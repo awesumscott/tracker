@@ -74,6 +74,9 @@ example; bare `trk` prints the overview.
 { "render": { "out": "docs/TODO.md" }, "archive": { "out": null } }
 ```
 
+`render` truncates its target (a regenerated projection); `archive` **appends** under a `## YYYY-MM-DD`
+heading (a changelog accumulates), so its target can safely be the changelog itself.
+
 Precedence for the output path: explicit `--out` > config value > stdout. A repo with no config behaves
 exactly as if the fields were unset.
 

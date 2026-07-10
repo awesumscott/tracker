@@ -244,7 +244,9 @@ pub const Cli = struct {
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
         \\  Graduate DONE tasks to changelog bullets (--out > config archive.out >
         \\  stdout), then flip each to `archived` so it leaves every view (structural
-        \\  dedup — re-running finds nothing). --dry-run previews without flipping.
+        \\  dedup — re-running finds nothing). A file target is APPENDED to under a
+        \\  `## YYYY-MM-DD` run heading, never truncated. --dry-run previews on
+        \\  stdout without flipping (and never touches the file).
         },
         .{ .name = "doc", .text =
         \\trk doc set <doc_id> <path>   register/update a doc_id -> repo-relative path
@@ -305,8 +307,9 @@ pub const Cli = struct {
             \\  trk tree <arc-or-task>       the ASCII prereq hierarchy
             \\  trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
             \\      Graduate DONE tasks to the changelog: emit them as markdown bullets
-            \\      (stdout, or --out <path>), then flip each to `archived` so it leaves
-            \\      every view (structural dedup). --dry-run previews without archiving.
+            \\      (appended to --out/config target under a dated heading, else stdout),
+            \\      then flip each to `archived` so it leaves every view (structural
+            \\      dedup). --dry-run previews on stdout without archiving.
             \\  trk compact                  rewrite snapshot + truncate log (drops archived/dropped)
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
             \\  trk doc list                 print all registered doc_id -> path mappings
@@ -452,6 +455,31 @@ pub const Cli = struct {
             }
         }
         try self.dir.writeFile(self.io, .{ .sub_path = path, .data = data, .flags = .{} });
+    }
+
+    /// Append `data` at the end of `path` under `self.dir` (created if absent,
+    /// parent chain best-effort like `writeOutFile`), preceded by a blank-line
+    /// separator when the file already has content. For accumulating targets
+    /// (the changelog): `render` regenerates its whole projection so it
+    /// truncates; `archive` emits increments, so truncating would destroy the
+    /// prior records.
+    fn appendOutFile(self: *Cli, path: []const u8, data: []const u8) Error!void {
+        if (std.fs.path.dirname(path)) |d| {
+            if (d.len > 0) {
+                if (self.dir.createDirPathOpen(self.io, d, .{})) |pd| {
+                    var pdv = pd;
+                    pdv.close(self.io);
+                } else |_| {}
+            }
+        }
+        var f = try self.dir.createFile(self.io, path, .{ .read = true, .truncate = false });
+        defer f.close(self.io);
+        var end = try f.length(self.io);
+        if (end > 0) {
+            try f.writePositionalAll(self.io, "\n", end);
+            end += 1;
+        }
+        try f.writePositionalAll(self.io, data, end);
     }
 
     // ----------------------------------------------------------- init
@@ -729,9 +757,11 @@ pub const Cli = struct {
     /// `trk archive [<term>...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]`
     /// — graduate completed work to the changelog. Selects `done` tasks (narrowed
     /// by the same term/arc/tag filters as `list`), emits them as changelog-ready
-    /// markdown bullets (stdout or `--out`), then flips each to `archived` so it
-    /// leaves every working view — the recorded item can never be re-emitted
-    /// (structural dedup). `--dry-run` previews the queue without archiving.
+    /// markdown bullets, then flips each to `archived` so it leaves every working
+    /// view — the recorded item can never be re-emitted (structural dedup). A file
+    /// target (`--out` or config) is APPENDED to, under a `## YYYY-MM-DD` run
+    /// heading. `--dry-run` previews the queue on stdout without archiving — it
+    /// never touches the file (an appended preview would duplicate on the real run).
     fn cmdArchive(self: *Cli, args: []const []const u8) Error!void {
         var out_path: ?[]const u8 = null;
         var dry_run = false;
@@ -787,12 +817,20 @@ pub const Cli = struct {
         defer draft.deinit(self.gpa);
         for (matched.items) |id| try self.appendArchiveBullet(&draft, id);
 
-        // Emit the draft (file or stdout). Do this BEFORE flipping state so the
-        // records are out even if the state writes fail partway.
-        // Precedence: explicit --out > config archive.out > stdout.
+        // Emit the draft BEFORE flipping state so the records are out even if
+        // the state writes fail partway. A real run APPENDS to the file target
+        // under a dated run heading (a changelog accumulates — truncating here
+        // once destroyed one); --dry-run previews on stdout and never touches
+        // the file. Precedence: explicit --out > config archive.out > stdout.
         const effective_out = out_path orelse self.store.config.archive_out;
-        if (effective_out) |p| {
-            try self.writeOutFile(p, draft.items);
+        if (effective_out != null and !dry_run) {
+            var chunk: std.ArrayList(u8) = .empty;
+            defer chunk.deinit(self.gpa);
+            var ts_buf: [32]u8 = undefined;
+            const ms = Io.Timestamp.now(self.io, .real).toMilliseconds();
+            try chunk.print(self.gpa, "## {s}\n\n", .{fmtTs(ms, &ts_buf)[0..10]});
+            try chunk.appendSlice(self.gpa, draft.items);
+            try self.appendOutFile(effective_out.?, chunk.items);
         } else {
             try self.write(draft.items);
         }
@@ -807,9 +845,9 @@ pub const Cli = struct {
         // a clean paste). dry-run-to-stdout shows just the bullets.
         if (effective_out) |p| {
             if (dry_run) {
-                try self.print("(dry run) {d} done task(s) would be archived; draft -> {s}\n", .{ matched.items.len, p });
+                try self.print("(dry run) {d} done task(s) would be archived; a real run appends to {s}\n", .{ matched.items.len, p });
             } else {
-                try self.print("archived {d} task(s); draft -> {s}\n", .{ matched.items.len, p });
+                try self.print("archived {d} task(s); appended -> {s}\n", .{ matched.items.len, p });
             }
         }
     }

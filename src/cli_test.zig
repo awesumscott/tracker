@@ -833,20 +833,49 @@ test "trk render with no config and no --out goes to stdout" {
     try testing.expect(std.mem.indexOf(u8, f.out.items, "TODO — remaining work") != null);
 }
 
-test "trk archive writes its draft to config archive.out with no --out" {
+test "trk archive APPENDS to config archive.out under a dated heading; dry-run never touches the file" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
     const t = mintId();
+    const u = mintId();
     try f.store.append(.{ .add = .{ .id = t, .title = "done item" } });
+    try f.store.append(.{ .add = .{ .id = u, .title = "later item" } });
     try f.store.append(.{ .setState = .{ .id = t, .state = .done } });
 
-    f.store.config.archive_out = "CHANGELOG-draft.md";
+    // Pre-existing content (a changelog header) must survive every run.
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "CHANGELOG.md", .data = "# Changelog\n", .flags = .{} });
+    f.store.config.archive_out = "CHANGELOG.md";
+
+    // dry-run: bullets preview on stdout, file untouched, nothing flipped.
+    try f.run(&.{ "archive", "--dry-run" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "- done item") != null);
+    try testing.expectEqual(tracker.State.done, f.store.get(t).?.state);
+    {
+        const d = try f.tmp.dir.readFileAlloc(io, "CHANGELOG.md", alloc, .unlimited);
+        defer alloc.free(d);
+        try testing.expectEqualStrings("# Changelog\n", d);
+    }
+
+    // Real run: appended after the header, under a `## YYYY-MM-DD` heading.
     try f.run(&.{"archive"});
-    const d = try f.tmp.dir.readFileAlloc(io, "CHANGELOG-draft.md", alloc, .unlimited);
-    defer alloc.free(d);
-    try testing.expect(std.mem.indexOf(u8, d, "done item") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "archived 1 task") != null);
+    {
+        const d = try f.tmp.dir.readFileAlloc(io, "CHANGELOG.md", alloc, .unlimited);
+        defer alloc.free(d);
+        try testing.expect(std.mem.startsWith(u8, d, "# Changelog\n\n## "));
+        try testing.expect(std.mem.indexOf(u8, d, "- done item") != null);
+    }
+
+    // A second run appends again — the first run's records survive.
+    try f.store.append(.{ .setState = .{ .id = u, .state = .done } });
+    try f.run(&.{"archive"});
+    {
+        const d = try f.tmp.dir.readFileAlloc(io, "CHANGELOG.md", alloc, .unlimited);
+        defer alloc.free(d);
+        try testing.expect(std.mem.indexOf(u8, d, "- done item") != null);
+        try testing.expect(std.mem.indexOf(u8, d, "- later item") != null);
+    }
 }
 
 test "loadConfig parses render/archive out; malformed sets config_malformed" {

@@ -99,13 +99,18 @@ markdown bullet, then flips it to `archived`** in one move — the act of record
 Because an `archived` item is gone from every working view, it can **never** be re-emitted: dedup is a
 property of the state machine, not of a date filter.
 
+- **A file target is appended to, never truncated** (under a `## YYYY-MM-DD` run heading; `--dry-run`
+  previews on stdout and never touches the file). `render` truncates because it regenerates its whole
+  projection each run; `archive` emits *increments* — structural dedup guarantees a bullet is emitted
+  exactly once, so append can never duplicate, while truncation destroyed a changelog's accumulated
+  history when `archive --out` was pointed at it (2026-07-10).
 - *Rejected alternative: a `--since <date>` filter on `list`.* It pushes the "already-changelogged?"
   bookkeeping onto the caller; the tombstone state makes that bookkeeping impossible to get wrong.
 - *Why a dedicated `trk archive` and not folding it into `compact`:* the two have different cadences —
   changelog handoff runs per closed batch, `compact` (heavier log GC) runs rarely; coupling them forces one
   to the other's rhythm.
-- The emitted bullets are a **draft** — curated into CHANGELOG prose, never pasted raw (CHANGELOG is
-  narrative, not 1:1 with tasks).
+- The emitted bullets are a **draft** — curate them into CHANGELOG prose (in place, when appending
+  straight to the changelog); the CHANGELOG is narrative, not 1:1 with tasks.
 - `archived` is a tombstone, not a hard delete — a condemn/adopt (tombstone-then-GC) model rather than a
   destructive removal.
 
