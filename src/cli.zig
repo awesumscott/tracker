@@ -1718,9 +1718,11 @@ fn fmtTs(ms: i64, buf: []u8) []const u8 {
     const yr: i64 = y + if (m <= 2) @as(i64, 1) else 0;
 
     // Write into a fixed-size sub-buffer (19 chars for "YYYY-MM-DD HH:MM:SS").
+    // Year is formatted unsigned: zero-padding a signed int prints an explicit
+    // "+" sign (std.fmt since 0.15), which corrupted date slices like [0..10].
     var tmp: [32]u8 = undefined;
     const out = std.fmt.bufPrint(&tmp, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        yr, m, d, hour, min, sec,
+        @as(u32, @intCast(yr)), m, d, hour, min, sec,
     }) catch "0000-00-00 00:00:00";
     @memcpy(buf[0..out.len], out);
     return buf[0..out.len];
