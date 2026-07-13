@@ -196,7 +196,8 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
     try s.append(.{ .setPriority = .{ .id = lone, .priority = 10 } });
 
     // While `pre` is open, dep1/dep2 are blocked; pre itself (no needs) is ready,
-    // arc (no needs) is ready, lone is ready.
+    // lone is ready. The arc root is a container with unfinished members —
+    // NOT handed out.
     {
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
@@ -204,6 +205,7 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
         try testing.expect(!contains(n, dep2));
         try testing.expect(contains(n, pre));
         try testing.expect(contains(n, lone));
+        try testing.expect(!contains(n, arc)); // undrained root: hidden
     }
 
     // Mark pre done -> dep1, dep2 become ready.
@@ -214,6 +216,7 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
         try testing.expect(contains(n, dep1));
         try testing.expect(contains(n, dep2));
         try testing.expect(!contains(n, pre)); // done -> not eligible
+        try testing.expect(!contains(n, arc)); // members still open -> still hidden
 
         // Ordering: dep2 (arc seq 1) before dep1 (arc seq 5); both before the
         // arc-less tasks (sentinel). Find their indices.
@@ -222,9 +225,25 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
         try testing.expect(idx2 < idx1);
 
         // arc'd tasks precede arc-less ones.
-        const iarc = indexOf(n, arc).?; // arc root: no arc membership -> arc-less
-        try testing.expect(idx1 < iarc);
-        try testing.expect(idx2 < iarc);
+        const ilone = indexOf(n, lone).?;
+        try testing.expect(idx1 < ilone);
+        try testing.expect(idx2 < ilone);
+    }
+
+    // Drain the arc -> the root surfaces exactly once as the close-out prompt.
+    try s.append(.{ .setState = .{ .id = dep1, .state = .done } });
+    try s.append(.{ .setState = .{ .id = dep2, .state = .done } });
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(contains(n, arc));
+    }
+    // Close the root (the completion judgment) -> gone from the frontier.
+    try s.append(.{ .setState = .{ .id = arc, .state = .done } });
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(!contains(n, arc));
     }
 }
 
@@ -247,7 +266,7 @@ test "next: a dropped prereq does NOT block its dependent" {
     try testing.expect(contains(n, dep)); // dropped prereq is satisfied
 }
 
-test "needs an arc: blocked until every arc member is done" {
+test "needs an arc: gates on the ROOT's state (the judgment), not on drainage" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const arc = mintId();
@@ -267,33 +286,95 @@ test "needs an arc: blocked until every arc member is done" {
     try s.append(.{ .dep = .{ .from = dependent, .to = arc } }); // dependent needs the ARC
 
     try testing.expect(s.isArc(arc));
-    try testing.expect(!s.arcComplete(arc));
+    try testing.expect(!s.arcDrained(arc));
 
-    // Only one member done → arc incomplete → dependent still blocked.
+    // Only one member done → arc undrained → root hidden, dependent blocked.
     try s.append(.{ .setState = .{ .id = m1, .state = .done } });
     {
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
         try testing.expect(!contains(n, dependent));
+        try testing.expect(!contains(n, arc));
         try testing.expect(contains(n, m2)); // the remaining member is ready
     }
     try testing.expectEqual(@as(usize, 1), s.arcProgress(arc).done);
     try testing.expectEqual(@as(usize, 2), s.arcProgress(arc).total);
 
-    // A PARKED member that is still open must NOT block arc completion.
+    // A PARKED member that is still open must NOT block drainage.
     const parked = mintId();
     try s.append(.{ .add = .{ .id = parked, .title = "parked stub" } });
     try s.append(.{ .tag = .{ .id = parked, .tag = "parked" } });
     try s.append(.{ .in = .{ .task = parked, .arc = arc, .seq = 2 } });
 
-    // Both NON-parked members done → arc complete (parked stub ignored) → unblocks.
+    // Both NON-parked members done → drained (parked stub ignored) → the ROOT
+    // surfaces, but the dependent is STILL blocked: drainage is the prompt,
+    // the root's own `done` is what a `needs`-the-arc gate waits on.
     try s.append(.{ .setState = .{ .id = m2, .state = .done } });
-    try testing.expect(s.arcComplete(arc)); // parked stub still open, but ignored
+    try testing.expect(s.arcDrained(arc)); // parked stub still open, but ignored
     try testing.expectEqual(@as(usize, 2), s.arcProgress(arc).total); // parked excluded from count
     {
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
+        try testing.expect(contains(n, arc));
+        try testing.expect(!contains(n, dependent));
+    }
+
+    // Close the root (the completion judgment) → the gate opens.
+    try s.append(.{ .setState = .{ .id = arc, .state = .done } });
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
         try testing.expect(contains(n, dependent));
+        try testing.expect(!contains(n, arc));
+    }
+}
+
+test "arc root eligibility: all-parked arc is vacuously drained; blocked member holds the root" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    // All-parked arc: only future stubs → nothing actionable → the root
+    // surfaces (no permanent black hole; parked members are never GC'd).
+    const arc1 = mintId();
+    const stub = mintId();
+    try s.append(.{ .add = .{ .id = arc1, .title = "scaffold arc" } });
+    try s.append(.{ .add = .{ .id = stub, .title = "future stub", .tags = &.{"parked"} } });
+    try s.append(.{ .in = .{ .task = stub, .arc = arc1, .seq = 0 } });
+    try testing.expect(s.arcDrained(arc1));
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(contains(n, arc1));
+        // `parked` exempts a member from gating the arc; the stub itself is
+        // still an open, unblocked task and stays individually eligible.
+        try testing.expect(contains(n, stub));
+    }
+
+    // A `blocked` member is unfinished (satisfiesPrereq=false) → root hidden.
+    const arc2 = mintId();
+    const held = mintId();
+    try s.append(.{ .add = .{ .id = arc2, .title = "held arc" } });
+    try s.append(.{ .add = .{ .id = held, .title = "on hold" } });
+    try s.append(.{ .in = .{ .task = held, .arc = arc2, .seq = 0 } });
+    try s.append(.{ .setState = .{ .id = held, .state = .blocked } });
+    try testing.expect(!s.arcDrained(arc2));
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(!contains(n, arc2));
+    }
+
+    // Dropping the held member drains the arc → root surfaces.
+    try s.append(.{ .setState = .{ .id = held, .state = .dropped } });
+    try testing.expect(s.arcDrained(arc2));
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(contains(n, arc2));
     }
 }
 
@@ -1079,6 +1160,34 @@ test "setState done round-trip: append persists across store reopen (basic regre
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
         try testing.expect(!contains(n, task));
+    }
+}
+
+test "setDocPath empty-path tombstone: unset survives compact + reload; live entries do" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .setDocPath = .{ .doc_id = "gone", .path = "docs/gone.md" } });
+        try s.append(.{ .setDocPath = .{ .doc_id = "kept", .path = "docs/kept.md" } });
+        try s.append(.{ .setDocPath = .{ .doc_id = "gone", .path = "" } }); // unset
+        try testing.expect(s.docPath("gone") == null);
+        try testing.expectEqualStrings("docs/kept.md", s.docPath("kept").?);
+        _ = try s.compact();
+    }
+
+    // Reopen post-compact: the snapshot must carry `kept` and no trace of `gone`
+    // (a removed mapping is simply not serialized — no empty-path line survives).
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try testing.expect(s.docPath("gone") == null);
+        try testing.expectEqualStrings("docs/kept.md", s.docPath("kept").?);
+        try testing.expectEqual(@as(usize, 1), s.doc_paths.count());
     }
 }
 

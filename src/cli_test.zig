@@ -1126,6 +1126,67 @@ test "undep: no-op on a non-existent edge" {
     try testing.expectEqual(@as(usize, 0), f.store.needs.items.len);
 }
 
+// ----------------------------------------------------------- show --body
+
+test "show --body prints the raw body verbatim: no header, no indent" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // A body that would be corrupted by de-indenting display output: blank
+    // lines and lines that already start with spaces.
+    const body = "line one\n  already indented\n\nlast";
+    try f.run(&.{ "add", "Bodied", "--body", body });
+    const id = try ulid.parse(f.out.items[0..ulid.len]);
+
+    try f.run(&.{ "show", &id.text, "--body" });
+    try testing.expectEqualStrings("line one\n  already indented\n\nlast\n", f.out.items);
+
+    // The round-trip is lossless: `$(trk show <id> --body)` strips the trailing
+    // newline, and re-editing with that value leaves the body unchanged.
+    try f.run(&.{ "edit", &id.text, "--body", body });
+    try f.run(&.{ "show", &id.text, "--body" });
+    try testing.expectEqualStrings("line one\n  already indented\n\nlast\n", f.out.items);
+}
+
+test "show --body on an empty body prints nothing" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{ "add", "Empty" });
+    const id = try ulid.parse(f.out.items[0..ulid.len]);
+    try f.run(&.{ "show", &id.text, "--body" });
+    try testing.expectEqualStrings("", f.out.items);
+}
+
+// ----------------------------------------------------------- doc unset
+
+test "doc unset unregisters: resolve fails, list hides, re-set revives" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{ "doc", "set", "design", "docs/design.md" });
+    try f.run(&.{ "doc", "resolve", "design" });
+    try testing.expectEqualStrings("docs/design.md\n", f.out.items);
+
+    try f.run(&.{ "doc", "unset", "design" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "unregistered") != null);
+
+    try testing.expectEqual(cli.CliError.NoSuchId, f.runExpectErr(&.{ "doc", "resolve", "design" }));
+    try f.run(&.{ "doc", "list" });
+    try testing.expectEqualStrings("(no doc paths registered)\n", f.out.items);
+
+    // Idempotent: unsetting an unregistered id is a clean no-op.
+    try f.run(&.{ "doc", "unset", "design" });
+
+    // A later set revives the mapping (last-write-wins).
+    try f.run(&.{ "doc", "set", "design", "docs/new.md" });
+    try f.run(&.{ "doc", "resolve", "design" });
+    try testing.expectEqualStrings("docs/new.md\n", f.out.items);
+}
+
 // ----------------------------------------------------------- helpers
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {

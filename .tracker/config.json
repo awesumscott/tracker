@@ -1,0 +1,4 @@
+{
+  "render": { "out": "docs/TODO.md" },
+  "archive": { "out": null }
+}

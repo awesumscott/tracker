@@ -58,10 +58,13 @@ Defined in `model.zig` (`Task`, `Needs`, `In`, `DocRef`, `State`, the `Event` un
   projection* (it auto-surfaces a shared prereq in every arc that reaches it); the `in` edge is the
   *authoring primitive*. A new prereq of an existing arc member auto-joins that arc; a genuinely new arc
   task is added with one `in` edge.
-- **Arc-as-prereq.** A `needs` edge whose *target is an arc* means "needs the whole arc": it is satisfied
-  iff every direct, non-`parked` member is finished (`isArc` / `arcComplete` in `store.zig`). `parked`
-  members (optional/future stubs) are excluded from an arc's completion criteria so a gate never waits on
-  them forever.
+- **Arc-as-prereq.** A `needs` edge whose *target is an arc root* is an **ordinary prereq on the root's
+  state** — it opens when the root is closed (`done`/`dropped`/`archived`), exactly like any other edge.
+  There is no special arc-gate in the DAG: the root's state *is* the arc's completion (the
+  drained-vs-complete ruling below). *(Supersedes the 2026-07-10 rule that gated such edges on
+  member-drainage via `arcComplete` — drainage-gating let a half-filed arc unblock dependents and made an
+  all-parked arc block them forever.)* `parked` members (optional/future stubs) are excluded from
+  drainage so the close-out prompt never waits on them.
 - **Priority = an edge/membership attribute**, the `seq` on the `in` edge — **not** a task property — so one
   task holds different positions in different arcs. **Lower `seq` sorts first.** Plus one global
   **personal-preference** priority (the `priority` field on `Task`, lower-first, matching `seq` so the two
@@ -117,10 +120,36 @@ property of the state machine, not of a date filter.
 ## `next` — the ready-frontier query (mechanism, not the whole scheduler)
 
 `Store.next` returns the **eligible set**: every `open` task whose `needs` are all satisfied
-(`done`/`dropped`/`archived`, or — for an arc target — `arcComplete`), ordered by best (smallest) arc-`seq`,
-then personal `priority`, then ULID (a stable, time-ascending tiebreak; `Ranked.less` in `store.zig`). An
-arc-less task still appears, sorted after arc'd tasks via a sentinel. That dissolves "I must remember to
-queue the next task" into a command.
+(`done`/`dropped`/`archived`), ordered by best (smallest) arc-`seq`, then personal `priority`, then ULID (a
+stable, time-ascending tiebreak; `Ranked.less` in `store.zig`). An arc-less task still appears, sorted
+after arc'd tasks via a sentinel. That dissolves "I must remember to queue the next task" into a command.
+
+**An arc root is a container, and `next` treats it as one** (2026-07-13; the drained-vs-complete ruling).
+"Do this arc" means *do its non-parked members* — the root is not itself a unit of work, so `next` holds an
+open root back while any direct non-`parked` member is unsatisfied (`arcDrained` in `store.zig`), then
+surfaces it **exactly once, as the close-out prompt**. Two distinct facts, never conflated:
+
+- **Drained** — every currently-filed, non-parked member is satisfied. *Observable, computed, never
+  stored*: it flaps by design (a newly filed member un-drains the arc), which is why nothing durable may
+  key off it. An arc with **no** non-parked members is **vacuously drained** — nothing actionable is
+  pending, so the root surfaces rather than black-holing (parked members stay `open` forever and are never
+  GC'd, so a "wait" here would be a wait with no exit).
+- **Complete** — the *goal* is achieved: the root's own `state = done`, set **explicitly**. Member
+  exhaustion can't imply this (the member set is open-ended); only a human/agent judgment converts drained
+  into complete. `next` offering the drained root *is the tool asking for that judgment*, and everything
+  downstream — `needs`-the-arc gates, `archive` graduation — reads only this fact.
+
+*Rejected: a `done-when-complete` auto-close field on the arc.* It hard-wires "drained ⇒ complete", which
+is wrong exactly while an arc is still growing, and it breaks the event model both ways: state derived at
+fold time makes the views disagree with the log, while state written on observation makes readers into
+writers that cross the disjoint-owner boundary — and a momentarily-drained arc that auto-dones can be
+graduated by `archive` into an `archived` tombstone (structurally barred from every view) while the goal
+is still alive. *Rejected: deriving `root needs member` edges at authoring time* (the hand-repair pattern
+observed in the field): a reversed `in` in a parallel worktree union-merges into a `needs` cycle that
+makes the whole store unloadable at fold; a plain derived edge ignores `parked` and gates forever on
+stubs; and derived edges are byte-identical to authored ones in the log, so no later pass can retract them.
+A root closed early, with members still open, unblocks its dependents — explicit judgment wins; the
+leftover members are candidates for `dropped`.
 
 But it is **mechanism, not the scheduler** (the mechanism/policy split): critical-path
 choice, agent-count budgeting, and cost are **orchestrator policy on top** of the eligible set, not stored
@@ -292,3 +321,6 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   event (last-write-wins on fold; `Store.docPath` resolves). A doc move is one `trk doc set <doc_id>
   <new-path>`; every task's doc-ref stores the `doc_id` (not the path), so all refs survive. Render
   resolves `doc_id → path#section`, falling back to the raw `doc_id#section` when unregistered.
+  `trk doc unset <doc_id>` tombstones a mapping via an empty-path `setDocPath` — the fold removes the
+  entry (refs fall back to the raw `doc_id`), the snapshot never emits it, so `compact` GCs the
+  tombstone; idempotent, and a later `set` revives it under the same last-write-wins fold.

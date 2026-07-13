@@ -210,6 +210,14 @@ pub const Store = struct {
                 try self.ins.append(self.gpa, .{ .task = x.task, .arc = x.arc, .seq = x.seq });
             },
             .setDocPath => |x| {
+                // Empty path = tombstone (`trk doc unset`): remove the mapping so
+                // docPath/list see it as never-registered. Same last-write-wins
+                // fold as a set; serializeState simply never emits a removed
+                // entry, so compaction GCs the tombstone for free.
+                if (x.path.len == 0) {
+                    _ = self.doc_paths.remove(x.doc_id);
+                    return;
+                }
                 // Last-write-wins: dup both key and value into the arena each time.
                 // The old arena strings are never freed (arena-only), which is fine.
                 const k = try self.a().dupe(u8, x.doc_id);
@@ -939,22 +947,26 @@ pub const Store = struct {
         return false;
     }
 
-    /// Arc completion: every DIRECT member (a task with `in id`) is done/dropped,
-    /// EXCLUDING members tagged `parked` (optional/future stubs are not part of an
-    /// arc's completion criteria — otherwise a gate would wait on them forever).
-    /// Returns false for a non-arc / an arc with no non-parked members — callers
-    /// gate on `isArc` first. Direct members only: a member can't be done while its
-    /// own `needs` are open, so "all direct members satisfied" implies their prereqs.
-    pub fn arcComplete(self: *Store, id: Ulid) bool {
-        var any = false;
+    /// Drained: no DIRECT member (a task with `in id`), excluding members tagged
+    /// `parked` (optional/future stubs), is unsatisfied. Vacuously TRUE for an
+    /// arc with no non-parked members — nothing actionable is pending, so the
+    /// root should surface for its close-out rather than black-hole.
+    ///
+    /// Drained is the OBSERVED fact and is never stored (it flaps by design: a
+    /// newly filed member un-drains the arc). The root's own `done` is the
+    /// completion JUDGMENT: `needs` gates wait on the root's state like any
+    /// other prereq; `next` uses drained only to decide when to OFFER the root
+    /// (the close-out prompt). See design.md's drained-vs-complete ruling.
+    /// Direct members only: a member can't be done while its own `needs` are
+    /// open, so "all direct members satisfied" implies their prereqs.
+    pub fn arcDrained(self: *Store, id: Ulid) bool {
         for (self.ins.items) |e| {
             if (!e.arc.eql(id)) continue;
-            const m = self.tasks.get(key(e.task)) orelse return false; // unknown member → not complete
+            const m = self.tasks.get(key(e.task)) orelse return false; // unknown member → not drained
             if (self.taskHasTag(m, "parked")) continue; // parked stubs don't gate
-            any = true;
             if (!m.state.satisfiesPrereq()) return false;
         }
-        return any;
+        return true;
     }
 
     /// (done, total) over an arc's DIRECT, non-parked members — for display.
@@ -1001,7 +1013,12 @@ pub const Store = struct {
     /// The ready frontier: every `open` task whose every `needs`-target is
     /// satisfied (state `done` or `dropped`), ordered per `Ranked.less`. A task
     /// with no `needs` is trivially ready; a task in no arc still appears
-    /// (sorted after arc'd tasks by the sentinel). Caller owns the slice.
+    /// (sorted after arc'd tasks by the sentinel). An arc ROOT is a container —
+    /// its work is its members' — so it is additionally held back until the arc
+    /// is drained, then surfaces exactly once as the close-out prompt. A `needs`
+    /// edge targeting a root gates on the root's own state (the completion
+    /// judgment), NOT on drainage — the root is an ordinary prereq here.
+    /// Caller owns the slice.
     pub fn next(self: *Store, alloc: std.mem.Allocator) ![]Ulid {
         var ranked: std.ArrayList(Ranked) = .empty;
         defer ranked.deinit(self.gpa);
@@ -1011,19 +1028,13 @@ pub const Store = struct {
             const t = entry.value_ptr.*;
             if (!t.state.isEligible()) continue; // only `open` is eligible
 
+            // An undrained arc root is never handed out (do the members first).
+            if (self.isArc(t.id) and !self.arcDrained(t.id)) continue;
+
             // Every prereq must be satisfied.
             var ready = true;
             for (self.needs.items) |e| {
                 if (!e.from.eql(t.id)) continue;
-                // A `needs` edge whose target is an arc means "needs the whole
-                // arc": satisfied iff every direct member is done/dropped.
-                if (self.isArc(e.to)) {
-                    if (!self.arcComplete(e.to)) {
-                        ready = false;
-                        break;
-                    }
-                    continue;
-                }
                 const pre = self.tasks.get(key(e.to)) orelse {
                     // A placeholder prereq we never learned the state of: treat
                     // as not-satisfied (default state `open` blocks) — it's

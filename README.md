@@ -54,7 +54,10 @@ subdirectory of a project.
 - **`T in X`** — task `T` belongs to arc `X`. An **arc** is a goal-root task. `trk in <task> <arc>`.
 - **State** — `open` → `done` → `archived` (via `trk archive`, which graduates done tasks to changelog
   bullets and tombstones them), plus `blocked` (held) and `dropped` (won't-do).
-- **`next`** — the ready frontier: every `open` task whose prerequisites are all satisfied.
+- **`next`** — the ready frontier: every `open` task whose prerequisites are all satisfied. An arc root
+  is a container ("do the arc" = do its non-parked members): `next` holds it back until the members are
+  finished, then surfaces it once as the close-out prompt — closing the root is what marks the goal
+  complete and unblocks anything that `needs` the arc.
 - **`.tracker/`** — the append-only `log.jsonl` (+ an optional compacted `snapshot.jsonl`). It union-merges
   on concurrent appends, so parallel workers on disjoint tasks can each close their own without conflict.
 

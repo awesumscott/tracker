@@ -213,7 +213,10 @@ pub const Cli = struct {
         },
         .{ .name = "next", .text =
         \\trk next [--arc <id>] [--limit <n>] [--json] [<term> ...]
-        \\  The ready frontier: open tasks whose prereqs are ALL met. Bare <term>s
+        \\  The ready frontier: open tasks whose prereqs are ALL met. An arc root is
+        \\  a container: it is held back until its non-parked members are finished,
+        \\  then surfaces once as the close-out prompt (`trk state <root> done` marks
+        \\  the goal complete and unblocks anything that needs the arc). Bare <term>s
         \\  (repeatable, ANDed) are a case-insensitive substring search over
         \\  title+body+tags. --json emits a machine-readable array.
         \\  e.g.  trk next           trk next prism windowed
@@ -250,14 +253,19 @@ pub const Cli = struct {
         },
         .{ .name = "doc", .text =
         \\trk doc set <doc_id> <path>   register/update a doc_id -> repo-relative path
+        \\trk doc unset <doc_id>        unregister a doc_id (idempotent; refs fall back
+        \\                              to the raw doc_id until it is re-set)
         \\trk doc list                  print all registered doc_id -> path mappings
         \\trk doc resolve <doc_id>      print the path for a doc_id
         \\  The registry backs the --doc/--add-doc design pointers on add/edit.
         },
         .{ .name = "show", .text =
-        \\trk show <id>
+        \\trk show <id> [--body]
         \\  Full detail for one task: body, state, priority, tags, prereqs,
         \\  dependents, arc memberships, and doc pointers. Ids accept any unique prefix.
+        \\  --body prints ONLY the raw body bytes (no header, no indent) — the safe
+        \\  read half of an edit round-trip:
+        \\  trk edit <id> --body "$(trk show <id> --body)"
         },
         .{ .name = "edit", .text =
         \\trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...]
@@ -877,15 +885,16 @@ pub const Cli = struct {
     /// `trk doc <set|list|resolve> ...` — doc-id registry commands.
     fn cmdDoc(self: *Cli, args: []const []const u8) Error!void {
         if (args.len == 0) {
-            try self.write("trk: doc needs a subcommand: set, list, resolve\n");
+            try self.write("trk: doc needs a subcommand: set, unset, list, resolve\n");
             return error.UsageError;
         }
         const sub = args[0];
         const rest = args[1..];
         if (std.mem.eql(u8, sub, "set")) return self.cmdDocSet(rest);
+        if (std.mem.eql(u8, sub, "unset")) return self.cmdDocUnset(rest);
         if (std.mem.eql(u8, sub, "list")) return self.cmdDocList(rest);
         if (std.mem.eql(u8, sub, "resolve")) return self.cmdDocResolve(rest);
-        try self.print("trk: doc: unknown subcommand '{s}' (set|list|resolve)\n", .{sub});
+        try self.print("trk: doc: unknown subcommand '{s}' (set|unset|list|resolve)\n", .{sub});
         return error.UnknownCommand;
     }
 
@@ -899,6 +908,19 @@ pub const Cli = struct {
         const path = args[1];
         try self.store.append(.{ .setDocPath = .{ .doc_id = doc_id, .path = path } });
         try self.print("doc {s} -> {s}\n", .{ doc_id, path });
+    }
+
+    /// `trk doc unset <doc_id>` — unregister a doc_id. Emits the empty-path
+    /// tombstone the fold removes the mapping on. Idempotent: unsetting an
+    /// unregistered id is a no-op append, like `untag`/`undep`.
+    fn cmdDocUnset(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len != 1) {
+            try self.write("trk: usage: trk doc unset <doc_id>\n");
+            return error.UsageError;
+        }
+        const doc_id = args[0];
+        try self.store.append(.{ .setDocPath = .{ .doc_id = doc_id, .path = "" } });
+        try self.print("doc {s} unregistered\n", .{doc_id});
     }
 
     /// `trk doc list` — print all doc_id -> path entries, sorted by doc_id.
@@ -1418,12 +1440,31 @@ pub const Cli = struct {
 
     /// `trk show <id>` — full task detail view.
     fn cmdShow(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 1) {
-            try self.write("trk: usage: trk show <id>\n");
-            return error.UsageError;
+        var id_arg: ?[]const u8 = null;
+        var raw_body = false;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--body")) {
+                raw_body = true;
+            } else if (id_arg == null) {
+                id_arg = a;
+            } else {
+                try self.write("trk: usage: trk show <id> [--body]\n");
+                return error.UsageError;
+            }
         }
-        const id = try self.resolve(args[0]);
+        const id = try self.resolve(id_arg orelse {
+            try self.write("trk: usage: trk show <id> [--body]\n");
+            return error.UsageError;
+        });
         const t = self.store.get(id).?;
+
+        if (raw_body) {
+            // Verbatim body bytes, nothing else — the read half of a safe edit
+            // round-trip: trk edit <id> --body "$(trk show <id> --body)".
+            try self.write(t.body);
+            if (t.body.len != 0 and t.body[t.body.len - 1] != '\n') try self.write("\n");
+            return;
+        }
 
         try self.print("id:       {s}\n", .{&id.text});
         try self.print("title:    {s}\n", .{t.title});
@@ -1462,11 +1503,11 @@ pub const Cli = struct {
                 const pre = self.store.get(e.to).?;
                 var sb: [ulid.len]u8 = undefined;
                 if (self.store.isArc(e.to)) {
-                    // "needs the whole arc" — show completion progress.
+                    // The gate is the ROOT's state (the completion judgment);
+                    // drain progress is shown as context, not as the gate.
                     const p = self.store.arcProgress(e.to);
-                    const mark = if (self.store.arcComplete(e.to)) "[x]" else "[ ]";
                     try self.print("  {s} {s}  arc: {s}  ({d}/{d} done)\n", .{
-                        mark, try self.shortId(e.to, &sb), pre.title, p.done, p.total,
+                        stateMarker(pre.state), try self.shortId(e.to, &sb), pre.title, p.done, p.total,
                     });
                 } else {
                     try self.print("  {s} {s}  {s}\n", .{
