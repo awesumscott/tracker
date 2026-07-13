@@ -287,6 +287,29 @@ test "render: arcs, shared prereq under both, markers, determinism" {
     try testing.expectEqualStrings(b1.items, b2.items);
 }
 
+test "render: body appears as an indented block under its bullet" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const with = mintId();
+    const without = mintId();
+    try f.store.append(.{ .add = .{ .id = with, .title = "Bodied task", .body = "first line\n\nsecond para\n" } });
+    try f.store.append(.{ .add = .{ .id = without, .title = "Bare task" } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    // The body block: blank line after the title bullet (so markdown doesn't
+    // lazy-continue the title paragraph), each body line 2-space indented,
+    // interior blank lines preserved, trailing newline trimmed.
+    try testing.expect(std.mem.indexOf(u8, b.items, "Bodied task\n\n  first line\n\n  second para\n\n") != null);
+    // A body-less task stays a single line.
+    try testing.expect(std.mem.indexOf(u8, b.items, "Bare task\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "Bare task\n\n  ") == null);
+}
+
 test "render: strict — done/archived excluded, open/blocked shown" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);

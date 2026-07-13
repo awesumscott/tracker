@@ -1243,7 +1243,10 @@ pub const Cli = struct {
         if (any_arcless) try buf.print(gpa, "\n", .{});
     }
 
-    /// One markdown bullet: `- [marker] <short-id> <title> #tags (doc#sec)`.
+    /// One markdown bullet: `- [marker] <short-id> <title> #tags (doc#sec)`,
+    /// followed by the body (if any) as a 2-space-indented block. The blank
+    /// line before the block is load-bearing: without it, markdown lazy-
+    /// continuation fuses the body's first line into the title paragraph.
     fn renderTaskBullet(self: *Cli, buf: *std.ArrayList(u8), id: Ulid, arc: ?Ulid) Error!void {
         const gpa = self.gpa;
         const t = self.store.get(id).?;
@@ -1266,6 +1269,20 @@ pub const Cli = struct {
             }
         }
         try buf.print(gpa, "\n", .{});
+
+        const body = std.mem.trimEnd(u8, t.body, "\n");
+        if (body.len != 0) {
+            try buf.print(gpa, "\n", .{});
+            var it = std.mem.splitScalar(u8, body, '\n');
+            while (it.next()) |line| {
+                if (line.len == 0) {
+                    try buf.print(gpa, "\n", .{});
+                } else {
+                    try buf.print(gpa, "  {s}\n", .{line});
+                }
+            }
+            try buf.print(gpa, "\n", .{});
+        }
     }
 
     // ----------------------------------------------------------- tree (ASCII)
