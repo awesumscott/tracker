@@ -232,6 +232,8 @@ pub const Cli = struct {
         \\  Write the TODO.md markdown projection. Destination precedence:
         \\  explicit --out > config render.out > stdout. Overwrites the target (it is
         \\  a generated projection with a do-not-edit header) — never hand-edit it.
+        \\  A task shared by several arcs is listed in full (tags, docs, body) only
+        \\  the first time; later listings link back to that anchor.
         },
         .{ .name = "tree", .text =
         \\trk tree <arc-or-task>
@@ -1189,6 +1191,24 @@ pub const Cli = struct {
         var printed = std.AutoHashMapUnmanaged([ulid.len]u8, void){};
         defer printed.deinit(gpa);
 
+        // Pre-count how many arc sections will list each task: a task shared by
+        // several arcs is listed in full exactly once (anchored), and every
+        // later listing links back to it instead of repeating the body. Arc
+        // order is deterministic, so "first" is stable across renders.
+        var listing_count = std.AutoHashMapUnmanaged([ulid.len]u8, u32){};
+        defer listing_count.deinit(gpa);
+        for (arcs) |arc| {
+            const members = try self.store.membersOf(gpa, arc);
+            defer gpa.free(members);
+            for (members) |id| {
+                if (!isRemaining(self.store.get(id).?.state)) continue;
+                if (self.store.isArc(id)) continue;
+                const gop = try listing_count.getOrPut(gpa, id.text);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
+        }
+
         for (arcs) |arc| {
             const arc_t = self.store.get(arc).?;
             try buf.print(gpa, "## {s}", .{arc_t.title});
@@ -1218,7 +1238,13 @@ pub const Cli = struct {
                     try printed.put(gpa, id.text, {});
                     continue;
                 }
-                try self.renderTaskBullet(buf, id, arc);
+                const listing: Listing = if (printed.contains(id.text))
+                    .repeat
+                else if ((listing_count.get(id.text) orelse 1) > 1)
+                    .anchored
+                else
+                    .plain;
+                try self.renderTaskBullet(buf, id, arc, listing);
                 try printed.put(gpa, id.text, {});
             }
             try buf.print(gpa, "\n", .{});
@@ -1238,23 +1264,41 @@ pub const Cli = struct {
                 try buf.print(gpa, "## Arc-less\n\n", .{});
                 any_arcless = true;
             }
-            try self.renderTaskBullet(buf, id, null);
+            try self.renderTaskBullet(buf, id, null, .plain);
         }
         if (any_arcless) try buf.print(gpa, "\n", .{});
     }
+
+    /// How a task appears in a render section. A task reachable from several
+    /// arcs is listed everywhere it belongs, but its full detail (tags,
+    /// doc-refs, body) appears exactly once: the first listing carries an HTML
+    /// anchor (the full ULID — the only stable fragment target a markdown list
+    /// item can have), and every repeat renders its short id as a link back.
+    const Listing = enum { plain, anchored, repeat };
 
     /// One markdown bullet: `- [marker] <short-id> <title> #tags (doc#sec)`,
     /// followed by the body (if any) as a 2-space-indented block. The blank
     /// line before the block is load-bearing: without it, markdown lazy-
     /// continuation fuses the body's first line into the title paragraph.
-    fn renderTaskBullet(self: *Cli, buf: *std.ArrayList(u8), id: Ulid, arc: ?Ulid) Error!void {
+    fn renderTaskBullet(self: *Cli, buf: *std.ArrayList(u8), id: Ulid, arc: ?Ulid, listing: Listing) Error!void {
         const gpa = self.gpa;
         const t = self.store.get(id).?;
         var sb: [ulid.len]u8 = undefined;
         const sid = try self.shortId(id, &sb);
         const checkbox = stateCheckbox(t.state);
         const seq = self.seqFor(id, arc);
-        try buf.print(gpa, "- {s} `{s}`", .{ checkbox, sid });
+        switch (listing) {
+            .plain => try buf.print(gpa, "- {s} `{s}`", .{ checkbox, sid }),
+            .anchored => try buf.print(gpa, "- {s} <a id=\"{s}\"></a>`{s}`", .{ checkbox, &id.text, sid }),
+            .repeat => {
+                // Link back to the anchored first listing; keep the title (and
+                // this arc's seq) for scanability, skip the repeated detail.
+                try buf.print(gpa, "- {s} [`{s}`](#{s})", .{ checkbox, sid, &id.text });
+                if (seq) |s| try buf.print(gpa, " [{d}]", .{s});
+                try buf.print(gpa, " {s}\n", .{t.title});
+                return;
+            },
+        }
         if (seq) |s| try buf.print(gpa, " [{d}]", .{s});
         try buf.print(gpa, " {s}", .{t.title});
         for (t.tags.items) |tg| try buf.print(gpa, " #{s}", .{tg});

@@ -287,6 +287,55 @@ test "render: arcs, shared prereq under both, markers, determinism" {
     try testing.expectEqualStrings(b1.items, b2.items);
 }
 
+test "render: a task shared by two arcs is anchored once; the repeat links back, body once" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc1 = mintId();
+    const arc2 = mintId();
+    const m1 = mintId();
+    const m2 = mintId();
+    const shared = mintId();
+    try f.store.append(.{ .add = .{ .id = arc1, .title = "First arc" } });
+    try f.store.append(.{ .add = .{ .id = arc2, .title = "Second arc" } });
+    try f.store.append(.{ .add = .{ .id = m1, .title = "Member one" } });
+    try f.store.append(.{ .add = .{ .id = m2, .title = "Member two" } });
+    try f.store.append(.{ .add = .{ .id = shared, .title = "Shared prereq", .body = "the shared body" } });
+    try f.store.append(.{ .in = .{ .task = m1, .arc = arc1, .seq = 0 } });
+    try f.store.append(.{ .in = .{ .task = m2, .arc = arc2, .seq = 0 } });
+    try f.store.append(.{ .dep = .{ .from = m1, .to = shared } });
+    try f.store.append(.{ .dep = .{ .from = m2, .to = shared } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    // Still listed under both arcs...
+    try testing.expectEqual(@as(usize, 2), countOccurrences(b.items, "Shared prereq"));
+    // ...but anchored + full exactly once, and linked back exactly once.
+    var anchor_buf: [64]u8 = undefined;
+    var link_buf: [64]u8 = undefined;
+    var m1_buf: [64]u8 = undefined;
+    const anchor = try std.fmt.bufPrint(&anchor_buf, "<a id=\"{s}\"></a>", .{&shared.text});
+    try testing.expectEqual(@as(usize, 1), countOccurrences(b.items, anchor));
+    const backlink = try std.fmt.bufPrint(&link_buf, "](#{s})", .{&shared.text});
+    try testing.expectEqual(@as(usize, 1), countOccurrences(b.items, backlink));
+    try testing.expectEqual(@as(usize, 1), countOccurrences(b.items, "the shared body"));
+    // The anchored listing precedes the linked repeat (arc order is stable).
+    try testing.expect(std.mem.indexOf(u8, b.items, anchor).? < std.mem.indexOf(u8, b.items, backlink).?);
+
+    // A single-arc member gets neither anchor nor link.
+    const m1_anchor = try std.fmt.bufPrint(&m1_buf, "<a id=\"{s}\"></a>", .{&m1.text});
+    try testing.expectEqual(@as(usize, 0), countOccurrences(b.items, m1_anchor));
+
+    // Determinism holds with anchors present.
+    var b2: std.ArrayList(u8) = .empty;
+    defer b2.deinit(alloc);
+    try f.c.renderMarkdown(&b2);
+    try testing.expectEqualStrings(b.items, b2.items);
+}
+
 test "render: body appears as an indented block under its bullet" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
