@@ -24,7 +24,7 @@ WSL note: this repo lives on `/mnt/c`. For parallel/worktree builds route `ZIG_L
 Two compilation units, wired in `build.zig`:
 
 - **`tracker` module** (root `src/tracker.zig`) — the platform-free library: `ulid.zig` (id minting), `model.zig` (Task/State/Event data, no I/O), `json_codec.zig` (event line codec), `store.zig` (the fold + queries + writes).
-- **`trk` exe** — `src/main.zig` is a thin shell (build `Io`, find the store root by walking up for `.tracker/` git-style, map errors to exit codes); all verb logic and the render/tree projections live in `src/cli.zig`, which imports the `tracker` module.
+- **`trk` exe** — `src/main.zig` is a thin shell (build `Io`, find the store root by walking up for `.tracker/` git-style via `src/discover.zig`, map errors to exit codes); all verb logic and the render/tree projections live in `src/cli.zig`, which imports the `tracker` module.
 
 Core mechanic: **load = fold**. `Store.load` replays `snapshot.jsonl` (optional baseline) then `log.jsonl` in file order into an in-memory graph; every write is one appended JSON line. Layering is strict: model.zig has no I/O and no fold logic; store semantics never leak into cli.zig (writes go through `Store.append`); cli.zig writes output into a caller-owned `ArrayList(u8)`, never stdout — main.zig flushes it, tests assert against it.
 
@@ -37,5 +37,6 @@ Core mechanic: **load = fold**. `Store.load` replays `snapshot.jsonl` (optional 
 - **On-disk format**: the JSON emit is hand-rolled in `json_codec.zig` (deterministic key order) deliberately — don't migrate it to `std.json.Stringify`. Decode tolerates missing `ts` (legacy lines).
 - **IDs**: ULIDs are minted once at creation, never regenerated (uniqueness-at-birth is what makes parallel worktrees collide-free). CLI accepts unique prefixes; short-id floor is `min_short = 6` in cli.zig.
 - **Help routing**: `--help`/`-h` anywhere in a verb's args must route to help *before* dispatch (positional-title verbs would otherwise mint junk tasks named "--help"). Every dispatched verb needs a `verb_help` entry — a test enforces this, so adding a verb without help text fails the suite.
+- **Store-root discovery is worktree-bounded; `TRK_READONLY` is the hard stop.** `discover.findRoot` (`src/discover.zig`) never walks past a linked git worktree's root (its `.git` is a plain FILE, never a directory — the on-disk marker, no git binary needed) into an enclosing repo's tracker, even when the worktree lacks its own `.tracker`. But a `.claude/worktrees/<id>/` dir that isn't a *real* git worktree (no `.git` at all — e.g. a scratch/tool dir) has no boundary marker to stop at, so discovery legitimately (if dangerously, for an agent context) climbs into whatever `.tracker` sits above it. `TRK_READONLY=1` in the env is the structural fix for that case: `Cli.read_only` refuses every mutating verb (`mutating_verbs` in `cli.zig`, `doc set`/`doc unset` special-cased out of the read-only `doc` verb) before dispatch, independent of which root discovery resolved to.
 
 Tests use `std.testing.tmpDir` + deterministic `ulid.mintAt` timestamps; nothing touches a real `.tracker/` or absolute paths — keep it that way.

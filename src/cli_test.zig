@@ -168,6 +168,61 @@ test "state rejects a bad state name cleanly" {
     try testing.expectEqual(cli.CliError.BadState, e);
 }
 
+// ----------------------------------------------------------- TRK_READONLY gate
+
+test "read_only refuses every mutating verb cleanly and mutates nothing" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "A" } });
+    const before = f.store.count();
+    f.c.read_only = true;
+
+    const cases = [_][]const []const u8{
+        &.{ "init", "--force" },
+        &.{ "add", "T" },
+        &.{ "dep", &a.text, &a.text },
+        &.{ "undep", &a.text, &a.text },
+        &.{ "in", &a.text, &a.text },
+        &.{ "state", &a.text, "done" },
+        &.{"render"},
+        &.{"compact"},
+        &.{"archive"},
+        &.{ "edit", &a.text, "--title", "X" },
+        &.{ "doc", "set", "d1", "path.md" },
+        &.{ "doc", "unset", "d1" },
+    };
+    for (cases) |args| {
+        const e = f.runExpectErr(args);
+        try testing.expectEqual(cli.CliError.ReadOnly, e);
+        try testing.expect(std.mem.indexOf(u8, f.out.items, "TRK_READONLY") != null);
+    }
+    try testing.expectEqual(before, f.store.count());
+    try testing.expectEqualStrings("A", f.store.get(a).?.title); // untouched by the "edit" attempt
+}
+
+test "read_only does not block read verbs, --help, or doc list/resolve" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "A" } });
+    f.c.read_only = true;
+
+    try f.run(&.{"next"});
+    try f.run(&.{"list"});
+    try f.run(&.{ "show", &a.text });
+    try f.run(&.{ "tree", &a.text });
+    try f.run(&.{"log"});
+    try f.run(&.{ "doc", "list" });
+    // Unregistered -> the normal NoSuchId error, NOT ReadOnly: proves the gate
+    // let it through to cmdDocResolve rather than blocking it.
+    try testing.expectEqual(cli.CliError.NoSuchId, f.runExpectErr(&.{ "doc", "resolve", "d1" }));
+    try f.run(&.{ "add", "--help" }); // help routes BEFORE the read_only gate
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "trk add") != null);
+}
+
 // ----------------------------------------------------------- prefix resolution
 
 test "prefix resolution: unique resolves, ambiguous errors with candidates" {

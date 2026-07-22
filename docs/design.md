@@ -248,6 +248,18 @@ The merge model is **owned** here, because it gates how parallel agents may touc
   `serializeState` neither emit `undep` ops nor persist tombstones, and correctly so — by compaction every
   `undep` is already folded into `needs` (the tombstoned edge absent) and the snapshot emits only surviving
   edges, so no stray `dep` line survives to need blocking.
+- **Store-root discovery is bounded at a worktree; `TRK_READONLY` backstops the rest.** `findRoot`
+  (`src/discover.zig`) walks up for `.tracker/`, git-style, but never past a linked worktree's root
+  (its `.git` is a plain FILE, never a directory — the on-disk marker, no git binary needed): a
+  worktree missing its own `.tracker` stops the walk *there* rather than escaping into the enclosing
+  repo's live tracker. This closes an incident (2026-07-22) where a dispatched agent's directory —
+  not always a *real* git worktree; some are `.claude/worktrees/<id>/` scratch dirs with no `.git` at
+  all — walked all the way up into the orchestrator's live `.tracker/log.jsonl`, and an agent
+  "reverting" what it believed was its own copy wiped a concurrent append there. A directory with no
+  `.git` marker at all has no boundary to detect, so this fix is necessary but not sufficient — the
+  belt-and-suspenders layer is `TRK_READONLY=1` in the environment, which refuses every mutating verb
+  outright regardless of which root discovery resolves to. The orchestrator sets it when dispatching
+  an agent that should only read the tracker.
 - **Compaction/render/archive are orchestrator-only and serialized.** `compact` rewrites the whole snapshot —
   the one merge-flashpoint — so it never runs in a worktree; `render` writes the generated backlog file;
   `archive` is the changelog handoff. None is a subagent operation.

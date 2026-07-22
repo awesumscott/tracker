@@ -44,6 +44,9 @@ pub const CliError = error{
     BadState,
     BadNumber,
     DependencyCycle,
+    /// A mutating verb was rejected because `read_only` is set (mirrors the
+    /// `TRK_READONLY` env var main.zig checks).
+    ReadOnly,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -63,6 +66,11 @@ pub const Cli = struct {
     dir: Io.Dir,
     /// Accumulated stdout-bound output. Caller owns it.
     out: *std.ArrayList(u8),
+    /// When true, every mutating verb (see `mutating_verbs` below) refuses
+    /// with `error.ReadOnly` before dispatch; read verbs are unaffected.
+    /// main.zig sets this from the `TRK_READONLY` env var; tests can set it
+    /// directly on a `Cli` built over a `Fixture`.
+    read_only: bool = false,
     /// Scratch for `directPrereqs` — must be drained/copied before the next
     /// call. tree recursion copies into a local dupe before recursing, so reuse
     /// is safe. Owned by the Cli; the caller (main/tests) deinits it.
@@ -132,6 +140,11 @@ pub const Cli = struct {
         }
         if (argsWantHelp(rest)) return self.helpFor(cmd);
 
+        if (self.read_only and isMutating(cmd, rest)) {
+            try self.print("trk: refusing to run '{s}' — TRK_READONLY is set (mutations are disabled)\n", .{cmd});
+            return error.ReadOnly;
+        }
+
         if (std.mem.eql(u8, cmd, "init")) return self.cmdInit(rest);
         if (std.mem.eql(u8, cmd, "add")) return self.cmdAdd(rest);
         if (std.mem.eql(u8, cmd, "dep")) return self.cmdDep(rest);
@@ -159,6 +172,26 @@ pub const Cli = struct {
     fn argsWantHelp(rest: []const []const u8) bool {
         for (rest) |a| {
             if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return true;
+        }
+        return false;
+    }
+
+    /// Every verb whose dispatch writes persisted state: an appended log
+    /// event (`add`/`dep`/`undep`/`in`/`state`/`edit`/`doc set`/`doc unset`),
+    /// a scaffolded `.tracker/` (`init`), a rewritten snapshot (`compact`), or
+    /// an out-file (`render`, `archive`). Everything else (`next`/`list`/
+    /// `show`/`tree`/`log`/`doc list`/`doc resolve`/`help`) is read-only.
+    /// `read_only` (`TRK_READONLY`) gates exactly this set.
+    const mutating_verbs = [_][]const u8{
+        "init", "add", "dep", "undep", "in", "state", "render", "compact", "archive", "edit",
+    };
+
+    fn isMutating(cmd: []const u8, rest: []const []const u8) bool {
+        for (mutating_verbs) |v| {
+            if (std.mem.eql(u8, cmd, v)) return true;
+        }
+        if (std.mem.eql(u8, cmd, "doc")) {
+            if (rest.len > 0 and (std.mem.eql(u8, rest[0], "set") or std.mem.eql(u8, rest[0], "unset"))) return true;
         }
         return false;
     }
@@ -330,6 +363,10 @@ pub const Cli = struct {
             \\
             \\Ids accept any unique prefix (git-short-hash style).
             \\Per-verb help: `trk <verb> --help`  (or  `trk help <verb>`).
+            \\
+            \\.tracker/ is found by walking up from cwd (git-style), bounded at a linked
+            \\worktree's root (never escapes into an enclosing repo's tracker).
+            \\TRK_READONLY=1 in the environment refuses every mutating verb.
             \\
         );
     }

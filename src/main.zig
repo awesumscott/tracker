@@ -11,6 +11,7 @@
 const std = @import("std");
 const tracker = @import("tracker");
 const cli = @import("cli.zig");
+const discover = @import("discover.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -29,8 +30,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Locate the store root: the nearest ancestor (cwd first, then up) that
     // holds a `.tracker/` dir — git-style, so `trk` runs from any subdirectory
-    // of the repo, not just its root.
-    const root = findRoot(io);
+    // of the repo, not just its root. Bounded at a linked git-worktree's root
+    // (see discover.zig) so an agent worktree's discovery can never escape
+    // into an enclosing repo's live tracker.
+    const root = discover.findRoot(io, std.Io.Dir.cwd());
     const dir = root.dir;
     defer if (root.owned) dir.close(io);
 
@@ -47,7 +50,14 @@ pub fn main(init: std.process.Init) !u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
 
-    var c = cli.Cli{ .gpa = gpa, .io = io, .store = &store, .dir = dir, .out = &out };
+    // `TRK_READONLY=1` (any non-empty value) refuses every mutating verb —
+    // the belt-and-suspenders layer over the worktree-boundary discovery fix
+    // above: the orchestrator sets this in a dispatched agent's env so a
+    // mutation can't land in the live tracker regardless of which root
+    // discovery resolves to.
+    const read_only = isReadOnly(init.minimal.environ, gpa);
+
+    var c = cli.Cli{ .gpa = gpa, .io = io, .store = &store, .dir = dir, .out = &out, .read_only = read_only };
     defer c.prereq_scratch.deinit(gpa);
 
     const result = c.run(args.items);
@@ -73,6 +83,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.BadState,
             error.BadNumber,
             error.DependencyCycle,
+            error.ReadOnly,
             => {},
             else => try printErr(io, "trk: error: {s}\n", .{@errorName(e)}),
         }
@@ -80,34 +91,13 @@ pub fn main(init: std.process.Init) !u8 {
     }
 }
 
-/// A located store root + whether we opened it (and so must close it). cwd
-/// itself is borrowed (no close); an opened ancestor must be closed.
-const Root = struct { dir: std.Io.Dir, owned: bool };
-
-/// Walk up from cwd looking for a `.tracker/` dir, like git's `.git` discovery.
-/// Returns the first ancestor that has one; falls back to cwd (so a first-run
-/// `trk add` still creates `.tracker/` under cwd, the prior behavior).
-fn findRoot(io: std.Io) Root {
-    const cwd = std.Io.Dir.cwd();
-    const max_depth = 24; // a repo nests far shallower than this
-    var buf: [3 * max_depth + 8]u8 = undefined;
-    var depth: usize = 0;
-    while (depth <= max_depth) : (depth += 1) {
-        var len: usize = 0;
-        for (0..depth) |_| {
-            @memcpy(buf[len..][0..3], "../");
-            len += 3;
-        }
-        @memcpy(buf[len..][0..8], ".tracker");
-        const probe = buf[0 .. len + 8];
-        cwd.access(io, probe, .{}) catch continue; // not here — go up one
-        if (depth == 0) return .{ .dir = cwd, .owned = false };
-        // The ancestor path is the "../"* prefix without the ".tracker" tail
-        // and without its trailing slash (openDir wants "../.." not "../../").
-        const opened = cwd.openDir(io, buf[0 .. len - 1], .{}) catch return .{ .dir = cwd, .owned = false };
-        return .{ .dir = opened, .owned = true };
-    }
-    return .{ .dir = cwd, .owned = false };
+/// True iff `TRK_READONLY` is set in the environment to any non-empty value.
+/// Cross-platform (works on Windows too) via `Environ.getAlloc`; the looked-up
+/// value itself is never needed, only its presence, so it's freed immediately.
+fn isReadOnly(environ: std.process.Environ, gpa: std.mem.Allocator) bool {
+    const val = environ.getAlloc(gpa, "TRK_READONLY") catch return false;
+    defer gpa.free(val);
+    return val.len != 0;
 }
 
 fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {

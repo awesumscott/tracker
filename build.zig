@@ -57,4 +57,15 @@ pub fn build(b: *std.Build) void {
     });
     const cli_test = b.addTest(.{ .root_module = cli_test_mod });
     test_step.dependOn(&b.addRunArtifact(cli_test).step);
+
+    // Store-root discovery tests (discover_test.zig drives discover.zig, the
+    // module main.zig's findRoot lives in). No `tracker` import needed --
+    // discovery is std.Io.Dir-only, no store/CLI dependency.
+    const discover_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/discover_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const discover_test = b.addTest(.{ .root_module = discover_test_mod });
+    test_step.dependOn(&b.addRunArtifact(discover_test).step);
 }

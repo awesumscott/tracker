@@ -45,7 +45,11 @@ trk render                        # regenerate TODO.md (destination from .tracke
 ```
 
 `trk` finds `.tracker/` by walking up from the current directory (git-style), so it runs from any
-subdirectory of a project.
+subdirectory of a project. The walk stops at a linked git worktree's root (its `.git` is a plain file,
+never a directory) — it never escapes a worktree into an enclosing repo's tracker, even when the
+worktree has no `.tracker` of its own yet. Set `TRK_READONLY=1` in the environment to refuse every
+mutating verb outright (a belt-and-suspenders guard for a dispatched agent's env, independent of
+discovery).
 
 ## Model in one screen
 
