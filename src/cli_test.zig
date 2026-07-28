@@ -916,6 +916,77 @@ test "next prints ready tasks; dep cycle rejected cleanly" {
     try testing.expect(std.mem.indexOf(u8, f.out.items, "cycle") != null);
 }
 
+// ------------------------------------------- self-wait (arc-membership cycle)
+//
+// A `needs` cycle isn't the only way a task can end up waiting on itself: an
+// arc's own completion structurally depends on every DIRECT member finishing
+// (it's never offered as the close-out prompt until drained), so a task that
+// `needs` an arc it is itself a (direct or transitive) member of can never
+// become ready — the arc can't finish while the member is open, and the
+// member can't finish until the arc does. `dep`/`in` both reject whichever
+// side would CLOSE that loop; see store.zig's `append`/`combinedReaches`.
+
+test "dep: a task needing its own arc is rejected (self-wait, direct)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const arc = mintId();
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc root" } });
+    try f.store.append(.{ .add = .{ .id = t, .title = "Member" } });
+    try f.run(&.{ "in", &t.text, &arc.text });
+
+    // t is a direct member of arc; t needing arc closes the loop.
+    const e = f.runExpectErr(&.{ "dep", &t.text, &arc.text });
+    try testing.expectEqual(cli.CliError.DependencyCycle, e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "wait on itself forever") != null);
+}
+
+test "in: joining an arc a task already (transitively) needs is rejected (self-wait, mirror)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const arc = mintId();
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc root" } });
+    try f.store.append(.{ .add = .{ .id = t, .title = "Member" } });
+    // t needs the arc BEFORE ever being a member of it — fine on its own,
+    // since arc isn't yet a container t belongs to.
+    try f.run(&.{ "dep", &t.text, &arc.text });
+
+    // Making t a direct member NOW closes the exact same loop from the
+    // other side: `dep`/`in` must be mirror-rejected, not just `dep`.
+    const e = f.runExpectErr(&.{ "in", &t.text, &arc.text });
+    try testing.expectEqual(cli.CliError.DependencyCycle, e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "wait on itself forever") != null);
+}
+
+test "dep: a legitimate cross-arc prereq is still accepted (over-rejection guard)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const arc_x = mintId();
+    const arc_y = mintId();
+    const tx = mintId();
+    const ty = mintId();
+    try f.store.append(.{ .add = .{ .id = arc_x, .title = "Arc X" } });
+    try f.store.append(.{ .add = .{ .id = arc_y, .title = "Arc Y" } });
+    try f.store.append(.{ .add = .{ .id = tx, .title = "Task in X" } });
+    try f.store.append(.{ .add = .{ .id = ty, .title = "Task in Y" } });
+    try f.store.append(.{ .in = .{ .task = tx, .arc = arc_x, .seq = 0 } });
+    try f.store.append(.{ .in = .{ .task = ty, .arc = arc_y, .seq = 0 } });
+
+    // A task in arc X needing a task in an UNRELATED arc Y is normal
+    // cross-arc ordering — must NOT be flagged as self-wait.
+    try f.run(&.{ "dep", &tx.text, &ty.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "now needs") != null);
+
+    // Needing the whole of arc Y wholesale is likewise normal: tx is not a
+    // member of Y, so there's no loop to close.
+    try f.run(&.{ "dep", &tx.text, &arc_y.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "now needs") != null);
+}
+
 test "list filters by tag, state, and word" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);

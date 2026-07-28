@@ -75,6 +75,13 @@ pub const Needs = model.Needs;
 /// An `in` membership edge in memory.
 pub const In = model.In;
 
+/// Endpoints of the back-edge that closes a self-wait cycle (see
+/// `findSelfWaitCycle`). Just a (from, to) pair — reuses `Needs`'s shape
+/// since a report is two ids, regardless of whether the closing edge was a
+/// genuine `needs` edge or an `in` membership edge (always reported in its
+/// needs-EQUIVALENT direction: arc -> task, i.e. "arc depends on task").
+pub const SelfWaitPair = Needs;
+
 pub const Store = struct {
     gpa: std.mem.Allocator,
     /// Arena owning all task strings/tags/docrefs/edges — freed wholesale on deinit.
@@ -108,6 +115,14 @@ pub const Store = struct {
     /// expected JSON object. main.zig surfaces a one-line stderr warning; the
     /// command still runs with default config.
     config_malformed: bool = false,
+    /// A self-wait cycle found in the loaded log — mediated by `in` (arc
+    /// membership), NOT a plain `needs` cycle (those still hard-fail `load`
+    /// via `checkAcyclic`). `null` = none found. Set by `load` from
+    /// `findSelfWaitCycle`; main.zig surfaces it as a one-line stderr
+    /// warning, same shape as `config_malformed` — the log still loads,
+    /// because refusing would brick a repo the bug already reached (exactly
+    /// the state a real repo was found in — see `findSelfWaitCycle`'s doc).
+    self_wait_warning: ?SelfWaitPair = null,
 
     /// Open a store rooted at `dir`. Does NOT load — call `load` for that, or
     /// `openAndLoad`. `dir` is borrowed; the caller keeps ownership/closes it.
@@ -297,10 +312,21 @@ pub const Store = struct {
     /// A cycle anywhere in the folded `needs` set is a loud `error.DependencyCycle`
     /// — re-checked here (not only on append) because a merge could introduce a
     /// cycle neither side had.
+    ///
+    /// A self-wait cycle mediated by `in` (arc membership) — e.g. a task that
+    /// `needs` its own arc — is a DIFFERENT case: `append` refuses to ever
+    /// CREATE one going forward (`combinedReaches`, below), but a log that
+    /// predates this check, or was hand-edited/badly merged, may already
+    /// carry one. Refusing to load it would brick an already-affected repo,
+    /// which is strictly worse than the bug (a real repo was found in
+    /// exactly this state — see `docs/design.md` "Arc-as-prereq"). So this
+    /// is a WARNING, not a load failure: `self_wait_warning` is set and
+    /// surfaced by main.zig/cli.zig; `load` still succeeds.
     pub fn load(self: *Store) !void {
         try self.replayFile(snapshot_name);
         try self.replayFile(log_name);
         try self.checkAcyclic();
+        self.self_wait_warning = try self.findSelfWaitCycle();
         self.loadConfig();
     }
 
@@ -449,6 +475,119 @@ pub const Store = struct {
         }
     }
 
+    /// True iff `target` is reachable from `start` via the COMBINED self-wait
+    /// graph: `needs` edges (from -> to) union `in` membership edges
+    /// reversed (arc -> task, since an arc structurally depends on
+    /// completing every direct member before IT can be considered done —
+    /// see `append`'s doc comment and design.md "Arc-as-prereq"). Pure
+    /// query over whatever is currently applied; no allocation escapes.
+    ///
+    /// This is the incremental, single-edge gate `append` uses: adding a new
+    /// directed edge X -> Y closes a cycle iff Y can already reach X, so the
+    /// call site checks `combinedReaches(Y, X)` AFTER tentatively applying
+    /// the edge — the edge itself points the wrong way to matter to this
+    /// search (it goes OUT of X, this search is looking for a path INTO X),
+    /// so including it in the graph already is harmless.
+    fn combinedReaches(self: *Store, alloc: std.mem.Allocator, start: Ulid, target: Ulid) Error!bool {
+        var seen = std.AutoHashMapUnmanaged(Key, void){};
+        defer seen.deinit(alloc);
+        var stack: std.ArrayList(Ulid) = .empty;
+        defer stack.deinit(alloc);
+        try stack.append(alloc, start);
+        try seen.put(alloc, key(start), {});
+
+        while (stack.pop()) |cur| {
+            if (cur.eql(target)) return true;
+            for (self.needs.items) |e| {
+                if (!e.from.eql(cur)) continue;
+                const gop = try seen.getOrPut(alloc, key(e.to));
+                if (!gop.found_existing) try stack.append(alloc, e.to);
+            }
+            for (self.ins.items) |e| {
+                if (!e.arc.eql(cur)) continue; // arc -> task, reversed
+                const gop = try seen.getOrPut(alloc, key(e.task));
+                if (!gop.found_existing) try stack.append(alloc, e.task);
+            }
+        }
+        return false;
+    }
+
+    /// Full scan of the COMBINED self-wait graph (see `combinedReaches` for
+    /// the edge-set definition) for a cycle anywhere in it. Returns the
+    /// (from, to) endpoints of the back-edge that closes the FIRST cycle the
+    /// scan hits (scan order, not necessarily insertion order), or null if
+    /// the combined graph is acyclic. Pure query: never mutates, never
+    /// raises on a found cycle — the caller decides what a cycle means
+    /// (`append` rejects via `combinedReaches`, `load` warns via this).
+    ///
+    /// Unlike `combinedReaches` (a single-edge, incremental check), this is
+    /// an unconditional full rescan — too expensive to run on every write,
+    /// but exactly right for the ONE-TIME check right after `load`, where
+    /// the log may hold structure no incremental gate ever validated (a
+    /// hand-edited log, a log predating this check, a bad merge).
+    pub fn findSelfWaitCycle(self: *Store) Error!?SelfWaitPair {
+        var adj = std.AutoHashMapUnmanaged(Key, std.ArrayList(Ulid)){};
+        defer {
+            var vit = adj.valueIterator();
+            while (vit.next()) |list| list.deinit(self.gpa);
+            adj.deinit(self.gpa);
+        }
+        for (self.needs.items) |e| {
+            const gop = try adj.getOrPut(self.gpa, key(e.from));
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.gpa, e.to);
+        }
+        for (self.ins.items) |e| {
+            // Reversed: the arc depends on the member, exactly like a needs edge.
+            const gop = try adj.getOrPut(self.gpa, key(e.arc));
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.gpa, e.task);
+        }
+
+        var color = std.AutoHashMapUnmanaged(Key, Color){};
+        defer color.deinit(self.gpa);
+        var task_it = self.tasks.keyIterator();
+        while (task_it.next()) |k| {
+            if ((color.get(k.*) orelse .white) != .white) continue;
+            if (try self.selfWaitDfs(k.*, &adj, &color)) |pair| return pair;
+        }
+        return null;
+    }
+
+    fn selfWaitDfs(
+        self: *Store,
+        start: Key,
+        adj: *std.AutoHashMapUnmanaged(Key, std.ArrayList(Ulid)),
+        color: *std.AutoHashMapUnmanaged(Key, Color),
+    ) Error!?SelfWaitPair {
+        var stack: std.ArrayList(Frame) = .empty;
+        defer stack.deinit(self.gpa);
+        try stack.append(self.gpa, .{ .node = start, .idx = 0 });
+        try color.put(self.gpa, start, .gray);
+
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            const neighbors: []const Ulid = if (adj.get(top.node)) |list| list.items else &.{};
+            if (top.idx < neighbors.len) {
+                const next_id = neighbors[top.idx];
+                top.idx += 1;
+                const nk = key(next_id);
+                switch (color.get(nk) orelse .white) {
+                    .white => {
+                        try color.put(self.gpa, nk, .gray);
+                        try stack.append(self.gpa, .{ .node = nk, .idx = 0 });
+                    },
+                    .gray => return SelfWaitPair{ .from = .{ .text = top.node }, .to = next_id },
+                    .black => {},
+                }
+            } else {
+                try color.put(self.gpa, top.node, .black);
+                _ = stack.pop();
+            }
+        }
+        return null;
+    }
+
     const Frame = struct { node: Key, idx: usize };
 
     fn dfsVisit(
@@ -487,9 +626,9 @@ pub const Store = struct {
     // ----------------------------------------------------------------- writes
 
     /// Append a single event to the log (creating .tracker/log.jsonl as needed),
-    /// applying it to in-memory state. For a `dep` event we re-verify the DAG and
-    /// reject `error.DependencyCycle` *before* persisting, so the log never holds
-    /// a write that closes a cycle.
+    /// applying it to in-memory state. For a `dep`/`in` event we re-verify the
+    /// self-wait invariant and reject `error.DependencyCycle` *before*
+    /// persisting, so the log never holds a write that closes a cycle.
     ///
     /// Stamps a real wall-clock ts (ms since Unix epoch) on every event at append
     /// time using comptime field injection. ts=0 on a loaded event means unknown /
@@ -504,24 +643,51 @@ pub const Store = struct {
             },
         }
 
-        // Snapshot enough to roll back the in-memory mutation if the cycle check
-        // fails: simplest correct approach is to apply, check, and on cycle undo
-        // by removing the just-added needs edge.
-        const is_dep = ev == .dep;
+        // Capture lengths so we can tell a genuinely NEW edge from a dedup
+        // no-op (`dep`) or a seq-only update (`in`) — both append-only lists
+        // grow iff `apply` actually added an entry (see `apply`'s dedup
+        // guards). This matters: re-checking on a no-op/update is not just
+        // wasted work, it risks popping the WRONG (unrelated) tail entry.
+        const needs_before = self.needs.items.len;
+        const ins_before = self.ins.items.len;
         try self.apply(ev);
-        if (is_dep) {
-            self.checkAcyclic() catch |e| {
-                if (e == error.DependencyCycle) {
-                    // Undo: drop the last needs edge (the one we just added, if
-                    // it wasn't a dedup no-op). Safe because apply appends at end.
-                    if (self.needs.items.len > 0) {
-                        const last = self.needs.items[self.needs.items.len - 1];
-                        if (last.from.eql(ev.dep.from) and last.to.eql(ev.dep.to))
-                            _ = self.needs.pop();
-                    }
+
+        // A freshly-added `dep` or `in` edge can close a cycle in the
+        // COMBINED self-wait graph: `needs` edges (from -> to) union `in`
+        // membership edges reversed (arc -> task — an arc structurally
+        // depends on completing every direct member before IT can be
+        // considered done, exactly like a needs edge, just spelled the other
+        // way round from the `in(task, arc)` event; see design.md
+        // "Arc-as-prereq"). The single most common shape: a task that
+        // `needs` its own arc (directly or transitively) can never become
+        // ready, because the arc can never drain while that same task is
+        // still open — each waits on the other forever.
+        //
+        // Checked INCREMENTALLY against just the new edge: every prior
+        // structural change went through this same gate, so the combined
+        // graph was self-wait-free immediately before this one edge lands,
+        // which means any cycle in the new graph must run through it —
+        // scanning from its far endpoint back to its near endpoint
+        // (`combinedReaches`) is therefore equivalent to, and far cheaper
+        // than, a full rescan. It also stays scoped to THIS edit even in a
+        // repo that already carries a pre-existing (legacy, load-time-warned
+        // — see `load`) cycle elsewhere: an unrelated future `dep`/`in` is
+        // never blocked by debt it doesn't touch, because the search starts
+        // at this edge's own endpoints, not at the whole graph.
+        switch (ev) {
+            .dep => |x| {
+                if (self.needs.items.len > needs_before and try self.combinedReaches(self.gpa, x.to, x.from)) {
+                    _ = self.needs.pop();
+                    return error.DependencyCycle;
                 }
-                return e;
-            };
+            },
+            .in => |x| {
+                if (self.ins.items.len > ins_before and try self.combinedReaches(self.gpa, x.task, x.arc)) {
+                    _ = self.ins.pop();
+                    return error.DependencyCycle;
+                }
+            },
+            else => {},
         }
         try self.persistAppend(ev);
     }

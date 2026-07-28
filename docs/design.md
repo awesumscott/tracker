@@ -49,6 +49,15 @@ Defined in `model.zig` (`Task`, `Needs`, `In`, `DocRef`, `State`, the `Event` un
     (`A`). A cycle is a rejected write (`error.DependencyCycle` in `store.zig`), and the acyclic invariant
     is **re-checked on fold/load** (`checkAcyclic`), not only on append — a merge can introduce a cycle
     neither side had (see storage).
+  - **Cycle-checking is NOT `needs`-only — it spans `needs` and `in` together.** Treat `in(task, arc)` as
+    an implicit reverse dependency (`arc -> task`, "an arc structurally depends on completing every direct
+    member before IT can be considered done" — exactly the `needs` shape, just spelled the opposite
+    direction from the authored edge). `append` rejects a new `dep` or `in` that would close a cycle in
+    this COMBINED graph (`combinedReaches`, an incremental single-edge check), not only in the plain
+    `needs` subgraph — a pure `needs`-only checker is blind to a task that `needs` an arc it is itself a
+    member of, which is a genuine self-wait (see "Arc-as-prereq" below), not a lesser case. A pre-existing
+    log already carrying one (predates this check, hand-edited, bad merge) is not refused at load — see
+    "Arc-as-prereq".
   - **`T in X`** (`In{ task, arc, seq }`) — direct membership of task `T` in arc `X`. This is
     **load-bearing, not optional**: pure reachability cannot express an arc's *first* task or an orphan goal
     (nothing depends on it yet), so "slot a new issue into an arc" needs a membership primitive, not just a
@@ -80,6 +89,19 @@ Defined in `model.zig` (`Task`, `Needs`, `In`, `DocRef`, `State`, the `Event` un
   member-drainage via `arcComplete` — drainage-gating let a half-filed arc unblock dependents and made an
   all-parked arc block them forever.)* `parked` members (optional/future stubs) are excluded from
   drainage so the close-out prompt never waits on them.
+  - **An arc member cannot `needs` its own arc — directly or transitively.** The arc is held back from
+    `next` until every direct member drains (above), so a member that also needs the arc waits on the arc,
+    while the arc waits on the member: neither can ever finish. This is fatal whether the membership is
+    direct (`task in arc`) or nested (`task in C`, `C in arc` — an arc can itself be a member of another
+    arc), because `arc`'s own drained-ness transitively bottoms out on `task` either way; it is emphatically
+    NOT fatal for a task in one arc to need a task — or the whole — of a genuinely *different*, unrelated
+    arc (ordinary cross-arc sequencing, used constantly). `trk dep`/`trk in` both reject whichever side
+    would close the loop (`Store.append`'s `combinedReaches` check — see the cycle-checking note above),
+    naming both ids and stating the consequence ("would wait on itself forever") rather than a bare
+    `DependencyCycle`. **A log that already contains one (from before this check existed, a hand edit, or a
+    bad merge) still loads** — `Store.load` warns to stderr (`self_wait_warning`) instead of refusing,
+    because bricking an already-affected repo would be strictly worse than the bug; going forward, `append`
+    means no NEW one can be created (found and fixed 2026-07-28, task `01KYJEDX2`).
 - **Priority = an edge/membership attribute**, the `seq` on the `in` edge — **not** a task property — so one
   task holds different positions in different arcs. **Lower `seq` sorts first.** Plus one global
   **personal-preference** priority (the `priority` field on `Task`, lower-first, matching `seq` so the two

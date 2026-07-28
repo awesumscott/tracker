@@ -263,6 +263,10 @@ pub const Cli = struct {
         \\  `dep`/`in` are NOT interchangeable: `dep` only adds DAG ordering (and, as a
         \\  side effect, reachability-membership if the prereq belongs to an arc) — it
         \\  never by itself makes anything an arc. See `trk in --help`.
+        \\  ALSO rejected if <needer> is a (direct or transitive) member of <prereq>'s
+        \\  arc: an arc can't finish while an open member waits on it, so a member
+        \\  needing its own arc is a permanent self-wait, not an ordinary cycle. A
+        \\  prereq in a DIFFERENT arc — or the whole of a different arc — is unaffected.
         \\  e.g.  trk dep 01KX6H4V 01KX6H48   (init needs config)
         },
         .{ .name = "undep", .text =
@@ -278,6 +282,9 @@ pub const Cli = struct {
         \\  with zero members); `dep` only adds a `needs` prerequisite edge, and merely
         \\  auto-JOINS an existing arc via reachability when the prereq's dependent is
         \\  already a member — it can never, by itself, create a new arc.
+        \\  Rejected if <task> already (directly or transitively) NEEDS <arc>: the
+        \\  membership would close the same self-wait loop `dep` guards against, just
+        \\  from the other direction — see `trk dep --help`.
         },
         .{ .name = "arc", .text =
         \\trk arc <id> [--undo]
@@ -874,9 +881,17 @@ pub const Cli = struct {
         var tb: [ulid.len]u8 = undefined;
         self.store.append(.{ .dep = .{ .from = from, .to = to } }) catch |e| {
             if (e == error.DependencyCycle) {
+                const fs = try self.shortId(from, &fb);
+                const ts = try self.shortId(to, &tb);
+                // Covers both shapes the store now rejects: a plain needs
+                // cycle (A->B->...->A) and a self-wait mediated by arc
+                // membership (e.g. `to` is an arc `from` is itself a
+                // member of) — "ts already depends on fs" is literally true
+                // either way, so one message serves both without needing to
+                // know which relation closed the loop.
                 try self.print(
-                    "trk: refusing {s} needs {s}: would create a dependency cycle\n",
-                    .{ try self.shortId(from, &fb), try self.shortId(to, &tb) },
+                    "trk: refusing: {s} needs {s} would close a cycle — {s} already (directly or transitively) depends on {s}, so {s} would wait on itself forever\n",
+                    .{ fs, ts, ts, fs, fs },
                 );
                 return error.DependencyCycle;
             }
@@ -919,7 +934,25 @@ pub const Cli = struct {
                 return error.UnknownFlag;
             }
         }
-        try self.store.append(.{ .in = .{ .task = task, .arc = arc, .seq = seq } });
+        self.store.append(.{ .in = .{ .task = task, .arc = arc, .seq = seq } }) catch |e| {
+            if (e == error.DependencyCycle) {
+                var tb: [ulid.len]u8 = undefined;
+                var ab: [ulid.len]u8 = undefined;
+                const ts = try self.shortId(task, &tb);
+                const as = try self.shortId(arc, &ab);
+                // The mirror of cmdDep's rejection: this membership would
+                // close the SAME combined self-wait graph from the other
+                // side — `task` already (directly or transitively) needs
+                // `arc`, so making it a member too means `arc` can never
+                // drain (it's waiting on a member that's waiting on it).
+                try self.print(
+                    "trk: refusing: {s} in {s} would close a cycle — {s} already (directly or transitively) needs {s}, so {s} would wait on itself forever (it can never finish while depending on a member that's waiting on it)\n",
+                    .{ ts, as, ts, as, as },
+                );
+                return error.DependencyCycle;
+            }
+            return e;
+        };
         var tb: [ulid.len]u8 = undefined;
         var ab: [ulid.len]u8 = undefined;
         try self.print("{s} in arc {s} (seq {d})\n", .{ try self.shortId(task, &tb), try self.shortId(arc, &ab), seq });

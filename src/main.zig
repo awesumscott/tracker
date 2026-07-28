@@ -46,6 +46,17 @@ pub fn main(init: std.process.Init) !u8 {
     // Best-effort config is non-fatal: warn but proceed on a malformed file.
     if (store.config_malformed)
         printErr(io, "trk: warning: {s}/{s} is malformed — using default config\n", .{ tracker.store.tracker_subdir, tracker.store.config_name }) catch {};
+    // A self-wait cycle already baked into the log (mediated by `in` arc
+    // membership — see Store.load's doc comment) is likewise non-fatal:
+    // warn but keep going, since refusing to load would brick the repo.
+    if (store.self_wait_warning) |p|
+        printErr(
+            io,
+            "trk: warning: {s} and {s} form a self-wait cycle across needs + arc-membership edges — " ++
+                "neither can ever complete while depending on the other; fix with `trk undep` or by " ++
+                "re-parenting the membership (`trk in`)\n",
+            .{ &p.from.text, &p.to.text },
+        ) catch {};
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);

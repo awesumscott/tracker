@@ -34,7 +34,12 @@ test "append -> fold round-trip across a re-open from disk" {
         try s.load(); // empty store -> ok
         try s.append(.{ .add = .{ .id = a, .title = "alpha", .body = "first" } });
         try s.append(.{ .add = .{ .id = b, .title = "beta" } });
-        try s.append(.{ .dep = .{ .from = b, .to = a } }); // b needs a
+        // NOTE: `a needs b` (not `b needs a`) is deliberate — `b in a` below
+        // makes `a` an arc with `b` as a direct member, and a member needing
+        // its OWN arc is exactly the self-wait bug this store now rejects
+        // (see the "self-wait" tests). `a needs b` is the safe direction: an
+        // arc needing its own member is redundant with membership, not a cycle.
+        try s.append(.{ .dep = .{ .from = a, .to = b } });
         try s.append(.{ .setState = .{ .id = a, .state = .done } });
         try s.append(.{ .in = .{ .task = b, .arc = a, .seq = 3 } });
         try s.append(.{ .setPriority = .{ .id = b, .priority = -2 } });
@@ -134,6 +139,66 @@ test "acyclic: a fold over a log that already contains a cycle errors" {
     var s = Store.open(testing.allocator, io, tmp.dir);
     defer s.deinit();
     try testing.expectError(error.DependencyCycle, s.load());
+}
+
+test "self-wait: an indirect cycle through NESTED arc membership is also rejected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId(); // deepest task
+    const arc_c = mintId(); // a's containing arc
+    const arc_b = mintId(); // arc_c's containing arc (arc_c is nested in arc_b)
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = a } });
+    try s.append(.{ .add = .{ .id = arc_c } });
+    try s.append(.{ .add = .{ .id = arc_b } });
+    try s.append(.{ .in = .{ .task = a, .arc = arc_c, .seq = 0 } }); // a in arc_c
+    try s.append(.{ .in = .{ .task = arc_c, .arc = arc_b, .seq = 0 } }); // arc_c in arc_b
+
+    // `a` is only a DIRECT member of arc_c, never directly `in` arc_b — but
+    // arc_b can't drain until arc_c is done, and arc_c can't drain until `a`
+    // is done, so `a needs arc_b` is exactly as fatal as needing its own
+    // direct arc: a two-hop self-wait through nested arc membership, not
+    // just the one-hop direct case.
+    try testing.expectError(error.DependencyCycle, s.append(.{ .dep = .{ .from = a, .to = arc_b } }));
+}
+
+test "self-wait: a pre-existing log with an in-mediated cycle still loads (warns, not fatal)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const arc = mintId();
+    const t = mintId();
+
+    // Write a self-wait-corrupted log directly (simulating a repo from
+    // before this check existed, a hand edit, or a bad merge): `t` needs its
+    // own arc `arc`, AND is a direct member of it. `append` refuses this
+    // combination today (see the tests above); `load` must not choke on one
+    // that's already on disk — refusing to load would brick the repo, which
+    // is strictly worse than the bug (a real repo was found in exactly this
+    // state — see docs/design.md "Arc-as-prereq").
+    var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(testing.allocator);
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = arc } });
+    try line.append(testing.allocator, '\n');
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = t } });
+    try line.append(testing.allocator, '\n');
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .dep = .{ .from = t, .to = arc } });
+    try line.append(testing.allocator, '\n');
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .in = .{ .task = t, .arc = arc, .seq = 0 } });
+    try line.append(testing.allocator, '\n');
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = line.items });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load(); // must NOT error
+
+    try testing.expectEqual(@as(usize, 2), s.count());
+    const pair = s.self_wait_warning orelse return error.TestUnexpectedResult;
+    try testing.expect((pair.from.eql(arc) and pair.to.eql(t)) or (pair.from.eql(t) and pair.to.eql(arc)));
 }
 
 test "membership: in-edge and reachability-via-needs, shared prereq in two arcs" {
