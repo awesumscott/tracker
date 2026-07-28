@@ -359,9 +359,18 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   the original dynamic computation at the original `min_short = 6` floor — intentionally left unstable and
   un-lengthened, since retroactively changing it would just move the staleness rather than fix it.
   `trk migrate-shorts` is the opt-in retrofit: freeze every un-frozen task at its CURRENT computed short (a
-  `setShort` event). This is a **best-effort baseline, not a repair** — a short already shortened by a PRIOR
-  compact has no recorded prior value anywhere to restore; the migration can only stop future drift, not
-  undo drift that already happened. Idempotent (a frozen task is skipped), safe to re-run blind.
+  `setShort` event). This is a **best-effort baseline, not a repair** of PRE-compact drift — a short already
+  shortened by a PRIOR compact has no recorded prior value anywhere to restore. Idempotent (an already-long-
+  enough short is skipped), safe to re-run blind.
+  - **`--min <n>` is the one exception that deliberately lengthens.** Freezing bare `migrate-shorts` at each
+    task's current computed length (floor 6) landed exactly the instability it was meant to end, just at a
+    new low: the repo owner's most-referenced task froze at 8 chars, a freshly-minted one at the bare 6-char
+    floor — both stable now, but neither matching the 9-char shape every existing written reference assumed.
+    `--min <n>` freezes (or RE-freezes) every task at `max(its current short length, n)`, still collision-
+    checked like any mint — the one place an already-frozen short is intentionally overwritten, because
+    "stable but wrong length" isn't the goal; "stable and recognizable" is. Gated behind an explicit flag
+    (never the default) because it changes ids a prior run already froze — a one-time, deliberate repair,
+    not something to run routinely.
 - **Doc-id registry ownership — folds into the store as events.** A `setDocPath { doc_id, path }` event
   (not a separate file) — one append-log, one compaction story, the same merge-safety model as every other
   event (last-write-wins on fold; `Store.docPath` resolves). A doc move is one `trk doc set <doc_id>

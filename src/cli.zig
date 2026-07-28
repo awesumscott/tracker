@@ -296,7 +296,7 @@ pub const Cli = struct {
         \\  count. A second run finds nothing (the tag is gone) — safe to re-run blind.
         },
         .{ .name = "migrate-shorts", .text =
-        \\trk migrate-shorts
+        \\trk migrate-shorts [--min <n>]
         \\  One-time (but idempotent/re-runnable) migration: for every task with no
         \\  FROZEN short id yet, freeze it at its CURRENT dynamically-computed short
         \\  (a `setShort` event) so it never again changes on add/archive/compact.
@@ -305,6 +305,14 @@ pub const Cli = struct {
         \\  id's displayed prefix, that PRE-compact value is not recorded anywhere and
         \\  cannot be recovered — this freezes whatever prefix is CURRENT right now,
         \\  which is the only recoverable baseline. Going forward, frozen ids are stable.
+        \\
+        \\  --min <n>  REPAIR mode: freeze/re-freeze every task at max(its current
+        \\  short length, n), collision-checked. Without --min, an already-frozen
+        \\  short is NEVER touched; --min is the one exception that DELIBERATELY
+        \\  LENGTHENS an already-frozen short shorter than n — this CHANGES an id a
+        \\  prior run already froze (e.g. every id you'd already written down at 8
+        \\  or 6 chars becomes longer). Run it once, on purpose, not routinely.
+        \\  e.g.  trk migrate-shorts --min 9
         },
         .{ .name = "state", .text =
         \\trk state <id> <open|done|blocked|dropped>
@@ -419,7 +427,8 @@ pub const Cli = struct {
             \\  trk in <task> <arc> [--seq <n>]   add task to an arc (NOT the same as `dep` — see `trk in --help`)
             \\  trk arc <id> [--undo]        declare/retract <id> as an arc root, even with zero members
             \\  trk migrate-arcs             convert every legacy `arc:` tag to a real declaration; idempotent
-            \\  trk migrate-shorts           freeze every task's CURRENT short id so it never changes again; idempotent
+            \\  trk migrate-shorts [--min <n>]   freeze every task's CURRENT short id so it never changes again
+            \\      --min <n> is a one-time REPAIR: also lengthens an already-frozen short below n
             \\  trk state <id> <open|done|blocked|dropped>
             \\  trk next [--arc <id>] [--limit <n>] [--json] [<term> ...]   the ready frontier
             \\  trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
@@ -1009,47 +1018,78 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- migrate-shorts
 
-    /// `trk migrate-shorts` — one-time-but-idempotent: freeze every task with
-    /// no persisted `short` yet at its CURRENT dynamically-computed short id
-    /// (a `setShort` event), so it never again moves on a future add/archive/
-    /// compact. Safe to re-run: a task already frozen is skipped (structural
-    /// idempotency), so a second pass finds nothing.
+    /// `trk migrate-shorts [--min <n>]` — one-time-but-idempotent: freeze
+    /// every task with no persisted `short` yet at its CURRENT dynamically-
+    /// computed short id (a `setShort` event), so it never again moves on a
+    /// future add/archive/compact. Safe to re-run: a task already frozen (and
+    /// already >= `--min`, if given) is skipped, so a settled repo finds
+    /// nothing.
     ///
-    /// LIMITATION (stated here and in the help text): the value frozen is
-    /// whatever `shortId` computes RIGHT NOW. If an earlier `compact` already
-    /// shortened/changed a task's displayed prefix, that pre-compact value was
-    /// never recorded anywhere and cannot be recovered — the current computed
-    /// value is the only recoverable baseline. This migration stops the drift
-    /// going forward; it cannot undo drift that already happened.
+    /// LIMITATION (stated here and in the help text): a freshly-frozen value
+    /// is whatever `shortId` computes RIGHT NOW. If an earlier `compact`
+    /// already shortened/changed a task's displayed prefix, that pre-compact
+    /// value was never recorded anywhere and cannot be recovered — the
+    /// current computed value is the only recoverable baseline.
+    ///
+    /// `--min <n>` is the one-time REPAIR path: every task (frozen or not) is
+    /// frozen at `max(its current short length, n)`, collision-checked like
+    /// any mint. Without `--min`, an already-frozen short is NEVER touched
+    /// (today's default, unchanged); `--min` is the one exception that
+    /// deliberately LENGTHENS an already-frozen short when it's shorter than
+    /// `n` — this changes an id a prior run already froze, so it is gated
+    /// behind the explicit flag and meant to be run once, on purpose (e.g. to
+    /// bring a repo's ids up to a length that matches what's already been
+    /// written down elsewhere).
     fn cmdMigrateShorts(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 0) {
-            try self.write("trk: migrate-shorts takes no arguments\n");
-            return error.UsageError;
+        var min_len: ?usize = null;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--min")) {
+                min_len = try self.parseUsize(try self.flagVal(args, &i, "--min"));
+            } else {
+                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
+                return error.UnknownFlag;
+            }
         }
+
         const ids = try self.store.allIds(self.gpa);
         defer self.gpa.free(ids);
 
-        var migrated: usize = 0;
+        var frozen: usize = 0;
+        var lengthened: usize = 0;
         for (ids) |id| {
             const t = self.store.get(id).?;
-            if (t.short != null) continue; // already frozen — never re-touched
-
-            // The CURRENT dynamically-computed short (shortId falls back to
-            // it precisely because t.short is null here).
             var sb: [ulid.len]u8 = undefined;
-            const short = try self.shortId(id, &sb);
+
+            if (t.short) |s| {
+                const min_l = min_len orelse continue; // no --min: never re-touch a frozen short
+                if (s.len >= min_l) continue; // already long enough
+                // Repair: lengthen this already-frozen short to >= min_l
+                // (still collision-checked — it may need to extend further).
+                const longer = shortestPrefix(id, ids, min_l, 1, &sb);
+                try self.store.append(.{ .setShort = .{ .id = id, .short = longer } });
+                try self.print("lengthened {s} -> {s}  {s}\n", .{ s, longer, t.title });
+                lengthened += 1;
+                continue;
+            }
+
+            // Never frozen: freeze at max(the natural unambiguous floor, --min).
+            const floor = @max(min_short, min_len orelse min_short);
+            const short = shortestPrefix(id, ids, floor, 1, &sb);
             try self.store.append(.{ .setShort = .{ .id = id, .short = short } });
             try self.print("froze {s}  {s}\n", .{ short, t.title });
-            migrated += 1;
+            frozen += 1;
         }
-        if (migrated == 0) {
-            try self.write("migrate-shorts: nothing to migrate (every task already has a frozen short)\n");
+
+        if (frozen == 0 and lengthened == 0) {
+            try self.write("migrate-shorts: nothing to migrate (every task already has a frozen short" ++
+                " long enough)\n");
         } else {
             try self.print(
-                "migrate-shorts: froze {d} task(s) at their CURRENT short id — note this is a " ++
-                    "best-effort baseline: any id already changed by an earlier `compact` cannot be " ++
+                "migrate-shorts: froze {d} new task(s), lengthened {d} existing short(s) — note this " ++
+                    "is a best-effort baseline: any id already changed by an earlier `compact` cannot be " ++
                     "recovered to a prior value; going forward these ids are stable.\n",
-                .{migrated},
+                .{ frozen, lengthened },
             );
         }
     }
@@ -1682,27 +1722,55 @@ pub const Cli = struct {
                     // are informally markdown by convention and that stays true
                     // for everything else — a leading `-` bullet list still
                     // renders as a list; only heading-shaped lines are escaped.
-                    if (isHeadingHazard(line)) try buf.append(gpa, '\\');
-                    try buf.print(gpa, "{s}\n", .{line});
+                    // Leading whitespace is skipped before testing: CommonMark
+                    // allows up to 3 leading spaces on an ATX heading, and once
+                    // this text sits inside the bullet's own indent + list-item
+                    // continuation context, several MORE spaces of raw indent
+                    // still parse as a heading rather than an indented code
+                    // block — trying to model that column arithmetic is not
+                    // worth it, so ANY amount of leading whitespace is hazard-
+                    // checked past. The backslash is inserted right before the
+                    // hazard character itself (after the preserved leading
+                    // whitespace), not at the front of the line, so the line
+                    // still reads naturally as plain, correctly-indented text.
+                    const lead = leadingWhitespaceLen(line);
+                    const rest = line[lead..];
+                    if (isHeadingHazard(rest)) {
+                        try buf.print(gpa, "{s}\\{s}\n", .{ line[0..lead], rest });
+                    } else {
+                        try buf.print(gpa, "{s}\n", .{line});
+                    }
                 }
             }
             try buf.print(gpa, "\n", .{});
         }
     }
 
-    /// True if `line` would be parsed as markdown heading structure at its
-    /// current position, outranking the render's own `#`/`##` hierarchy: an
-    /// ATX heading (`#`...`######` at line-start), or a setext underline (a
-    /// line consisting of ONLY `=` or ONLY `-` characters) — which, following
-    /// a non-blank line, retroactively turns THAT line into an H1/H2. A
-    /// setext-shaped line is flagged unconditionally (not only when a
-    /// preceding line is known) since escaping it is harmless either way.
-    /// List markers (`- item`, which always carry a space + content after the
-    /// dash) and inline formatting are deliberately left alone.
-    fn isHeadingHazard(line: []const u8) bool {
-        if (line.len == 0) return false;
-        if (line[0] == '#') return true;
-        return isAllChar(line, '=') or isAllChar(line, '-');
+    /// Index of the first non-space/tab byte in `line` (== `line.len` if the
+    /// line is all whitespace). Used to find where a hazard character sits so
+    /// the escaping backslash can be inserted AT that point, not at column 0.
+    fn leadingWhitespaceLen(line: []const u8) usize {
+        var i: usize = 0;
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+        return i;
+    }
+
+    /// True if `rest` (a line with leading whitespace already stripped) would
+    /// be parsed as markdown heading structure, outranking the render's own
+    /// `#`/`##` hierarchy: an ATX heading (`#`...`######` at line-start), or a
+    /// setext underline (a line consisting of ONLY `=` or ONLY `-`
+    /// characters, CommonMark also permits trailing whitespace on that line)
+    /// — which, following a non-blank line, retroactively turns THAT line
+    /// into an H1/H2. A setext-shaped line is flagged unconditionally (not
+    /// only when a preceding line is known) since escaping it is harmless
+    /// either way. List markers (`- item`, which always carry a space +
+    /// content after the dash) and inline formatting are deliberately left
+    /// alone.
+    fn isHeadingHazard(rest: []const u8) bool {
+        if (rest.len == 0) return false;
+        if (rest[0] == '#') return true;
+        const setext = std.mem.trimEnd(u8, rest, " \t");
+        return setext.len != 0 and (isAllChar(setext, '=') or isAllChar(setext, '-'));
     }
 
     fn isAllChar(s: []const u8, c: u8) bool {

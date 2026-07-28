@@ -436,6 +436,92 @@ test "migrate-shorts: freezes every un-frozen task at its CURRENT short; idempot
     try testing.expectEqualStrings(a_before, try f.c.shortId(a, &buf));
 }
 
+test "migrate-shorts WITHOUT --min never lengthens an already-frozen short, even a very short one" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "A", .short = a.text[0..6] } });
+
+    try f.run(&.{"migrate-shorts"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing to migrate") != null);
+    try testing.expectEqualStrings(a.text[0..6], f.store.get(a).?.short.?);
+}
+
+test "migrate-shorts --min: lengthens an already-frozen short below n; leaves a long-enough one alone; freezes a never-frozen task at >= n too" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const short8 = mintId();
+    const already_long = mintId();
+    const never_frozen = mintId();
+    try f.store.append(.{ .add = .{ .id = short8, .title = "Short8", .short = short8.text[0..8] } });
+    try f.store.append(.{ .add = .{ .id = already_long, .title = "AlreadyLong", .short = already_long.text[0..9] } });
+    try f.store.append(.{ .add = .{ .id = never_frozen, .title = "NeverFrozen" } });
+
+    try f.run(&.{ "migrate-shorts", "--min", "9" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "lengthened") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "froze") != null);
+
+    // Lengthened past 8 -> at least 9, and still a genuine prefix of its own id.
+    const s8 = f.store.get(short8).?.short.?;
+    try testing.expect(s8.len >= 9);
+    try testing.expectEqualStrings(short8.text[0..s8.len], s8);
+
+    // Already long enough: untouched byte-for-byte (no spurious "lengthened" line for it).
+    try testing.expectEqualStrings(already_long.text[0..9], f.store.get(already_long).?.short.?);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "AlreadyLong") == null);
+
+    // A never-frozen task is frozen at >= --min too (not the legacy floor of 6).
+    const nf = f.store.get(never_frozen).?.short.?;
+    try testing.expect(nf.len >= 9);
+}
+
+test "migrate-shorts --min: collision-checks the repair, extending past a sibling's shared prefix" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Two ids sharing their first 25 characters (differ only at the last char).
+    const a = try ulid.parse("0123456789ABCDEFGHJKMNPQRS");
+    const b = try ulid.parse("0123456789ABCDEFGHJKMNPQRT");
+    // `a` was migrated bare before (frozen at the legacy floor); `b` never frozen.
+    try f.store.append(.{ .add = .{ .id = a, .title = "A", .short = a.text[0..6] } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "B" } });
+
+    try f.run(&.{ "migrate-shorts", "--min", "9" });
+
+    const sa = f.store.get(a).?.short.?;
+    const sb = f.store.get(b).?.short.?;
+    // They share 25 of 26 chars, so only the FULL id distinguishes them.
+    try testing.expectEqual(@as(usize, ulid.len), sa.len);
+    try testing.expectEqual(@as(usize, ulid.len), sb.len);
+    try testing.expectEqualStrings(a.text[0..sa.len], sa);
+    try testing.expectEqualStrings(b.text[0..sb.len], sb);
+}
+
+test "migrate-shorts --min: idempotent — a second run at the same n touches nothing" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try f.store.append(.{ .add = .{ .id = mintId(), .title = "Legacy" } });
+
+    try f.run(&.{ "migrate-shorts", "--min", "9" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "froze") != null);
+
+    try f.run(&.{ "migrate-shorts", "--min", "9" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing to migrate") != null);
+}
+
+test "migrate-shorts --min: missing value and unknown flags error cleanly" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try testing.expectEqual(cli.CliError.MissingArgument, f.runExpectErr(&.{ "migrate-shorts", "--min" }));
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "migrate-shorts", "--nope" }));
+}
+
 // ----------------------------------------------------------- render projection
 
 test "render: arcs, shared prereq under both, markers, determinism" {
@@ -647,6 +733,39 @@ test "render: a body line starting with # cannot hijack the heading outline; a l
     // A leading `-` LIST (dash + space + content) is untouched — still a list.
     try testing.expect(std.mem.indexOf(u8, b.items, "  - first item\n") != null);
     try testing.expect(std.mem.indexOf(u8, b.items, "  - second item\n") != null);
+}
+
+test "render: an INDENTED body line starting with # also cannot hijack the heading outline (production shape)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The exact production shape: the body line itself carries 2 leading
+    // spaces (e.g. a quoted/continuation line), which lands under the
+    // render's OWN 2-space bullet indent — 4 total leading spaces before the
+    // `#`. Column-0 checking alone misses this (line[0] is a space, not '#').
+    const hazard = mintId();
+    try f.store.append(.{ .add = .{
+        .id = hazard,
+        .title = "Hazard task",
+        .body = "intro\n  # 01KWXRWA pm spawn fail phase=spawn.commit_refused\n  --- \n  ---\nmore",
+    } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    // Escaped right before the `#` — the ORIGINAL 2-space line indent plus the
+    // render's own 2-space indent are both preserved verbatim, so it still
+    // reads naturally as indented plain text; only the hazard char is escaped.
+    try testing.expect(std.mem.indexOf(u8, b.items, "    \\# 01KWXRWA") != null);
+    // No unescaped `#` starts anywhere on that line, at any indent.
+    try testing.expect(std.mem.indexOf(u8, b.items, "  # 01KWXRWA") == null);
+
+    // An indented setext-shaped line (only `-`, ignoring surrounding
+    // whitespace) is escaped the same way.
+    try testing.expect(std.mem.indexOf(u8, b.items, "    \\---\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "  ---\n") == null);
 }
 
 test "render: strict — done/archived excluded, open/blocked shown" {
@@ -1806,11 +1925,11 @@ test "trk migrate-arcs converts arc: tags to declarations, strips the tag, is id
     try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "migrate-arcs", "extra" }));
 }
 
-test "trk migrate-shorts rejects extra arguments" {
+test "trk migrate-shorts rejects an unrecognized argument (it now optionally takes --min, so this is UnknownFlag, matching cmdArc/cmdIn's convention for a stray token)" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
-    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "migrate-shorts", "extra" }));
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "migrate-shorts", "extra" }));
 }
 
 // ----------------------------------------------------------- helpers

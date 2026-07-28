@@ -71,6 +71,9 @@ discovery).
   identical across every future add/archive/compact. A task that predates this (every task minted before it
   shipped) still gets a *dynamically-computed* short that can move as the live id set changes; run
   `trk migrate-shorts` once to freeze those in place too (current values only — see its `--help`).
+  `trk migrate-shorts --min <n>` is a one-time REPAIR that also LENGTHENS an already-frozen short below
+  `n` chars (e.g. bring a repo's ids up to match what's already been written down elsewhere) — run it once,
+  deliberately, since it changes existing ids.
 
 ## Commands
 
