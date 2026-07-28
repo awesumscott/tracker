@@ -106,6 +106,15 @@ pub const Op = enum {
     /// concurrent `dep` for the same edge: the tombstone wins regardless of
     /// append order on fold.
     undep,
+    /// Declare (or retract) a task as an arc root, independent of whether any
+    /// task is `in` it. `declared: true` makes `isArc` true even with zero
+    /// members (expresses a real goal with no work filed yet); `declared:
+    /// false` retracts it (`trk arc --undo`). Single-task, last-write-wins on
+    /// fold — same commutation shape as `setState`/`setPriority`. This is the
+    /// unification of what used to be three non-agreeing arc definitions
+    /// (a direct `in`-edge, `in`+reachability, and a cosmetic `arc:` tag);
+    /// see `Store.isArc`.
+    arcDeclare,
 };
 
 /// One log event — a tagged union over the op kinds. Fields mirror the JSON
@@ -141,4 +150,6 @@ pub const Event = union(Op) {
     /// the edge; applied before a `dep` (in union-merge order) the `dep` dedup
     /// guard re-checks and skips re-adding it. Both orderings converge.
     undep: struct { from: Ulid, to: Ulid, ts: i64 = 0 },
+    /// Declare/retract `id` as an arc root. Last-write-wins on fold.
+    arcDeclare: struct { id: Ulid, declared: bool, ts: i64 = 0 },
 };

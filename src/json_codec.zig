@@ -24,6 +24,7 @@
 //!   {"op":"setBody","id":"<ulid>","body":"...","ts":0}
 //!   {"op":"untag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"undep","from":"<ulid>","to":"<ulid>","ts":0}
+//!   {"op":"arcDeclare","id":"<ulid>","declared":true|false,"ts":0}
 //!
 //! ts=0 is tolerated on decode (legacy lines / snapshot events).
 
@@ -77,6 +78,10 @@ fn writeInt(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, v: i64) !void {
     var tmp: [24]u8 = undefined;
     const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
     try buf.appendSlice(gpa, s);
+}
+
+fn writeBool(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, v: bool) !void {
+    try buf.appendSlice(gpa, if (v) "true" else "false");
 }
 
 /// Encode an event as a single JSON object (no newline) appended to `buf`.
@@ -197,6 +202,14 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, d.ts);
         },
+        .arcDeclare => |d| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, d.id.slice());
+            try writeKey(buf, gpa, "declared", &first);
+            try writeBool(buf, gpa, d.declared);
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, d.ts);
+        },
     }
     try buf.append(gpa, '}');
 }
@@ -223,6 +236,14 @@ fn getIntDefault(obj: std.json.ObjectMap, key: []const u8, def: i64) i64 {
     const v = obj.get(key) orelse return def;
     return switch (v) {
         .integer => |i| i,
+        else => def,
+    };
+}
+
+fn getBoolDefault(obj: std.json.ObjectMap, key: []const u8, def: bool) bool {
+    const v = obj.get(key) orelse return def;
+    return switch (v) {
+        .bool => |b| b,
         else => def,
     };
 }
@@ -333,6 +354,11 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
         .undep => return .{ .undep = .{
             .from = try getUlid(obj, "from"),
             .to = try getUlid(obj, "to"),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
+        .arcDeclare => return .{ .arcDeclare = .{
+            .id = try getUlid(obj, "id"),
+            .declared = getBoolDefault(obj, "declared", false),
             .ts = getIntDefault(obj, "ts", 0),
         } },
     }

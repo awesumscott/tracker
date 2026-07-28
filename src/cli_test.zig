@@ -29,6 +29,9 @@ const Fixture = struct {
     tmp: testing.TmpDir,
     store: *Store,
     out: *std.ArrayList(u8),
+    /// The separate stderr-bound buffer (arc-less `add` warnings). Cleared by
+    /// `run`/`runExpectErr` just like `out` so each test call starts fresh.
+    warn: *std.ArrayList(u8),
     c: *cli.Cli,
     alloc: std.mem.Allocator,
 
@@ -39,19 +42,23 @@ const Fixture = struct {
         try store.load();
         const out = try alloc.create(std.ArrayList(u8));
         out.* = .empty;
+        const warn = try alloc.create(std.ArrayList(u8));
+        warn.* = .empty;
         const c = try alloc.create(cli.Cli);
-        c.* = .{ .gpa = alloc, .io = io, .store = store, .dir = tmp.dir, .out = out };
-        return .{ .tmp = tmp, .store = store, .out = out, .c = c, .alloc = alloc };
+        c.* = .{ .gpa = alloc, .io = io, .store = store, .dir = tmp.dir, .out = out, .warn = warn };
+        return .{ .tmp = tmp, .store = store, .out = out, .warn = warn, .c = c, .alloc = alloc };
     }
 
     fn run(self: *Fixture, args: []const []const u8) !void {
         self.out.clearRetainingCapacity();
+        self.warn.clearRetainingCapacity();
         try self.c.run(args);
     }
 
     /// Run expecting a CliError; returns the error so the test can match it.
     fn runExpectErr(self: *Fixture, args: []const []const u8) anyerror {
         self.out.clearRetainingCapacity();
+        self.warn.clearRetainingCapacity();
         if (self.c.run(args)) |_| return error.TestUnexpectedSuccess else |e| return e;
     }
 
@@ -60,6 +67,8 @@ const Fixture = struct {
         self.alloc.destroy(self.c);
         self.out.deinit(self.alloc);
         self.alloc.destroy(self.out);
+        self.warn.deinit(self.alloc);
+        self.alloc.destroy(self.warn);
         self.store.deinit();
         self.alloc.destroy(self.store);
         self.tmp.cleanup();
@@ -185,6 +194,8 @@ test "read_only refuses every mutating verb cleanly and mutates nothing" {
         &.{ "dep", &a.text, &a.text },
         &.{ "undep", &a.text, &a.text },
         &.{ "in", &a.text, &a.text },
+        &.{ "arc", &a.text },
+        &.{"migrate-arcs"},
         &.{ "state", &a.text, "done" },
         &.{"render"},
         &.{"compact"},
@@ -1031,6 +1042,33 @@ test "loadConfig parses render/archive out; malformed sets config_malformed" {
     try testing.expect(f.store.config_malformed);
 }
 
+test "loadConfig: add.arcless — absent/warn/typo default to false (warn); exactly \"error\" is true" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+
+    // No config at all: the safe default.
+    try testing.expect(!f.store.config.add_arcless_error);
+
+    // Explicit "warn" -> false.
+    try sub.writeFile(io, .{ .sub_path = "config.json", .data = "{ \"add\": { \"arcless\": \"warn\" } }", .flags = .{} });
+    f.store.loadConfig();
+    try testing.expect(!f.store.config.add_arcless_error);
+
+    // A typo/unknown value degrades to the safe default, not a hard error.
+    try sub.writeFile(io, .{ .sub_path = "config.json", .data = "{ \"add\": { \"arcless\": \"eror\" } }", .flags = .{} });
+    f.store.loadConfig();
+    try testing.expect(!f.store.config.add_arcless_error);
+
+    // Exactly "error" escalates.
+    try sub.writeFile(io, .{ .sub_path = "config.json", .data = "{ \"add\": { \"arcless\": \"error\" } }", .flags = .{} });
+    f.store.loadConfig();
+    try testing.expect(f.store.config.add_arcless_error);
+}
+
 // --------------------------------------------- per-verb --help (agent exploration)
 
 test "every verb supports --help/-h and add --help mints no task" {
@@ -1041,8 +1079,9 @@ test "every verb supports --help/-h and add --help mints no task" {
     // The full dispatch set. Kept in lockstep with the `verb_help` table via the
     // count assertion below, so a new verb without a help entry is caught.
     const verbs = [_][]const u8{
-        "init",   "add",  "dep",     "undep", "in",   "state", "next", "list",
-        "render", "tree", "compact", "archive", "doc", "show",  "edit", "log",
+        "init",     "add",  "dep",       "undep", "in",   "arc",  "migrate-arcs", "state",
+        "next",     "list", "render",    "tree",  "compact", "archive", "doc",       "show",
+        "edit",     "log",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verb_help.len);
 
@@ -1312,6 +1351,223 @@ test "doc unset unregisters: resolve fails, list hides, re-set revives" {
     try f.run(&.{ "doc", "set", "design", "docs/new.md" });
     try f.run(&.{ "doc", "resolve", "design" });
     try testing.expectEqualStrings("docs/new.md\n", f.out.items);
+}
+
+// ----------------------------------------------------------- arc declaration
+
+test "trk arc declares a zero-member arc; --undo retracts it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "Goal, no work yet" } });
+    try testing.expect(!f.store.isArc(a));
+
+    try f.run(&.{ "arc", &a.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "declared an arc") != null);
+    try testing.expect(f.store.isArc(a));
+
+    // It renders its own section even with zero members.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try f.c.renderMarkdown(&buf);
+    try testing.expect(std.mem.indexOf(u8, buf.items, "## Goal, no work yet") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, "## Arc-less") == null);
+
+    try f.run(&.{ "arc", &a.text, "--undo" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "retracted") != null);
+    try testing.expect(!f.store.isArc(a));
+
+    // Unknown flag / usage errors.
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "arc", &a.text, "--bogus" }));
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{"arc"}));
+}
+
+test "trk add --arc declares the new task itself in one step" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{ "add", "Ship v2", "--arc" });
+    const id = try ulid.parse(f.out.items[0..ulid.len]);
+    try testing.expect(f.store.isArc(id));
+    // --arc needs no other arc to exist -> no arc-less warning either.
+    try testing.expectEqual(@as(usize, 0), f.warn.items.len);
+}
+
+test "trk add with neither --in nor --arc warns to stderr, NEVER pollutes stdout" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{ "add", "Orphan task" });
+    // stdout (`out`) is EXACTLY the scriptable ULID + newline — the warning
+    // must not have leaked in.
+    try testing.expectEqual(@as(usize, ulid.len + 1), f.out.items.len);
+    const id = try ulid.parse(f.out.items[0..ulid.len]);
+    // The warning lands on the separate stderr-bound buffer instead, naming
+    // the new task by its (short) id.
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "no arc") != null);
+    var sb: [ulid.len]u8 = undefined;
+    const short = try f.c.shortId(id, &sb);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, short) != null);
+
+    // --in or --arc silences it.
+    const arc = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
+    try f.run(&.{ "add", "Sorted task", "--in", &arc.text });
+    try testing.expectEqual(@as(usize, 0), f.warn.items.len);
+}
+
+test "config add.arcless = \"error\" refuses an arc-less add outright; no task minted" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    try sub.writeFile(io, .{ .sub_path = "config.json", .data = "{ \"add\": { \"arcless\": \"error\" } }", .flags = .{} });
+    f.store.loadConfig();
+
+    const before = f.store.count();
+    const e = f.runExpectErr(&.{ "add", "Would be orphaned" });
+    try testing.expectEqual(cli.CliError.NoArc, e);
+    try testing.expectEqual(before, f.store.count()); // nothing minted
+    try testing.expectEqual(@as(usize, 0), f.warn.items.len); // error path, not warn
+
+    // --arc still succeeds under the same config.
+    try f.run(&.{ "add", "Declared fine", "--arc" });
+    try testing.expectEqual(before + 1, f.store.count());
+}
+
+test "trk add --tag arc: / trk edit --add-tag arc: warn to stderr but still write the tag" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{ "add", "Legacy-style", "--tag", "arc:legacy", "--arc" });
+    const id = try ulid.parse(f.out.items[0..ulid.len]);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "DEPRECATED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "trk arc") != null);
+    try testing.expectEqualStrings("arc:legacy", f.store.get(id).?.tags.items[0]); // still written
+
+    try f.run(&.{ "edit", &id.text, "--add-tag", "arc:other" });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "DEPRECATED") != null);
+
+    // A normal tag never triggers it.
+    try f.run(&.{ "edit", &id.text, "--add-tag", "priority-1" });
+    try testing.expectEqual(@as(usize, 0), f.warn.items.len);
+}
+
+test "trk list --no-arc: composes with --state/--tag, mutually exclusive with --arc" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const member = mintId();
+    const orphan_open = mintId();
+    const orphan_done = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
+    try f.store.append(.{ .add = .{ .id = member, .title = "Member" } });
+    try f.store.append(.{ .add = .{ .id = orphan_open, .title = "Orphan open", .tags = &.{"net"} } });
+    try f.store.append(.{ .add = .{ .id = orphan_done, .title = "Orphan done" } });
+    try f.store.append(.{ .setState = .{ .id = orphan_done, .state = .done } });
+    try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+
+    try f.run(&.{ "list", "--no-arc" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan open") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan done") != null); // no --state -> all but archived
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Member") == null);
+
+    // Composes with --state.
+    try f.run(&.{ "list", "--no-arc", "--state", "open" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan open") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan done") == null);
+
+    // Composes with --tag.
+    try f.run(&.{ "list", "--no-arc", "--tag", "net" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan open") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan done") == null);
+
+    // Mutually exclusive with --arc.
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "list", "--no-arc", "--arc", &arc.text }));
+}
+
+test "render header: arc-less drift count matches actual arc-less remaining tasks" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var buf0: std.ArrayList(u8) = .empty;
+    defer buf0.deinit(alloc);
+    try f.c.renderMarkdown(&buf0);
+    try testing.expect(std.mem.indexOf(u8, buf0.items, "Arc-less drift: 0 remaining task") != null);
+
+    const arc = mintId();
+    const member = mintId();
+    const orphan = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
+    try f.store.append(.{ .add = .{ .id = member, .title = "Member" } });
+    try f.store.append(.{ .add = .{ .id = orphan, .title = "Orphan" } });
+    try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+
+    var buf1: std.ArrayList(u8) = .empty;
+    defer buf1.deinit(alloc);
+    try f.c.renderMarkdown(&buf1);
+    try testing.expect(std.mem.indexOf(u8, buf1.items, "Arc-less drift: 1 remaining task") != null);
+
+    // A done arc-less task is finished, not drift — doesn't bump the count.
+    try f.store.append(.{ .setState = .{ .id = orphan, .state = .done } });
+    var buf2: std.ArrayList(u8) = .empty;
+    defer buf2.deinit(alloc);
+    try f.c.renderMarkdown(&buf2);
+    try testing.expect(std.mem.indexOf(u8, buf2.items, "Arc-less drift: 0 remaining task") != null);
+}
+
+test "trk migrate-arcs converts arc: tags to declarations, strips the tag, is idempotent" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    const b = mintId();
+    const plain = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "Legacy A", .tags = &.{ "arc:display", "keep-me" } } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "Legacy B", .tags = &.{"arc:net"} } });
+    try f.store.append(.{ .add = .{ .id = plain, .title = "Plain", .tags = &.{"keep-me"} } });
+
+    // Already an arc pre-migration, via the legacy tag back-compat path in
+    // `isArc` — exactly why the migration exists (to move it off that path).
+    try testing.expect(f.store.isArc(a));
+    try testing.expect(!f.store.declared_arcs.contains(a.text)); // not YET a real declaration
+
+    try f.run(&.{"migrate-arcs"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "2 task(s) migrated") != null);
+
+    // Still an arc post-migration, but now via a REAL declaration — the tag
+    // that used to carry it is gone (checked below), so this can't be the
+    // legacy fallback path anymore.
+    try testing.expect(f.store.isArc(a));
+    try testing.expect(f.store.declared_arcs.contains(a.text));
+    try testing.expect(f.store.isArc(b));
+    // The legacy tag is stripped; an unrelated tag survives.
+    const ta = f.store.get(a).?;
+    try testing.expectEqual(@as(usize, 1), ta.tags.items.len);
+    try testing.expectEqualStrings("keep-me", ta.tags.items[0]);
+    // `plain` was never tagged arc: — untouched.
+    try testing.expect(!f.store.isArc(plain));
+
+    // Idempotent: a second run finds nothing (the tags are already gone).
+    try f.run(&.{"migrate-arcs"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing to migrate") != null);
+    // Declarations (and the survivor tag) are untouched by the no-op re-run.
+    try testing.expect(f.store.isArc(a));
+    try testing.expectEqualStrings("keep-me", f.store.get(a).?.tags.items[0]);
+
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "migrate-arcs", "extra" }));
 }
 
 // ----------------------------------------------------------- helpers

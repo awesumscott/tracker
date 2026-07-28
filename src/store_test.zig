@@ -175,6 +175,119 @@ test "membership: in-edge and reachability-via-needs, shared prereq in two arcs"
     try testing.expect(contains(sh_arcs, arc2));
 }
 
+// --------------------------------------------------------- isArc unification
+
+test "isArc: declared-with-zero-members, in-member, arc: tag (back-compat), and plain task" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const declared_empty = mintId();
+    const in_based = mintId();
+    const member = mintId();
+    const tagged = mintId();
+    const plain = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = declared_empty, .title = "Declared, no members" } });
+    try s.append(.{ .add = .{ .id = in_based, .title = "Has a member" } });
+    try s.append(.{ .add = .{ .id = member } });
+    try s.append(.{ .add = .{ .id = tagged, .title = "Legacy tag", .tags = &.{"arc:legacy"} } });
+    try s.append(.{ .add = .{ .id = plain, .title = "Not an arc" } });
+
+    try s.append(.{ .arcDeclare = .{ .id = declared_empty, .declared = true } });
+    try s.append(.{ .in = .{ .task = member, .arc = in_based, .seq = 0 } });
+
+    // Before declaration, a bare task with zero `in` members and no tag is not
+    // an arc — proves the fix is additive, not "everything is now an arc".
+    try testing.expect(!s.isArc(plain));
+
+    // All three arc-ness paths now agree via the single `isArc` check.
+    try testing.expect(s.isArc(declared_empty));
+    try testing.expect(s.isArc(in_based));
+    try testing.expect(s.isArc(tagged)); // back-compat: an `arc:` tag still counts
+    try testing.expect(!s.isArc(plain));
+    try testing.expect(!s.isArc(member)); // a member is not itself an arc
+
+    // A declared-but-memberless arc IS expressible: it has exactly one
+    // "member" (itself), never held back by `arcDrained` (vacuous truth).
+    const members = try s.membersOf(testing.allocator, declared_empty);
+    defer testing.allocator.free(members);
+    try testing.expectEqual(@as(usize, 1), members.len);
+    try testing.expect(members[0].eql(declared_empty));
+    try testing.expect(s.arcDrained(declared_empty));
+
+    // `--undo` (arcDeclare{declared:false}) retracts a declaration with no
+    // `in` members: isArc reverts to false.
+    try s.append(.{ .arcDeclare = .{ .id = declared_empty, .declared = false } });
+    try testing.expect(!s.isArc(declared_empty));
+
+    // But retracting a declaration on a task that ALSO has a direct `in`
+    // member leaves it an arc (the `in`-edge path is independent).
+    try s.append(.{ .arcDeclare = .{ .id = in_based, .declared = true } });
+    try testing.expect(s.isArc(in_based));
+    try s.append(.{ .arcDeclare = .{ .id = in_based, .declared = false } });
+    try testing.expect(s.isArc(in_based)); // still true: the `in` member remains
+}
+
+// ------------------------------------------------------------------ arcless
+
+test "arcless: excludes arc roots + members (direct and reachable), includes stray tasks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const arc = mintId();
+    const member = mintId();
+    const shared_prereq = mintId();
+    const declared_empty = mintId();
+    const stray = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    for ([_]tracker.Ulid{ arc, member, shared_prereq, declared_empty, stray }) |id|
+        try s.append(.{ .add = .{ .id = id } });
+    try s.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+    try s.append(.{ .dep = .{ .from = member, .to = shared_prereq } });
+    try s.append(.{ .arcDeclare = .{ .id = declared_empty, .declared = true } });
+
+    const al = try s.arcless(testing.allocator);
+    defer testing.allocator.free(al);
+
+    try testing.expect(!contains(al, arc)); // the arc root itself is "in" its own arc
+    try testing.expect(!contains(al, member));
+    try testing.expect(!contains(al, shared_prereq)); // reachable-via-needs from a member
+    try testing.expect(!contains(al, declared_empty)); // an arc root, even with 0 members
+    try testing.expect(contains(al, stray));
+    try testing.expectEqual(@as(usize, 1), al.len);
+}
+
+test "arcRoots: matches exactly what isArc is true for, across all three paths" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const declared = mintId();
+    const in_target = mintId();
+    const tagged = mintId();
+    const plain = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = declared } });
+    try s.append(.{ .add = .{ .id = in_target } });
+    try s.append(.{ .add = .{ .id = plain } });
+    try s.append(.{ .add = .{ .id = tagged, .tags = &.{"arc:x"} } });
+    try s.append(.{ .arcDeclare = .{ .id = declared, .declared = true } });
+    try s.append(.{ .in = .{ .task = plain, .arc = in_target, .seq = 0 } });
+
+    const roots = try s.arcRoots(testing.allocator);
+    defer testing.allocator.free(roots);
+    try testing.expectEqual(@as(usize, 3), roots.len);
+    try testing.expect(contains(roots, declared));
+    try testing.expect(contains(roots, in_target));
+    try testing.expect(contains(roots, tagged));
+    try testing.expect(!contains(roots, plain));
+}
+
 test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then personal" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -577,6 +690,33 @@ test "compact: determinism — two compactions of the same state are byte-identi
     defer testing.allocator.free(snap2);
 
     try testing.expectEqualSlices(u8, snap1, snap2);
+}
+
+test "compact: a declared (zero-member) arc's isArc survives snapshot round-trip" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const declared = mintId();
+    const dropped_declared = mintId();
+
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = declared, .title = "Goal, no work filed yet" } });
+        try s.append(.{ .arcDeclare = .{ .id = declared, .declared = true } });
+        // A declared arc that then gets GC'd (dropped) must NOT resurrect its
+        // declaration post-compact — the task itself is gone.
+        try s.append(.{ .add = .{ .id = dropped_declared } });
+        try s.append(.{ .arcDeclare = .{ .id = dropped_declared, .declared = true } });
+        try s.append(.{ .setState = .{ .id = dropped_declared, .state = .dropped } });
+        _ = try s.compact();
+    }
+
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expect(s2.isArc(declared));
+    try testing.expect(s2.get(dropped_declared) == null); // GC'd, not merely un-declared
 }
 
 test "compact: dropped task absent post-compact; done task survives and unblocks dependent" {

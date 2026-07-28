@@ -47,6 +47,9 @@ pub const CliError = error{
     /// A mutating verb was rejected because `read_only` is set (mirrors the
     /// `TRK_READONLY` env var main.zig checks).
     ReadOnly,
+    /// `trk add` landed a task in no arc (neither `--in` nor `--arc`) while
+    /// `.tracker/config.json`'s `add.arcless` is `"error"`.
+    NoArc,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -66,6 +69,12 @@ pub const Cli = struct {
     dir: Io.Dir,
     /// Accumulated stdout-bound output. Caller owns it.
     out: *std.ArrayList(u8),
+    /// Accumulated stderr-bound output (currently: the `trk add` arc-less
+    /// warning). Kept separate from `out` because `out` is scriptable
+    /// (`ID=$(trk add "x")`) and must never carry a warning line. main.zig
+    /// flushes this to real stderr; tests assert against it directly. Caller
+    /// owns it.
+    warn: *std.ArrayList(u8),
     /// When true, every mutating verb (see `mutating_verbs` below) refuses
     /// with `error.ReadOnly` before dispatch; read verbs are unaffected.
     /// main.zig sets this from the `TRK_READONLY` env var; tests can set it
@@ -150,6 +159,8 @@ pub const Cli = struct {
         if (std.mem.eql(u8, cmd, "dep")) return self.cmdDep(rest);
         if (std.mem.eql(u8, cmd, "undep")) return self.cmdUndep(rest);
         if (std.mem.eql(u8, cmd, "in")) return self.cmdIn(rest);
+        if (std.mem.eql(u8, cmd, "arc")) return self.cmdArc(rest);
+        if (std.mem.eql(u8, cmd, "migrate-arcs")) return self.cmdMigrateArcs(rest);
         if (std.mem.eql(u8, cmd, "state")) return self.cmdState(rest);
         if (std.mem.eql(u8, cmd, "next")) return self.cmdNext(rest);
         if (std.mem.eql(u8, cmd, "list")) return self.cmdList(rest);
@@ -183,7 +194,7 @@ pub const Cli = struct {
     /// `show`/`tree`/`log`/`doc list`/`doc resolve`/`help`) is read-only.
     /// `read_only` (`TRK_READONLY`) gates exactly this set.
     const mutating_verbs = [_][]const u8{
-        "init", "add", "dep", "undep", "in", "state", "render", "compact", "archive", "edit",
+        "init", "add", "dep", "undep", "in", "arc", "migrate-arcs", "state", "render", "compact", "archive", "edit",
     };
 
     fn isMutating(cmd: []const u8, rest: []const []const u8) bool {
@@ -213,18 +224,27 @@ pub const Cli = struct {
         },
         .{ .name = "add", .text =
         \\trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...]
-        \\       [--in <arc> [--seq <n>]] [--needs <id> ...] [--priority <n>] [-v]
+        \\       [--in <arc> [--seq <n>]] [--arc] [--needs <id> ...] [--priority <n>] [-v]
         \\  Create a task. Prints ONLY the new full ULID (scriptable: ID=$(trk add "x"));
         \\  -v/--verbose prints the friendly "added <short> (<full>)" instead. --needs
-        \\  wires prerequisite edges, --in adds it to an arc, --doc attaches a design
-        \\  pointer (register the id first with `trk doc set`). Priority: int, lower first.
+        \\  wires prerequisite edges, --in adds it to an EXISTING arc as a member, --arc
+        \\  declares THIS new task itself an arc root (even with zero members yet), --doc
+        \\  attaches a design pointer (register the id first with `trk doc set`). Priority:
+        \\  int, lower first. Neither --in nor --arc given -> a stderr warning (never
+        \\  stdout); escalate to a hard error via .tracker/config.json's add.arcless.
+        \\  A `--tag arc:<slug>` is a DEPRECATED way to mark an arc (still honored, but
+        \\  warns) — use --arc instead.
         \\  e.g.  trk add "Add dark mode" --tag ui --in 01KVX4K0 --needs 01KWZJFRR
+        \\        trk add "Ship v2" --arc
         },
         .{ .name = "dep", .text =
         \\trk dep <needer> <prereq>
         \\  Make <needer> require prerequisite <prereq> (a `needs` edge). Arg order
         \\  is needer-THEN-prereq; reversing wires the DAG backwards. Rejected if it
         \\  would close a cycle. Fix a backwards edge with `trk undep`.
+        \\  `dep`/`in` are NOT interchangeable: `dep` only adds DAG ordering (and, as a
+        \\  side effect, reachability-membership if the prereq belongs to an arc) — it
+        \\  never by itself makes anything an arc. See `trk in --help`.
         \\  e.g.  trk dep 01KX6H4V 01KX6H48   (init needs config)
         },
         .{ .name = "undep", .text =
@@ -234,8 +254,28 @@ pub const Cli = struct {
         },
         .{ .name = "in", .text =
         \\trk in <task> <arc> [--seq <n>]
-        \\  Add <task> to arc <arc> as a member, optionally ordered by --seq. An arc
-        \\  is just a goal-root task other tasks are `in`.
+        \\  Add <task> to arc <arc> as a DIRECT member, optionally ordered by --seq.
+        \\  `in` and `dep` are NOT interchangeable: `in` is the authoring primitive that
+        \\  makes <arc> an arc (`isArc` — also true for a task declared via `trk arc`,
+        \\  with zero members); `dep` only adds a `needs` prerequisite edge, and merely
+        \\  auto-JOINS an existing arc via reachability when the prereq's dependent is
+        \\  already a member — it can never, by itself, create a new arc.
+        },
+        .{ .name = "arc", .text =
+        \\trk arc <id> [--undo]
+        \\  Declare <id> an arc root (an `arcDeclare` event), independent of whether any
+        \\  task is `in` it — the fix for an arc with genuinely zero members yet (a real
+        \\  goal with no work filed), which a direct-`in`/reachability check alone cannot
+        \\  express. `--undo` retracts the declaration (a no-op if <id> is still an arc
+        \\  via an `in` member). `trk add --arc` declares a brand-new task in one step.
+        \\  e.g.  trk arc 01KX6H4V           trk arc 01KX6H4V --undo
+        },
+        .{ .name = "migrate-arcs", .text =
+        \\trk migrate-arcs
+        \\  One-time (but idempotent/re-runnable) migration: for every task carrying a
+        \\  legacy `arc:<slug>` tag, emit an `arcDeclare{declared:true}` and strip the
+        \\  tag. Prints what it changed, one line per migrated task, plus a summary
+        \\  count. A second run finds nothing (the tag is gone) — safe to re-run blind.
         },
         .{ .name = "state", .text =
         \\trk state <id> <open|done|blocked|dropped>
@@ -255,10 +295,13 @@ pub const Cli = struct {
         \\  e.g.  trk next           trk next prism windowed
         },
         .{ .name = "list", .text =
-        \\trk list [--arc <id>] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
+        \\trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
         \\  Every task (not just the ready frontier), filterable by arc/state/tag and
-        \\  the same bare-term search as `next`. --json for machine-readable output.
-        \\  e.g.  trk list --state open net
+        \\  the same bare-term search as `next`. --no-arc lists every task in NO arc
+        \\  (by the unified isArc/membership model, including needs-reachability) — the
+        \\  completeness query for "sort everything into arcs"; mutually exclusive with
+        \\  --arc. --json for machine-readable output.
+        \\  e.g.  trk list --state open net           trk list --no-arc
         },
         .{ .name = "render", .text =
         \\trk render [--out <path>]
@@ -266,7 +309,9 @@ pub const Cli = struct {
         \\  explicit --out > config render.out > stdout. Overwrites the target (it is
         \\  a generated projection with a do-not-edit header) — never hand-edit it.
         \\  A task shared by several arcs is listed in full (tags, docs, body) only
-        \\  the first time; later listings link back to that anchor.
+        \\  the first time; later listings link back to that anchor. The header
+        \\  reports an arc-less drift count every regeneration (`trk list --no-arc`
+        \\  for the list).
         },
         .{ .name = "tree", .text =
         \\trk tree <arc-or-task>
@@ -306,6 +351,8 @@ pub const Cli = struct {
         \\trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...]
         \\        [--add-doc <doc_id[#section]> ...] [--priority <n>]
         \\  Modify an existing task in place. --body replaces the whole body.
+        \\  `--add-tag arc:<slug>` is a DEPRECATED way to mark an arc (still honored,
+        \\  but warns) — use `trk arc <id>` instead.
         \\  e.g.  trk edit 01KX6H --body "revised plan" --add-tag tooling
         },
         .{ .name = "log", .text =
@@ -335,18 +382,23 @@ pub const Cli = struct {
             \\  trk init [--out <path>] [--force]   scaffold .tracker/ + config.json + a starter TODO.md
             \\      Idempotent and non-destructive: never overwrites an existing TODO.md (or
             \\      config.json without --force). --out sets config's render.out (default docs/TODO.md).
-            \\  trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...] [--in <arc> [--seq <n>]]
+            \\  trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...] [--in <arc> [--seq <n>]] [--arc]
             \\                    [--needs <id> ...] [--priority <n>] [-v]   (prints the new ULID; -v = friendly)
+            \\      Neither --in nor --arc -> warns to stderr (escalate via config's add.arcless).
             \\  trk dep <from> <to>          mark <from> as needing prerequisite <to>
             \\  trk undep <from> <to>        remove the <from> needs <to> edge (tombstone; no-op if absent)
-            \\  trk in <task> <arc> [--seq <n>]   add task to an arc
+            \\  trk in <task> <arc> [--seq <n>]   add task to an arc (NOT the same as `dep` — see `trk in --help`)
+            \\  trk arc <id> [--undo]        declare/retract <id> as an arc root, even with zero members
+            \\  trk migrate-arcs             convert every legacy `arc:` tag to a real declaration; idempotent
             \\  trk state <id> <open|done|blocked|dropped>
             \\  trk next [--arc <id>] [--limit <n>] [--json] [<term> ...]   the ready frontier
-            \\  trk list [--arc <id>] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
+            \\  trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
             \\      <term> (bare or --word <term>, repeatable) ANDs a case-insensitive
-            \\      substring search over title+body+tags. --json emits a machine-
-            \\      readable array (id/short/title/state/priority/seq?/tags).
+            \\      substring search over title+body+tags. --no-arc lists every task in
+            \\      no arc. --json emits a machine-readable array
+            \\      (id/short/title/state/priority/seq?/tags).
             \\  trk render [--out <path>]    the TODO.md markdown projection (--out > config render.out > stdout)
+            \\      Header reports an arc-less drift count every regeneration.
             \\  trk tree <arc-or-task>       the ASCII prereq hierarchy
             \\  trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
             \\      Graduate DONE tasks to the changelog: emit them as markdown bullets
@@ -640,6 +692,7 @@ pub const Cli = struct {
         var body: []const u8 = "";
         var priority: ?i32 = null;
         var in_arc: ?[]const u8 = null;
+        var declare_arc = false;
         var seq: i32 = 0;
         var verbose = false;
         var tags: std.ArrayList([]const u8) = .empty;
@@ -662,6 +715,8 @@ pub const Cli = struct {
                 try docs.append(self.gpa, try self.flagVal(args, &i, "--doc"));
             } else if (std.mem.eql(u8, arg, "--in")) {
                 in_arc = try self.flagVal(args, &i, "--in");
+            } else if (std.mem.eql(u8, arg, "--arc")) {
+                declare_arc = true;
             } else if (std.mem.eql(u8, arg, "--seq")) {
                 seq = try self.parseI32(try self.flagVal(args, &i, "--seq"));
             } else if (std.mem.eql(u8, arg, "--priority")) {
@@ -681,16 +736,37 @@ pub const Cli = struct {
         defer self.gpa.free(need_ids);
         for (needs.items, 0..) |n, idx| need_ids[idx] = try self.resolve(n);
 
+        // Neither --in nor --arc: the task lands in no arc. Decided BEFORE
+        // minting so the hard-error path (config add.arcless = "error") never
+        // leaves a half-built task in the log.
+        const has_arc = arc_id != null or declare_arc;
+        if (!has_arc and self.store.config.add_arcless_error) {
+            try self.write(
+                "trk: refusing: this task would land in no arc (neither --in nor --arc given) — " ++
+                    "pass one, or set add.arcless to \"warn\" in .tracker/config.json to downgrade this to a warning\n",
+            );
+            return error.NoArc;
+        }
+
         const id = ulid.mint(self.io);
         const tag_slice = tags.items;
         try self.store.append(.{ .add = .{ .id = id, .title = title, .body = body, .tags = tag_slice } });
         if (priority) |p| try self.store.append(.{ .setPriority = .{ .id = id, .priority = p } });
         if (arc_id) |a| try self.store.append(.{ .in = .{ .task = id, .arc = a, .seq = seq } });
+        if (declare_arc) try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = true } });
         for (need_ids) |to| try self.store.append(.{ .dep = .{ .from = id, .to = to } });
         for (docs.items) |d| {
             const ref = splitDocRef(d);
             try self.store.append(.{ .docref = .{ .id = id, .doc_id = ref.doc_id, .section_id = ref.section_id } });
         }
+
+        // Arc-less warning goes to the SEPARATE `warn` buffer (stderr), never
+        // `out` (stdout) — `out` is exactly the scriptable ULID and nothing else.
+        if (!has_arc) {
+            var sb: [ulid.len]u8 = undefined;
+            try self.warn.print(self.gpa, "trk: warning: {s} \"{s}\" is in no arc (pass --in <arc> or --arc)\n", .{ try self.shortId(id, &sb), title });
+        }
+        for (tag_slice) |tg| try self.warnDeprecatedArcTag(id, tg);
 
         // Quiet by default: print ONLY the full ULID so `ID=$(trk add ...)` is
         // scriptable with no parsing. `-v`/`--verbose` gives the friendly form.
@@ -764,6 +840,97 @@ pub const Cli = struct {
         var tb: [ulid.len]u8 = undefined;
         var ab: [ulid.len]u8 = undefined;
         try self.print("{s} in arc {s} (seq {d})\n", .{ try self.shortId(task, &tb), try self.shortId(arc, &ab), seq });
+    }
+
+    // ----------------------------------------------------------- arc
+
+    /// If `tg` is the DEPRECATED `arc:<slug>` marker, nudge to stderr steering
+    /// new usage at `trk arc`/`trk add --arc` instead — the whole point of
+    /// unifying arc-ness is that nothing should keep silently writing the old,
+    /// cosmetic marker. `Store.isArc` still HONORS an already-written tag
+    /// read-only (back-compat: an un-migrated repo's arcs keep working); this
+    /// is the write-path guard that stops NEW ones from accumulating. Never
+    /// blocks the write (a warning, not an error) — the tag is still valid
+    /// input, just steered away from.
+    fn warnDeprecatedArcTag(self: *Cli, id: Ulid, tg: []const u8) Error!void {
+        if (!std.mem.startsWith(u8, tg, "arc:")) return;
+        var sb: [ulid.len]u8 = undefined;
+        const sid = try self.shortId(id, &sb);
+        try self.warn.print(
+            self.gpa,
+            "trk: warning: {s}: tag \"{s}\" is the DEPRECATED arc marker — use `trk arc {s}` (or `trk add --arc`) instead; `trk migrate-arcs` converts existing ones\n",
+            .{ sid, tg, sid },
+        );
+    }
+
+    /// `trk arc <id> [--undo]` — declare (or, with --undo, retract) <id> as an
+    /// arc root independent of `in` membership. See `Store.isArc`.
+    fn cmdArc(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len == 0) {
+            try self.write("trk: usage: trk arc <id> [--undo]\n");
+            return error.UsageError;
+        }
+        const id = try self.resolve(args[0]);
+        var undo = false;
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--undo")) {
+                undo = true;
+            } else {
+                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
+                return error.UnknownFlag;
+            }
+        }
+        try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = !undo } });
+        var sb: [ulid.len]u8 = undefined;
+        if (undo) {
+            try self.print("{s} arc declaration retracted\n", .{try self.shortId(id, &sb)});
+        } else {
+            try self.print("{s} declared an arc\n", .{try self.shortId(id, &sb)});
+        }
+    }
+
+    // ----------------------------------------------------------- migrate-arcs
+
+    /// `trk migrate-arcs` — one-time-but-idempotent conversion of every legacy
+    /// `arc:<slug>` tag to a real `arcDeclare` event, stripping the tag. Safe
+    /// to re-run: a task whose tag was already stripped has none left to find,
+    /// so a second pass changes nothing (structural idempotency, not a
+    /// separate "already migrated" check).
+    fn cmdMigrateArcs(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len != 0) {
+            try self.write("trk: migrate-arcs takes no arguments\n");
+            return error.UsageError;
+        }
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+
+        var migrated: usize = 0;
+        for (ids) |id| {
+            const t = self.store.get(id).?;
+            if (!hasArcTag(t)) continue;
+            var arc_tags: std.ArrayList([]const u8) = .empty;
+            defer arc_tags.deinit(self.gpa);
+            for (t.tags.items) |tg| {
+                if (std.mem.startsWith(u8, tg, "arc:")) try arc_tags.append(self.gpa, try self.gpa.dupe(u8, tg));
+            }
+            defer for (arc_tags.items) |tg| self.gpa.free(tg);
+            if (arc_tags.items.len == 0) continue;
+
+            try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = true } });
+            for (arc_tags.items) |tg| try self.store.append(.{ .untag = .{ .id = id, .tag = tg } });
+
+            var sb: [ulid.len]u8 = undefined;
+            try self.print("migrated {s}  {s}  (declared; stripped {d} arc: tag(s))\n", .{
+                try self.shortId(id, &sb), t.title, arc_tags.items.len,
+            });
+            migrated += 1;
+        }
+        if (migrated == 0) {
+            try self.write("migrate-arcs: nothing to migrate\n");
+        } else {
+            try self.print("migrate-arcs: {d} task(s) migrated\n", .{migrated});
+        }
     }
 
     // ----------------------------------------------------------- state
@@ -1096,6 +1263,7 @@ pub const Cli = struct {
 
     fn cmdList(self: *Cli, args: []const []const u8) Error!void {
         var arc_filter: ?[]const u8 = null;
+        var no_arc = false;
         var state_filter: ?State = null;
         var tag_filter: ?[]const u8 = null;
         var limit: ?usize = null;
@@ -1107,6 +1275,8 @@ pub const Cli = struct {
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--arc")) {
                 arc_filter = try self.flagVal(args, &i, "--arc");
+            } else if (std.mem.eql(u8, args[i], "--no-arc")) {
+                no_arc = true;
             } else if (std.mem.eql(u8, args[i], "--state")) {
                 const sv = try self.flagVal(args, &i, "--state");
                 state_filter = State.fromString(sv) orelse {
@@ -1129,10 +1299,18 @@ pub const Cli = struct {
                 try words.append(self.gpa, args[i]);
             }
         }
+        if (arc_filter != null and no_arc) {
+            try self.write("trk: --arc and --no-arc are mutually exclusive\n");
+            return error.UsageError;
+        }
         const arc_id: ?Ulid = if (arc_filter) |a| try self.resolve(a) else null;
         var members: ?[]Ulid = null;
         defer if (members) |m| self.gpa.free(m);
-        if (arc_id) |a| members = try self.store.membersOf(self.gpa, a);
+        if (arc_id) |a| {
+            members = try self.store.membersOf(self.gpa, a);
+        } else if (no_arc) {
+            members = try self.store.arcless(self.gpa);
+        }
 
         // Deterministic: iterate sorted ids (in-memory query over the fold).
         const ids = try self.store.allIds(self.gpa);
@@ -1220,7 +1398,14 @@ pub const Cli = struct {
             \\
         , .{});
 
-        // Collect arcs = ids that appear as an `in.arc`. Sort by (root prio, id).
+        // Arc-less drift: surfaced every regeneration so it can't go unnoticed
+        // for weeks (`trk list --no-arc` for the list itself).
+        try buf.print(gpa, "> Arc-less drift: {d} remaining task(s) belong to no arc (`trk list --no-arc`).\n\n", .{
+            try self.arclessRemainingCount(),
+        });
+
+        // Collect arcs = every id `isArc` is true for (declared, `in`-target, or
+        // back-compat `arc:` tag). Sort by (root prio, id).
         const arcs = try self.collectArcs();
         defer gpa.free(arcs);
 
@@ -1294,9 +1479,13 @@ pub const Cli = struct {
         for (ids) |id| {
             if (printed.contains(id.text)) continue;
             if (!isRemaining(self.store.get(id).?.state)) continue;
-            // An empty arc (no members, so not in collectArcs) still carries its
-            // `arc:` identity — don't list it as a stray Arc-less bullet.
-            if (self.store.get(id).?.state == .open and hasArcTag(self.store.get(id).?)) continue;
+            // An arc (declared, `in`-target, or back-compat `arc:` tag — the
+            // unified `isArc`) is always represented by its own section above,
+            // even with zero members — never list it as a stray Arc-less bullet.
+            // (Belt-and-suspenders: `printed` already covers this for every
+            // remaining-state arc root reachable from `collectArcs`, since it is
+            // always its own first member; this check is the explicit backstop.)
+            if (self.store.isArc(id)) continue;
             if (!any_arcless) {
                 try buf.print(gpa, "## Arc-less\n\n", .{});
                 any_arcless = true;
@@ -1483,18 +1672,27 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- arc helpers
 
-    /// Arcs (ids appearing as `in.arc`), sorted by (root priority, id).
+    /// Count of remaining (open/blocked) tasks in NO arc — the render header's
+    /// drift number. Wraps `Store.arcless`, filtered to `isRemaining` (a
+    /// done/dropped/archived arc-less task isn't "not yet sorted" drift, it's
+    /// just finished).
+    fn arclessRemainingCount(self: *Cli) Error!usize {
+        const ids = try self.store.arcless(self.gpa);
+        defer self.gpa.free(ids);
+        var n: usize = 0;
+        for (ids) |id| {
+            if (isRemaining(self.store.get(id).?.state)) n += 1;
+        }
+        return n;
+    }
+
+    /// Every arc (every id `isArc` is true for — declared, an `in.arc` target,
+    /// or a back-compat `arc:` tag), sorted by (root priority, id). This is
+    /// what earns a task its own "## <title>" render section, INCLUDING a
+    /// declared-but-zero-member arc (it renders as a header with no bullets).
     fn collectArcs(self: *Cli) Error![]Ulid {
         const gpa = self.gpa;
-        var seen = std.AutoHashMapUnmanaged([ulid.len]u8, void){};
-        defer seen.deinit(gpa);
-        var arcs: std.ArrayList(Ulid) = .empty;
-        defer arcs.deinit(gpa);
-        for (self.store.ins.items) |e| {
-            const gop = try seen.getOrPut(gpa, e.arc.text);
-            if (!gop.found_existing) try arcs.append(gpa, e.arc);
-        }
-        const out = try gpa.dupe(Ulid, arcs.items);
+        const out = try self.store.arcRoots(gpa);
         const Ctx = struct {
             cli: *Cli,
             fn less(c: @This(), x: Ulid, y: Ulid) bool {
@@ -1738,6 +1936,7 @@ pub const Cli = struct {
         for (add_tags.items) |tg| {
             try self.store.append(.{ .tag = .{ .id = id, .tag = tg } });
             try self.print("{s}: +#{s}\n", .{ sid, tg });
+            try self.warnDeprecatedArcTag(id, tg);
         }
         for (rm_tags.items) |tg| {
             try self.store.append(.{ .untag = .{ .id = id, .tag = tg } });
@@ -1874,6 +2073,10 @@ fn containsId(haystack: []const Ulid, needle: Ulid) bool {
     return false;
 }
 
+/// DEPRECATED: the cosmetic pre-`arcDeclare` arc marker. Not a definition of
+/// arc-ness (that's `Store.isArc`, which already reads this same `arc:` prefix
+/// as a backward-compat fallback) — this standalone helper survives only as
+/// `trk migrate-arcs`'s "does this task need converting" check.
 fn hasArcTag(t: Task) bool {
     for (t.tags.items) |tg| {
         if (std.mem.startsWith(u8, tg, "arc:")) return true;

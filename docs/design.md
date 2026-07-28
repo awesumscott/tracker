@@ -9,7 +9,7 @@ file, which becomes a generated projection — structure the value once, render 
 dogfooded: the tool tracks its own development.
 
 The tool is `trk` (a small Zig host tool). Subcommands:
-`add`/`dep`/`undep`/`in`/`state`/`edit`/`show`/`next`/`list`/`render`/`tree`/`log`/`doc`/`compact`/`archive`.
+`add`/`dep`/`undep`/`in`/`arc`/`migrate-arcs`/`state`/`edit`/`show`/`next`/`list`/`render`/`tree`/`log`/`doc`/`compact`/`archive`.
 
 What this doc owns: the **data model** (the two-edge DAG, edge-attribute priority, doc-refs), the **`next`
 query**, the **arc/wave tree-print**, the **state lifecycle / changelog handoff**, and the **merge model +
@@ -53,11 +53,26 @@ Defined in `model.zig` (`Task`, `Needs`, `In`, `DocRef`, `State`, the `Event` un
     **load-bearing, not optional**: pure reachability cannot express an arc's *first* task or an orphan goal
     (nothing depends on it yet), so "slot a new issue into an arc" needs a membership primitive, not just a
     prereq edge.
-- **Arc = a goal root.** A task is **in an arc** if it carries an `in X` edge **or** is reachable from a
-  member via `needs` edges (`membersOf` / `arcsOf` in `store.zig`). Membership-as-reachability is the *read
-  projection* (it auto-surfaces a shared prereq in every arc that reaches it); the `in` edge is the
-  *authoring primitive*. A new prereq of an existing arc member auto-joins that arc; a genuinely new arc
-  task is added with one `in` edge.
+- **Arc-ness is a DECLARED property (`isArc`, `store.zig`) — one definition, not three.** A task is an arc
+  iff it is **explicitly declared** (`trk arc <id>` / `trk add --arc`, an `arcDeclare` event — last-write-wins
+  on fold, `--undo` retracts) **or** at least one task carries a direct `in X` edge. Declaring makes an
+  arc with **genuinely zero members** expressible (a real goal with no work filed yet, previously
+  inexpressible by either structural check alone); the `in`-edge path needs no migration — every arc
+  built before `arcDeclare` existed keeps working unchanged. *(Supersedes an earlier state where `isArc`
+  (direct `in` only), `membersOf`/`arcsOf` reachability, and a cosmetic `arc:<slug>` tag — introduced in a
+  render-polish commit purely to keep an empty arc out of the "Arc-less" section — silently disagreed: an
+  arc populated only via `dep`/`needs` edges could read `isArc`-false while `list --arc` showed it full.
+  The tag is still read as an implicit declaration at load time for backward compatibility (DEPRECATED —
+  `trk migrate-arcs` converts every tagged task to a real declaration and strips the tag; `add`/`edit`
+  warn on stderr if a new `arc:` tag is written).)*
+  **`membersOf`/`arcsOf` stay the strictly WIDER read projection**: a task is *in* an arc if it's a direct
+  `in` member **or** `needs`-reachable from one (it auto-surfaces a shared prereq in every arc that reaches
+  it) — never conflate this with `isArc` (arc-ness of the root itself). A new prereq of an existing arc
+  member auto-joins that arc via reachability; a genuinely new arc task is added with one `in` edge.
+  **`Store.arcless`** is the completeness counterpart — every task in NO arc by this unified model
+  (`trk list --no-arc`; `render`'s header counts it as drift every regeneration) — the terminating
+  condition for "sort everything into arcs". `trk add` warns to stderr (escalate to a hard error via
+  `.tracker/config.json`'s `add.arcless`) when a new task lands in no arc.
 - **Arc-as-prereq.** A `needs` edge whose *target is an arc root* is an **ordinary prereq on the root's
   state** — it opens when the root is closed (`done`/`dropped`/`archived`), exactly like any other edge.
   There is no special arc-gate in the DAG: the root's state *is* the arc's completion (the

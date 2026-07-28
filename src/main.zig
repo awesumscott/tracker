@@ -49,6 +49,11 @@ pub fn main(init: std.process.Init) !u8 {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
+    // Separate stderr-bound buffer (currently: the `trk add` arc-less
+    // warning) so it can never land on stdout, which stays scriptable
+    // (`ID=$(trk add "x")`).
+    var warn: std.ArrayList(u8) = .empty;
+    defer warn.deinit(gpa);
 
     // `TRK_READONLY=1` (any non-empty value) refuses every mutating verb —
     // the belt-and-suspenders layer over the worktree-boundary discovery fix
@@ -57,7 +62,7 @@ pub fn main(init: std.process.Init) !u8 {
     // discovery resolves to.
     const read_only = isReadOnly(init.minimal.environ, gpa);
 
-    var c = cli.Cli{ .gpa = gpa, .io = io, .store = &store, .dir = dir, .out = &out, .read_only = read_only };
+    var c = cli.Cli{ .gpa = gpa, .io = io, .store = &store, .dir = dir, .out = &out, .warn = &warn, .read_only = read_only };
     defer c.prereq_scratch.deinit(gpa);
 
     const result = c.run(args.items);
@@ -65,6 +70,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Flush whatever the CLI produced. Error messages are appended to `out` by
     // the CLI itself, so a failed command still has a clean message to print.
     std.Io.File.stdout().writeStreamingAll(io, out.items) catch {};
+    std.Io.File.stderr().writeStreamingAll(io, warn.items) catch {};
 
     if (result) |_| {
         return 0;
@@ -84,6 +90,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.BadNumber,
             error.DependencyCycle,
             error.ReadOnly,
+            error.NoArc,
             => {},
             else => try printErr(io, "trk: error: {s}\n", .{@errorName(e)}),
         }

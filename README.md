@@ -55,7 +55,9 @@ discovery).
 
 - **Task** = a node with `id` (a ULID, minted once), `title`, `body`, `state`, `priority`, `tags`, doc-refs.
 - **`A needs B`** — a prerequisite edge, forming a DAG. Cycles are rejected. `trk dep <needer> <prereq>`.
-- **`T in X`** — task `T` belongs to arc `X`. An **arc** is a goal-root task. `trk in <task> <arc>`.
+- **`T in X`** — task `T` belongs to arc `X`. An **arc** is a task that's either **declared**
+  (`trk arc <id>`, or `trk add --arc` — works even with zero members) or has ≥1 direct `in` member.
+  `trk in <task> <arc>`. `trk list --no-arc` lists every task in no arc.
 - **State** — `open` → `done` → `archived` (via `trk archive`, which graduates done tasks to changelog
   bullets and tombstones them), plus `blocked` (held) and `dropped` (won't-do).
 - **`next`** — the ready frontier: every `open` task whose prerequisites are all satisfied. An arc root
@@ -67,7 +69,7 @@ discovery).
 
 ## Commands
 
-`add · dep · undep · in · state · edit · show · next · list · render · tree · log · doc · compact · archive · init`
+`add · dep · undep · in · arc · migrate-arcs · state · edit · show · next · list · render · tree · log · doc · compact · archive · init`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.

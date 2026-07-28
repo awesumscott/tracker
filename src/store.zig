@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Scott Lowe
 //! The Store: in-memory task graph folded from an append-only JSONL event log,
-//! plus the queries (`membersOf`, `arcsOf`, `next`) and the write/atomic-write
-//! helpers.
+//! plus the queries (`membersOf`, `arcsOf`, `isArc`, `arcless`, `next`) and the
+//! write/atomic-write helpers.
 //!
 //! Layout under the store dir (overridable — tests pass a tmp dir):
 //!   <dir>/.tracker/snapshot.jsonl   optional full-state baseline (absent in v1)
@@ -59,6 +59,11 @@ pub const Config = struct {
     render_out: ?[]const u8 = null,
     /// `archive.out` — where `trk archive` writes its draft with no `--out`. null → stdout.
     archive_out: ?[]const u8 = null,
+    /// `add.arcless` — policy when `trk add` mints a task with neither `--in`
+    /// nor `--arc`. `false` (default, `"warn"` or absent) prints a warning to
+    /// stderr and proceeds; `true` (`"error"`) refuses the add outright. Warn
+    /// is the default so a repo with no config behaves exactly as before.
+    add_arcless_error: bool = false,
 };
 
 pub const Error = error{
@@ -90,6 +95,11 @@ pub const Store = struct {
     /// the same doc_id replaces the path in the map (old key/value stay in the
     /// arena — cheap and correct since the arena only grows until deinit).
     doc_paths: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Explicitly declared arc roots (`trk arc <id>` / `trk add --arc`), folded
+    /// from `arcDeclare` events. A member of this set is an arc even with zero
+    /// `in` members — the structural fix for an empty goal that was previously
+    /// inexpressible. See `isArc`.
+    declared_arcs: std.AutoHashMapUnmanaged(Key, void) = .empty,
     /// Parsed `.tracker/config.json` (defaults when the file is absent). Loaded
     /// by `load` alongside the event fold; best-effort (a malformed file yields
     /// defaults and sets `config_malformed` rather than failing the command).
@@ -116,6 +126,7 @@ pub const Store = struct {
         self.ins.deinit(self.gpa);
         self.dep_tombstones.deinit(self.gpa);
         self.doc_paths.deinit(self.gpa);
+        self.declared_arcs.deinit(self.gpa);
         self.arena.deinit();
     }
 
@@ -254,6 +265,16 @@ pub const Store = struct {
                 }
                 if (idx) |i| _ = self.needs.orderedRemove(i);
             },
+            .arcDeclare => |x| {
+                // Out-of-order tolerance like dep/in: a declare for an id we
+                // haven't `add`ed yet creates the placeholder.
+                _ = try self.ensureNode(x.id);
+                if (x.declared) {
+                    try self.declared_arcs.put(self.gpa, key(x.id), {});
+                } else {
+                    _ = self.declared_arcs.remove(key(x.id));
+                }
+            },
         }
     }
 
@@ -293,6 +314,25 @@ pub const Store = struct {
         };
         self.config.render_out = self.readNestedOut(root, "render");
         self.config.archive_out = self.readNestedOut(root, "archive");
+        self.config.add_arcless_error = self.readAddArclessError(root);
+    }
+
+    /// Pull `add.arcless` (a string, `"warn"` or `"error"`) from the config
+    /// root. Returns `false` (warn) for a missing section/key, a non-string
+    /// value, or any string other than exactly `"error"` — so a typo degrades
+    /// to the safe default rather than silently hard-erroring every add.
+    fn readAddArclessError(_: *Store, root: std.json.ObjectMap) bool {
+        const sv = root.get("add") orelse return false;
+        const so = switch (sv) {
+            .object => |o| o,
+            else => return false,
+        };
+        const ov = so.get("arcless") orelse return false;
+        const s = switch (ov) {
+            .string => |str| str,
+            else => return false,
+        };
+        return std.mem.eql(u8, s, "error");
     }
 
     /// Pull `<section>.out` (a string) from the config root, arena-dup'd. Returns
@@ -592,6 +632,7 @@ pub const Store = struct {
     ///     are excluded entirely)
     ///   - `setPriority` if non-zero
     ///   - `docref` events per task
+    ///   - `arcDeclare{declared:true}` if the task is in `declared_arcs`
     ///   - `dep` edges sorted by (from, to) — skipped if either endpoint is gone
     ///   - `in`  edges sorted by (task, arc) — skipped if either endpoint is gone
     ///
@@ -638,6 +679,8 @@ pub const Store = struct {
                 try self.emit(buf, .{ .docref = .{
                     .id = id, .doc_id = dr.doc_id, .section_id = dr.section_id,
                 } });
+            if (self.declared_arcs.contains(key(id)))
+                try self.emit(buf, .{ .arcDeclare = .{ .id = id, .declared = true } });
             live += 1;
         }
 
@@ -832,6 +875,11 @@ pub const Store = struct {
                     task_id = null;
                     break :blk try std.fmt.allocPrint(alloc, "docpath: {s} -> {s}", .{ x.doc_id, x.path });
                 },
+                .arcDeclare => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "arc: {s}", .{if (x.declared) "declared" else "undeclared"});
+                },
             };
             try out.append(alloc, .{
                 .ts = ts,
@@ -938,13 +986,81 @@ pub const Store = struct {
 
     // -------------------------------------------------------------- arc-as-prereq
 
-    /// True if `id` is used as an arc — i.e. at least one task is `in id`.
-    /// (A `needs` edge whose target is an arc means "needs the whole arc.")
+    /// True if `id` is an arc: EXPLICITLY DECLARED (`trk arc <id>` / `trk add
+    /// --arc`, an `arcDeclare{declared:true}` event — `declared_arcs`), OR at
+    /// least one task is `in id`. A `needs` edge whose target is an arc means
+    /// "needs the whole arc."
+    ///
+    /// This is the single, unified arc-ness check — it replaces three
+    /// previously non-agreeing notions: this direct-`in`-edge test, `in`+
+    /// reachability (`membersOf`/`arcsOf`, a strictly WIDER set used for
+    /// listing/rendering — do not conflate the two), and a cosmetic `arc:`
+    /// slug tag that a render-polish commit introduced to keep an empty arc
+    /// (no `in` members yet, so invisible to the two structural checks) out of
+    /// the "Arc-less" section. Declaring makes an empty arc structurally
+    /// expressible, so the tag is no longer needed as a definition — but it is
+    /// still HONORED here, read-only, for backward compatibility with any
+    /// already-tagged arc: DEPRECATED, do not write new `arc:` tags; `trk
+    /// migrate-arcs` converts every tagged task to a real `arcDeclare` and
+    /// strips the tag.
     pub fn isArc(self: *Store, id: Ulid) bool {
+        if (self.declared_arcs.contains(key(id))) return true;
         for (self.ins.items) |e| {
             if (e.arc.eql(id)) return true;
         }
+        if (self.tasks.get(key(id))) |t| {
+            for (t.tags.items) |tg| {
+                if (std.mem.startsWith(u8, tg, "arc:")) return true;
+            }
+        }
         return false;
+    }
+
+    /// Every declared-or-inferred arc root id: appears as an `in.arc`, is in
+    /// `declared_arcs`, or (back-compat) carries an `arc:` tag — i.e. every id
+    /// for which `isArc` is true. Caller owns the slice. Shared by `arcless`
+    /// and the CLI's arc-section collector so both use the identical set.
+    pub fn arcRoots(self: *Store, alloc: std.mem.Allocator) ![]Ulid {
+        var out: std.ArrayList(Ulid) = .empty;
+        var it = self.tasks.keyIterator();
+        while (it.next()) |k| {
+            const id: Ulid = .{ .text = k.* };
+            if (self.isArc(id)) try out.append(alloc, id);
+        }
+        const s = try out.toOwnedSlice(alloc);
+        std.sort.pdq(Ulid, s, {}, Ulid.lessThan);
+        return s;
+    }
+
+    /// Every task belonging to NO arc: not itself an arc root, not a direct
+    /// `in` member of one, and not `needs`-reachable from a member of one —
+    /// the complement of the union of `membersOf(arc)` over every arc root.
+    /// The completeness counterpart to `membersOf`: the terminating condition
+    /// for "sort everything into arcs" (`trk list --no-arc`), and what
+    /// `render`'s generated header counts as drift. Caller owns the slice.
+    pub fn arcless(self: *Store, alloc: std.mem.Allocator) ![]Ulid {
+        const roots = try self.arcRoots(self.gpa);
+        defer self.gpa.free(roots);
+
+        var in_some = std.AutoHashMapUnmanaged(Key, void){};
+        defer in_some.deinit(self.gpa);
+        for (roots) |arc| {
+            const members = try self.membersOf(self.gpa, arc);
+            defer self.gpa.free(members);
+            for (members) |m| try in_some.put(self.gpa, key(m), {});
+        }
+
+        var out: std.ArrayList(Ulid) = .empty;
+        var it = self.tasks.keyIterator();
+        while (it.next()) |k| {
+            if (!in_some.contains(k.*)) try out.append(self.gpa, .{ .text = k.* });
+        }
+        const s = try out.toOwnedSlice(self.gpa);
+        defer self.gpa.free(s);
+        const final = try alloc.alloc(Ulid, s.len);
+        @memcpy(final, s);
+        std.sort.pdq(Ulid, final, {}, Ulid.lessThan);
+        return final;
     }
 
     /// Drained: no DIRECT member (a task with `in id`), excluding members tagged
