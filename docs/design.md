@@ -343,6 +343,25 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   un-graduated changelog queue, so dropping it would silently corrupt the graph. (Crash-safe: the snapshot
   is renamed durably *before* the log is truncated; every event is idempotent on re-fold, so the inter-step
   window loses nothing — a dropped/archived task may transiently reappear until the next compact.)
+- **Short-id stability — frozen at mint time, never recomputed.** `Cli.shortId` originally computed "the
+  shortest CURRENTLY-unambiguous prefix" fresh on every call, against the live id set — a pure function of
+  that set, so it moved whenever the set moved. Measured in production: a `compact` GC'd the dropped/
+  archived backlog, the id set shrank, and prefixes got SHORTER — `01KYJTYBT` silently became `01KYJTYB`.
+  Every written reference (commits, task bodies, docs, the CHANGELOG, a human's own memory) went stale in
+  one stroke; lookup still worked (any unique prefix resolves), but *recognition* broke. The fix: a task's
+  short id is minted ONCE (`Cli.mintShortId`, floor `min_short_mint = 9` — chosen to match the dominant
+  historical id length so a fresh mint less often needs extending) and persisted forever (`Task.short`, the
+  `add` event's own `short` field) — never recomputed on add, archive, or compact. `compact`'s
+  `serializeState` re-emits each live task's `add` event (the canonicalization step); it MUST carry
+  `.short` through verbatim, because that re-emission is exactly where the original bug bit. Collision
+  handling is one-sided: a new mint's candidate extends past an existing id's collision; an already-frozen
+  short is never touched. A task with no frozen short (every task minted before this landed) falls back to
+  the original dynamic computation at the original `min_short = 6` floor — intentionally left unstable and
+  un-lengthened, since retroactively changing it would just move the staleness rather than fix it.
+  `trk migrate-shorts` is the opt-in retrofit: freeze every un-frozen task at its CURRENT computed short (a
+  `setShort` event). This is a **best-effort baseline, not a repair** — a short already shortened by a PRIOR
+  compact has no recorded prior value anywhere to restore; the migration can only stop future drift, not
+  undo drift that already happened. Idempotent (a frozen task is skipped), safe to re-run blind.
 - **Doc-id registry ownership — folds into the store as events.** A `setDocPath { doc_id, path }` event
   (not a separate file) — one append-log, one compaction story, the same merge-safety model as every other
   event (last-write-wins on fold; `Store.docPath` resolves). A doc move is one `trk doc set <doc_id>

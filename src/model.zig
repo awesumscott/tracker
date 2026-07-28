@@ -65,6 +65,13 @@ pub const Task = struct {
     priority: i32 = 0,
     tags: std.ArrayList([]const u8) = .empty,
     docrefs: std.ArrayList(DocRef) = .empty,
+    /// The FROZEN short id, set once (at mint time, or by `trk migrate-shorts`
+    /// for a pre-existing task) and never recomputed. `null` means "never
+    /// frozen" — the display falls back to the legacy dynamically-computed
+    /// prefix (`Cli.shortId`), which is UNSTABLE (moves as the id set moves —
+    /// see design.md "short-id stability"). Once set, this is the only value
+    /// `Cli.shortId` ever returns for this task, across adds/archives/compacts.
+    short: ?[]const u8 = null,
 };
 
 /// `from needs to` — `from` depends on prerequisite `to`. Forms the DAG.
@@ -115,6 +122,12 @@ pub const Op = enum {
     /// (a direct `in`-edge, `in`+reachability, and a cosmetic `arc:` tag);
     /// see `Store.isArc`.
     arcDeclare,
+    /// Freeze a task's short id (last-write-wins on fold, but in practice
+    /// written exactly once per task — by `trk migrate-shorts` for a
+    /// pre-existing task that has no persisted short yet). A freshly-minted
+    /// task instead gets its short via the `add` event's own `short` field;
+    /// this op exists for the retrofit path where `add` already happened.
+    setShort,
 };
 
 /// One log event — a tagged union over the op kinds. Fields mirror the JSON
@@ -127,6 +140,12 @@ pub const Event = union(Op) {
         title: []const u8 = "",
         body: []const u8 = "",
         tags: []const []const u8 = &.{},
+        /// The short id frozen at mint time (`Cli.mintShortId`), or the value
+        /// `compact`'s `serializeState` re-emits to carry an already-frozen
+        /// short through the snapshot rewrite. `null` on a legacy add (no
+        /// short was ever frozen) — the display then falls back to the
+        /// dynamically-computed prefix. See `Task.short`.
+        short: ?[]const u8 = null,
         /// Original creation ms (the ULID also carries it; kept explicit for the
         /// human face and so a re-mint scheme could decouple later). Optional.
         ts: i64 = 0,
@@ -152,4 +171,6 @@ pub const Event = union(Op) {
     undep: struct { from: Ulid, to: Ulid, ts: i64 = 0 },
     /// Declare/retract `id` as an arc root. Last-write-wins on fold.
     arcDeclare: struct { id: Ulid, declared: bool, ts: i64 = 0 },
+    /// Freeze a task's short id. See `Op.setShort`.
+    setShort: struct { id: Ulid, short: []const u8, ts: i64 = 0 },
 };

@@ -166,6 +166,11 @@ pub const Store = struct {
                 // Reset tags to exactly the add's set (idempotent on replay).
                 t.tags = .empty;
                 for (x.tags) |tg| try t.tags.append(self.a(), try self.a().dupe(u8, tg));
+                // Freeze the short id carried on this add (mint time, or a
+                // compact's re-canonicalized add carrying the already-frozen
+                // value forward). null means "never frozen" — display falls
+                // back to the dynamic computation. See `Task.short`.
+                t.short = if (x.short) |s| try self.a().dupe(u8, s) else null;
             },
             .setState => |x| {
                 const t = try self.ensureNode(x.id);
@@ -248,7 +253,10 @@ pub const Store = struct {
                 // Find and remove the tag if present. Shift-remove to preserve order.
                 var idx: ?usize = null;
                 for (t.tags.items, 0..) |tg, i| {
-                    if (std.mem.eql(u8, tg, x.tag)) { idx = i; break; }
+                    if (std.mem.eql(u8, tg, x.tag)) {
+                        idx = i;
+                        break;
+                    }
                 }
                 if (idx) |i| _ = t.tags.orderedRemove(i);
             },
@@ -261,7 +269,10 @@ pub const Store = struct {
                 // (handles the case where the `dep` precedes the `undep` in fold order).
                 var idx: ?usize = null;
                 for (self.needs.items, 0..) |e, i| {
-                    if (e.from.eql(x.from) and e.to.eql(x.to)) { idx = i; break; }
+                    if (e.from.eql(x.from) and e.to.eql(x.to)) {
+                        idx = i;
+                        break;
+                    }
                 }
                 if (idx) |i| _ = self.needs.orderedRemove(i);
             },
@@ -274,6 +285,10 @@ pub const Store = struct {
                 } else {
                     _ = self.declared_arcs.remove(key(x.id));
                 }
+            },
+            .setShort => |x| {
+                const t = try self.ensureNode(x.id);
+                t.short = try self.a().dupe(u8, x.short);
             },
         }
     }
@@ -384,6 +399,7 @@ pub const Store = struct {
                 gpa.free(x.body);
                 for (x.tags) |t| gpa.free(t);
                 gpa.free(x.tags);
+                if (x.short) |s| gpa.free(s);
             },
             .tag => |x| gpa.free(x.tag),
             .docref => |x| {
@@ -397,6 +413,7 @@ pub const Store = struct {
             .setTitle => |x| gpa.free(x.title),
             .setBody => |x| gpa.free(x.body),
             .untag => |x| gpa.free(x.tag),
+            .setShort => |x| gpa.free(x.short),
             else => {},
         }
     }
@@ -668,8 +685,16 @@ pub const Store = struct {
             for (t.tags.items, 0..) |tg, i| tag_slice[i] = tg;
             std.sort.pdq([]const u8, tag_slice, {}, lessThanStr);
 
+            // .short is carried through VERBATIM — this is the fix for the
+            // instability bug: a compact must never let a task's frozen short
+            // silently regress to a shorter/different dynamically-computed
+            // value just because the live id set shrank.
             try self.emit(buf, .{ .add = .{
-                .id = id, .title = t.title, .body = t.body, .tags = tag_slice,
+                .id = id,
+                .title = t.title,
+                .body = t.body,
+                .tags = tag_slice,
+                .short = t.short,
             } });
             if (t.state != .open)
                 try self.emit(buf, .{ .setState = .{ .id = id, .state = t.state } });
@@ -677,7 +702,9 @@ pub const Store = struct {
                 try self.emit(buf, .{ .setPriority = .{ .id = id, .priority = t.priority } });
             for (t.docrefs.items) |dr|
                 try self.emit(buf, .{ .docref = .{
-                    .id = id, .doc_id = dr.doc_id, .section_id = dr.section_id,
+                    .id = id,
+                    .doc_id = dr.doc_id,
+                    .section_id = dr.section_id,
                 } });
             if (self.declared_arcs.contains(key(id)))
                 try self.emit(buf, .{ .arcDeclare = .{ .id = id, .declared = true } });
@@ -879,6 +906,11 @@ pub const Store = struct {
                     ts = x.ts;
                     task_id = x.id;
                     break :blk try std.fmt.allocPrint(alloc, "arc: {s}", .{if (x.declared) "declared" else "undeclared"});
+                },
+                .setShort => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "short frozen: {s}", .{x.short});
                 },
             };
             try out.append(alloc, .{

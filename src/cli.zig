@@ -13,8 +13,14 @@
 //!   - User errors surface as `CliError` + a clean message appended to `out`
 //!     (main maps that to a non-zero exit). No Zig stack traces on bad input.
 //!   - ID ergonomics: every id argument accepts a unique ULID *prefix*
-//!     (git-short-hash style). `shortId` prints the shortest currently
-//!     unambiguous prefix (min `min_short`). All human output uses short ids.
+//!     (git-short-hash style). All human output uses short ids, but a short
+//!     id is NOT always dynamically computed: a task minted after short-id
+//!     freezing landed (or migrated via `trk migrate-shorts`) carries a
+//!     PERSISTED `short` that `shortId` returns verbatim, stable forever —
+//!     it never changes on add, archive, or compact. A task with no
+//!     persisted short falls back to the legacy behavior: the shortest
+//!     CURRENTLY-unambiguous prefix (min `min_short`), which moves as the
+//!     live id set moves. See design.md "short-id stability".
 
 const std = @import("std");
 const tracker = @import("tracker");
@@ -26,9 +32,20 @@ const State = tracker.State;
 const Task = tracker.Task;
 const Io = std.Io;
 
-/// Minimum length of a short id we print (git uses 7; ULIDs are denser, but a
-/// short floor keeps them recognizable + stable as the set grows).
+/// Minimum length of a DYNAMICALLY-computed short id — the legacy/back-compat
+/// path for a task with no persisted `short` (git uses 7; ULIDs are denser,
+/// but a short floor keeps them recognizable). This value governs ONLY the
+/// fallback computation; it is intentionally left at its historical value —
+/// existing un-migrated ids are never retroactively re-lengthened.
 pub const min_short = 6;
+
+/// Floor for a NEWLY MINTED task's short id (`Cli.mintShortId`), frozen
+/// forever into `Task.short` at mint time. Higher than the legacy
+/// `min_short` floor: 9 matches the dominant historical id length in
+/// practice, so a fresh mint less often needs extending past the floor —
+/// and because a frozen short is never recomputed, a longer floor pays off
+/// once instead of on every future collision check.
+pub const min_short_mint = 9;
 
 /// User-facing errors. Each is reported as a clean one-line message; the caller
 /// (main) maps any `CliError` to a non-zero exit code. `error.DependencyCycle`
@@ -161,6 +178,7 @@ pub const Cli = struct {
         if (std.mem.eql(u8, cmd, "in")) return self.cmdIn(rest);
         if (std.mem.eql(u8, cmd, "arc")) return self.cmdArc(rest);
         if (std.mem.eql(u8, cmd, "migrate-arcs")) return self.cmdMigrateArcs(rest);
+        if (std.mem.eql(u8, cmd, "migrate-shorts")) return self.cmdMigrateShorts(rest);
         if (std.mem.eql(u8, cmd, "state")) return self.cmdState(rest);
         if (std.mem.eql(u8, cmd, "next")) return self.cmdNext(rest);
         if (std.mem.eql(u8, cmd, "list")) return self.cmdList(rest);
@@ -194,7 +212,7 @@ pub const Cli = struct {
     /// `show`/`tree`/`log`/`doc list`/`doc resolve`/`help`) is read-only.
     /// `read_only` (`TRK_READONLY`) gates exactly this set.
     const mutating_verbs = [_][]const u8{
-        "init", "add", "dep", "undep", "in", "arc", "migrate-arcs", "state", "render", "compact", "archive", "edit",
+        "init", "add", "dep", "undep", "in", "arc", "migrate-arcs", "migrate-shorts", "state", "render", "compact", "archive", "edit",
     };
 
     fn isMutating(cmd: []const u8, rest: []const []const u8) bool {
@@ -276,6 +294,17 @@ pub const Cli = struct {
         \\  legacy `arc:<slug>` tag, emit an `arcDeclare{declared:true}` and strip the
         \\  tag. Prints what it changed, one line per migrated task, plus a summary
         \\  count. A second run finds nothing (the tag is gone) — safe to re-run blind.
+        },
+        .{ .name = "migrate-shorts", .text =
+        \\trk migrate-shorts
+        \\  One-time (but idempotent/re-runnable) migration: for every task with no
+        \\  FROZEN short id yet, freeze it at its CURRENT dynamically-computed short
+        \\  (a `setShort` event) so it never again changes on add/archive/compact.
+        \\  A second run finds nothing (every task now has a frozen short) — safe to
+        \\  re-run blind. LIMITATION: if a prior `compact` already shortened/changed an
+        \\  id's displayed prefix, that PRE-compact value is not recorded anywhere and
+        \\  cannot be recovered — this freezes whatever prefix is CURRENT right now,
+        \\  which is the only recoverable baseline. Going forward, frozen ids are stable.
         },
         .{ .name = "state", .text =
         \\trk state <id> <open|done|blocked|dropped>
@@ -390,6 +419,7 @@ pub const Cli = struct {
             \\  trk in <task> <arc> [--seq <n>]   add task to an arc (NOT the same as `dep` — see `trk in --help`)
             \\  trk arc <id> [--undo]        declare/retract <id> as an arc root, even with zero members
             \\  trk migrate-arcs             convert every legacy `arc:` tag to a real declaration; idempotent
+            \\  trk migrate-shorts           freeze every task's CURRENT short id so it never changes again; idempotent
             \\  trk state <id> <open|done|blocked|dropped>
             \\  trk next [--arc <id>] [--limit <n>] [--json] [<term> ...]   the ready frontier
             \\  trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
@@ -413,7 +443,11 @@ pub const Cli = struct {
             \\  trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...] [--add-doc <doc_id[#section]> ...] [--priority <n>]
             \\  trk log [<id>] [--limit <n>] event history (most-recent-last)
             \\
-            \\Ids accept any unique prefix (git-short-hash style).
+            \\Ids accept any unique prefix (git-short-hash style). A task minted after
+            \\short-id freezing (or migrated via `trk migrate-shorts`) always displays
+            \\the SAME short id — it never changes on add/archive/compact. A task with
+            \\no frozen short falls back to a dynamically-computed prefix that can
+            \\change as the id set changes; `trk migrate-shorts` freezes it in place.
             \\Per-verb help: `trk <verb> --help`  (or  `trk help <verb>`).
             \\
             \\.tracker/ is found by walking up from cwd (git-style), bounded at a linked
@@ -488,24 +522,58 @@ pub const Cli = struct {
         return true;
     }
 
-    /// The shortest currently-unambiguous prefix of `id` (>= `min_short`),
-    /// written into the caller-provided `buf` (a full-ULID-sized scratch buffer);
-    /// returns a slice of `buf`. No heap allocation, so call sites need no free
-    /// (two short ids in one line want two buffers). Lookup is O(N·len) over the
-    /// id set — fine for an in-repo backlog.
-    pub fn shortId(self: *Cli, id: Ulid, buf: *[ulid.len]u8) ![]const u8 {
-        const ids = try self.store.allIds(self.gpa);
-        defer self.gpa.free(ids);
-        var n: usize = min_short;
+    /// Shared prefix-search: the shortest prefix of `id.text` (>= `floor`,
+    /// capped at the full ULID) that collides with at most `max_collisions`
+    /// other entries in `ids`. Two call shapes:
+    ///   - DISPLAY (`id` is already a member of `ids`): `max_collisions = 1`
+    ///     tolerates the id matching itself.
+    ///   - MINT (`id` is NOT yet in `ids` — not yet inserted into the store):
+    ///     `max_collisions = 0`, so any match is a real collision to extend past.
+    /// Written into the caller-provided `buf`; returns a slice of `buf`. No heap
+    /// allocation. Lookup is O(N·len) over the id set — fine for an in-repo backlog.
+    fn shortestPrefix(id: Ulid, ids: []const Ulid, floor: usize, max_collisions: usize, buf: *[ulid.len]u8) []const u8 {
+        var n: usize = floor;
         while (n < ulid.len) : (n += 1) {
             var collisions: usize = 0;
             for (ids) |other| {
                 if (std.mem.eql(u8, id.text[0..n], other.text[0..n])) collisions += 1;
             }
-            if (collisions <= 1) break;
+            if (collisions <= max_collisions) break;
         }
         @memcpy(buf[0..n], id.text[0..n]);
         return buf[0..n];
+    }
+
+    /// The short id to DISPLAY for `id`. If a short was frozen for this task
+    /// (at mint time via `mintShortId`, or later via `trk migrate-shorts`),
+    /// returns it verbatim — stable forever, independent of the live id set.
+    /// Otherwise falls back to the legacy dynamically-computed prefix (>=
+    /// `min_short`), which is UNSTABLE: it moves as the id set moves (an add,
+    /// an archive, a compact can all change it). Written into the
+    /// caller-provided `buf`; returns a slice of `buf`. No heap allocation
+    /// needed by the caller (two short ids in one line want two buffers).
+    pub fn shortId(self: *Cli, id: Ulid, buf: *[ulid.len]u8) ![]const u8 {
+        if (self.store.get(id)) |t| {
+            if (t.short) |s| {
+                @memcpy(buf[0..s.len], s);
+                return buf[0..s.len];
+            }
+        }
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+        return shortestPrefix(id, ids, min_short, 1, buf);
+    }
+
+    /// The short id to FREEZE for a newly-minted `id` that is NOT YET in the
+    /// store (called before `store.append(.add)`). The shortest prefix (>=
+    /// `min_short_mint`) that does not collide with any EXISTING task's id —
+    /// collision handling is one-sided: only the new id's candidate is ever
+    /// extended; an already-frozen short is never touched. The caller embeds
+    /// the result in the `add` event's `short` field so it persists forever.
+    pub fn mintShortId(self: *Cli, id: Ulid, buf: *[ulid.len]u8) ![]const u8 {
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+        return shortestPrefix(id, ids, min_short_mint, 0, buf);
     }
 
     // ----------------------------------------------------------- small parse helpers
@@ -749,8 +817,14 @@ pub const Cli = struct {
         }
 
         const id = ulid.mint(self.io);
+        // Freeze the short id NOW, before `id` exists in the store, so the
+        // collision check is against the pre-add id set (mintShortId's
+        // contract) — then carry it in the add event so it's persisted
+        // forever (Task.short), never recomputed.
+        var short_buf: [ulid.len]u8 = undefined;
+        const short = try self.mintShortId(id, &short_buf);
         const tag_slice = tags.items;
-        try self.store.append(.{ .add = .{ .id = id, .title = title, .body = body, .tags = tag_slice } });
+        try self.store.append(.{ .add = .{ .id = id, .title = title, .body = body, .tags = tag_slice, .short = short } });
         if (priority) |p| try self.store.append(.{ .setPriority = .{ .id = id, .priority = p } });
         if (arc_id) |a| try self.store.append(.{ .in = .{ .task = id, .arc = a, .seq = seq } });
         if (declare_arc) try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = true } });
@@ -930,6 +1004,53 @@ pub const Cli = struct {
             try self.write("migrate-arcs: nothing to migrate\n");
         } else {
             try self.print("migrate-arcs: {d} task(s) migrated\n", .{migrated});
+        }
+    }
+
+    // ----------------------------------------------------------- migrate-shorts
+
+    /// `trk migrate-shorts` — one-time-but-idempotent: freeze every task with
+    /// no persisted `short` yet at its CURRENT dynamically-computed short id
+    /// (a `setShort` event), so it never again moves on a future add/archive/
+    /// compact. Safe to re-run: a task already frozen is skipped (structural
+    /// idempotency), so a second pass finds nothing.
+    ///
+    /// LIMITATION (stated here and in the help text): the value frozen is
+    /// whatever `shortId` computes RIGHT NOW. If an earlier `compact` already
+    /// shortened/changed a task's displayed prefix, that pre-compact value was
+    /// never recorded anywhere and cannot be recovered — the current computed
+    /// value is the only recoverable baseline. This migration stops the drift
+    /// going forward; it cannot undo drift that already happened.
+    fn cmdMigrateShorts(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len != 0) {
+            try self.write("trk: migrate-shorts takes no arguments\n");
+            return error.UsageError;
+        }
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+
+        var migrated: usize = 0;
+        for (ids) |id| {
+            const t = self.store.get(id).?;
+            if (t.short != null) continue; // already frozen — never re-touched
+
+            // The CURRENT dynamically-computed short (shortId falls back to
+            // it precisely because t.short is null here).
+            var sb: [ulid.len]u8 = undefined;
+            const short = try self.shortId(id, &sb);
+            try self.store.append(.{ .setShort = .{ .id = id, .short = short } });
+            try self.print("froze {s}  {s}\n", .{ short, t.title });
+            migrated += 1;
+        }
+        if (migrated == 0) {
+            try self.write("migrate-shorts: nothing to migrate (every task already has a frozen short)\n");
+        } else {
+            try self.print(
+                "migrate-shorts: froze {d} task(s) at their CURRENT short id — note this is a " ++
+                    "best-effort baseline: any id already changed by an earlier `compact` cannot be " ++
+                    "recovered to a prior value; going forward these ids are stable.\n",
+                .{migrated},
+            );
         }
     }
 
@@ -1520,12 +1641,17 @@ pub const Cli = struct {
                 // Link back to the anchored first listing; keep the title (and
                 // this arc's seq) for scanability, skip the repeated detail.
                 try buf.print(gpa, "- {s} [`{s}`](#{s})", .{ checkbox, sid, &id.text });
-                if (seq) |s| try buf.print(gpa, " [{d}]", .{s});
+                // seq 0 is the default (no explicit ordering) — omit it rather
+                // than render the ABSENCE of ordering as noise. A genuine
+                // non-zero seq uses "(seq N)", never bare "[N]": in markdown a
+                // bare `[N]` is reference-link syntax with no definition, so it
+                // rendered as an empty/broken anchor.
+                if (seq) |s| if (s != 0) try buf.print(gpa, " (seq {d})", .{s});
                 try buf.print(gpa, " {s}\n", .{t.title});
                 return;
             },
         }
-        if (seq) |s| try buf.print(gpa, " [{d}]", .{s});
+        if (seq) |s| if (s != 0) try buf.print(gpa, " (seq {d})", .{s});
         try buf.print(gpa, " {s}", .{t.title});
         for (t.tags.items) |tg| try buf.print(gpa, " #{s}", .{tg});
         for (t.docrefs.items) |dr| {
@@ -1548,11 +1674,42 @@ pub const Cli = struct {
                 if (line.len == 0) {
                     try buf.print(gpa, "\n", .{});
                 } else {
-                    try buf.print(gpa, "  {s}\n", .{line});
+                    try buf.print(gpa, "  ", .{});
+                    // Neutralize a line-leading construct that would hijack the
+                    // DOCUMENT's own heading structure (identical bug class to
+                    // the seq-bracket fix above: field text landing in markdown
+                    // without neutralizing markdown-significant syntax). Bodies
+                    // are informally markdown by convention and that stays true
+                    // for everything else — a leading `-` bullet list still
+                    // renders as a list; only heading-shaped lines are escaped.
+                    if (isHeadingHazard(line)) try buf.append(gpa, '\\');
+                    try buf.print(gpa, "{s}\n", .{line});
                 }
             }
             try buf.print(gpa, "\n", .{});
         }
+    }
+
+    /// True if `line` would be parsed as markdown heading structure at its
+    /// current position, outranking the render's own `#`/`##` hierarchy: an
+    /// ATX heading (`#`...`######` at line-start), or a setext underline (a
+    /// line consisting of ONLY `=` or ONLY `-` characters) — which, following
+    /// a non-blank line, retroactively turns THAT line into an H1/H2. A
+    /// setext-shaped line is flagged unconditionally (not only when a
+    /// preceding line is known) since escaping it is harmless either way.
+    /// List markers (`- item`, which always carry a space + content after the
+    /// dash) and inline formatting are deliberately left alone.
+    fn isHeadingHazard(line: []const u8) bool {
+        if (line.len == 0) return false;
+        if (line[0] == '#') return true;
+        return isAllChar(line, '=') or isAllChar(line, '-');
+    }
+
+    fn isAllChar(s: []const u8, c: u8) bool {
+        for (s) |ch| {
+            if (ch != c) return false;
+        }
+        return true;
     }
 
     // ----------------------------------------------------------- tree (ASCII)

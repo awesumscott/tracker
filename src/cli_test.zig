@@ -196,6 +196,7 @@ test "read_only refuses every mutating verb cleanly and mutates nothing" {
         &.{ "in", &a.text, &a.text },
         &.{ "arc", &a.text },
         &.{"migrate-arcs"},
+        &.{"migrate-shorts"},
         &.{ "state", &a.text, "done" },
         &.{"render"},
         &.{"compact"},
@@ -303,6 +304,136 @@ test "shortId returns an unambiguous prefix" {
     // 25 chars), and must resolve back to exactly a.
     const resolved = try f.c.resolve(sa);
     try testing.expect(resolved.eql(a));
+}
+
+// ----------------------------------------------------------- short-id stability (frozen shorts)
+
+test "add mints and freezes a persisted short id (>= min_short_mint), returned verbatim by shortId" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try f.run(&.{ "add", "New" });
+    const ids = try f.store.allIds(alloc);
+    defer alloc.free(ids);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    const t = f.store.get(ids[0]).?;
+    try testing.expect(t.short != null);
+    // No collisions in a fresh store -> exactly the mint floor.
+    try testing.expectEqual(@as(usize, cli.min_short_mint), t.short.?.len);
+
+    var buf: [ulid.len]u8 = undefined;
+    const displayed = try f.c.shortId(ids[0], &buf);
+    try testing.expectEqualStrings(t.short.?, displayed);
+}
+
+test "a task added directly to the store (no mint) has no frozen short — the back-compat path" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "Legacy" } });
+    try testing.expect(f.store.get(a).?.short == null);
+}
+
+test "THE PRODUCTION BUG: a minted short survives add/drop churn + compact byte-identical" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Mint the task whose short we track.
+    try f.run(&.{ "add", "Keep me" });
+    const kept = try ulid.parse(f.out.items[0..ulid.len]);
+    var buf1: [ulid.len]u8 = undefined;
+    const short_before = try alloc.dupe(u8, try f.c.shortId(kept, &buf1));
+    defer alloc.free(short_before);
+
+    // Churn: mint + drop a bunch of siblings. This is exactly the shape that
+    // used to shrink the live id set and shorten `kept`'s dynamically-computed
+    // prefix out from under it.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try f.run(&.{ "add", "churn" });
+        const cid = try ulid.parse(f.out.items[0..ulid.len]);
+        try f.run(&.{ "state", &cid.text, "dropped" });
+    }
+
+    // Compact: GCs the dropped churn tasks, shrinking the live id set (the
+    // exact trigger of the production incident).
+    try f.run(&.{"compact"});
+
+    var buf2: [ulid.len]u8 = undefined;
+    try testing.expectEqualStrings(short_before, try f.c.shortId(kept, &buf2));
+
+    // Byte-identical across an on-disk reopen too — this is what actually
+    // exercises `serializeState`'s rewrite of the `add` event, the exact spot
+    // the bug bit (the short was silently dropped/recomputed on compact).
+    {
+        var reopened = Store.open(alloc, io, f.tmp.dir);
+        defer reopened.deinit();
+        try reopened.load();
+        const t = reopened.get(kept).?;
+        try testing.expect(t.short != null);
+        try testing.expectEqualStrings(short_before, t.short.?);
+    }
+}
+
+test "mintShortId: collision with an EXISTING id extends only the NEW candidate; the existing id is untouched" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Two crafted ids sharing their first 10 characters — well past
+    // min_short_mint (9), so a naive 9-char mint would collide.
+    const a = try ulid.parse("0123456789ABCDEFGHJKMNPQRS");
+    const b = try ulid.parse("0123456789ABCDEFGHJKMNPQRT");
+    try f.store.append(.{ .add = .{ .id = a, .title = "Existing" } });
+
+    var buf: [ulid.len]u8 = undefined;
+    const mint_short = try f.c.mintShortId(b, &buf);
+    try testing.expect(mint_short.len > 10); // extended past the shared prefix
+    try testing.expectEqualStrings(b.text[0..mint_short.len], mint_short);
+
+    // One-sided: `a` (the already-present id) is never touched by minting `b`.
+    try testing.expect(f.store.get(a).?.short == null);
+}
+
+test "migrate-shorts: freezes every un-frozen task at its CURRENT short; idempotent; then survives compact" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // A pre-existing (legacy) repo: tasks added directly, bypassing cmdAdd's
+    // mint-time freeze — exactly what every task minted before this feature
+    // shipped looks like.
+    const a = mintId();
+    const b = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "Alpha" } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "Beta" } });
+
+    var buf: [ulid.len]u8 = undefined;
+    const a_before = try alloc.dupe(u8, try f.c.shortId(a, &buf));
+    defer alloc.free(a_before);
+    const b_before = try alloc.dupe(u8, try f.c.shortId(b, &buf));
+    defer alloc.free(b_before);
+
+    try f.run(&.{"migrate-shorts"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "froze") != null);
+    try testing.expectEqualStrings(a_before, f.store.get(a).?.short.?);
+    try testing.expectEqualStrings(b_before, f.store.get(b).?.short.?);
+
+    // Idempotent: a second run touches nothing.
+    try f.run(&.{"migrate-shorts"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing to migrate") != null);
+
+    // The whole point: churn + compact must not move a frozen short anymore.
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        try f.run(&.{ "add", "churn" });
+        const cid = try ulid.parse(f.out.items[0..ulid.len]);
+        try f.run(&.{ "state", &cid.text, "dropped" });
+    }
+    try f.run(&.{"compact"});
+    try testing.expectEqualStrings(a_before, try f.c.shortId(a, &buf));
 }
 
 // ----------------------------------------------------------- render projection
@@ -423,6 +554,99 @@ test "render: body appears as an indented block under its bullet" {
     // A body-less task stays a single line.
     try testing.expect(std.mem.indexOf(u8, b.items, "Bare task\n") != null);
     try testing.expect(std.mem.indexOf(u8, b.items, "Bare task\n\n  ") == null);
+}
+
+test "render: arc seq renders as (seq N), never bare [N]; seq 0 is omitted entirely" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const default_seq = mintId(); // seq 0 (default) -> omitted entirely
+    const ordered = mintId(); // seq 2 -> "(seq 2)"
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
+    try f.store.append(.{ .add = .{ .id = default_seq, .title = "Default seq task" } });
+    try f.store.append(.{ .add = .{ .id = ordered, .title = "Ordered task" } });
+    try f.store.append(.{ .in = .{ .task = default_seq, .arc = arc, .seq = 0 } });
+    try f.store.append(.{ .in = .{ .task = ordered, .arc = arc, .seq = 2 } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    // No bare `[N]` anywhere — that's the broken-markdown-link shape (a bare
+    // `[0]`/`[2]` is unresolved reference-link syntax and renders as an empty
+    // or broken anchor).
+    try testing.expect(std.mem.indexOf(u8, b.items, "[0]") == null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "[2]") == null);
+    // A genuine non-zero seq uses a parenthesized, non-link form.
+    try testing.expect(std.mem.indexOf(u8, b.items, "(seq 2)") != null);
+    // seq 0 renders the ABSENCE of ordering — omitted, not "(seq 0)".
+    try testing.expect(std.mem.indexOf(u8, b.items, "(seq 0)") == null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "Default seq task") != null);
+}
+
+test "render: the repeat-listing (shared task) also uses (seq N), never bare [N]" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc1 = mintId();
+    const arc2 = mintId();
+    const shared = mintId();
+    try f.store.append(.{ .add = .{ .id = arc1, .title = "Arc one" } });
+    try f.store.append(.{ .add = .{ .id = arc2, .title = "Arc two" } });
+    try f.store.append(.{ .add = .{ .id = shared, .title = "Shared" } });
+    try f.store.append(.{ .in = .{ .task = shared, .arc = arc1, .seq = 0 } });
+    try f.store.append(.{ .in = .{ .task = shared, .arc = arc2, .seq = 5 } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    try testing.expect(std.mem.indexOf(u8, b.items, "[5]") == null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "(seq 5)") != null);
+}
+
+test "render: a body line starting with # cannot hijack the heading outline; a leading - list still renders" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const hazard = mintId();
+    const listy = mintId();
+    try f.store.append(.{ .add = .{
+        .id = hazard,
+        .title = "Hazard task",
+        .body = "intro\n# 01KWXRWA pm spawn fail phase=spawn.commit_refused\n## also heading-shaped\nparagraph\n---\nafter dashes\n===\nafter equals",
+    } });
+    try f.store.append(.{ .add = .{
+        .id = listy,
+        .title = "List task",
+        .body = "- first item\n- second item",
+    } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    // ATX-shaped lines: escaped (a literal backslash breaks heading parsing),
+    // and critically NO unescaped `#`/`##` starts a body line.
+    try testing.expect(std.mem.indexOf(u8, b.items, "  \\# 01KWXRWA") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "  \\## also heading-shaped") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "\n# 01KWXRWA") == null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "\n## also heading-shaped") == null);
+
+    // Setext-underline-shaped lines (a line of only `-` or only `=`, which
+    // would retroactively turn the PRECEDING line into an H1/H2): also escaped.
+    try testing.expect(std.mem.indexOf(u8, b.items, "  \\---\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "\n---\n") == null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "  \\===\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "\n===\n") == null);
+
+    // A leading `-` LIST (dash + space + content) is untouched — still a list.
+    try testing.expect(std.mem.indexOf(u8, b.items, "  - first item\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "  - second item\n") != null);
 }
 
 test "render: strict — done/archived excluded, open/blocked shown" {
@@ -875,7 +1099,9 @@ test "trk edit: title/body/add-tag/priority all apply; rm-tag removes" {
     try f.run(&.{ "edit", &task.text, "--rm-tag", "foo" });
     const t2 = f.store.get(task).?;
     var has_foo = false;
-    for (t2.tags.items) |tg| if (std.mem.eql(u8, tg, "foo")) { has_foo = true; };
+    for (t2.tags.items) |tg| if (std.mem.eql(u8, tg, "foo")) {
+        has_foo = true;
+    };
     try testing.expect(!has_foo);
 }
 
@@ -1079,9 +1305,9 @@ test "every verb supports --help/-h and add --help mints no task" {
     // The full dispatch set. Kept in lockstep with the `verb_help` table via the
     // count assertion below, so a new verb without a help entry is caught.
     const verbs = [_][]const u8{
-        "init",     "add",  "dep",       "undep", "in",   "arc",  "migrate-arcs", "state",
-        "next",     "list", "render",    "tree",  "compact", "archive", "doc",       "show",
-        "edit",     "log",
+        "init",  "add",  "dep",  "undep",  "in",   "arc",     "migrate-arcs", "migrate-shorts",
+        "state", "next", "list", "render", "tree", "compact", "archive",      "doc",
+        "show",  "edit", "log",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verb_help.len);
 
@@ -1224,7 +1450,9 @@ test "undep: removes an existing needs edge" {
 
     // Confirm edge present.
     var found = false;
-    for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) { found = true; };
+    for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) {
+        found = true;
+    };
     try testing.expect(found);
 
     // undep removes it.
@@ -1232,14 +1460,18 @@ test "undep: removes an existing needs edge" {
     try testing.expect(std.mem.indexOf(u8, f.out.items, "no longer needs") != null);
 
     var still = false;
-    for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) { still = true; };
+    for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) {
+        still = true;
+    };
     try testing.expect(!still);
 
     // a is now unblocked (no prereqs).
     const ready = try f.store.next(alloc);
     defer alloc.free(ready);
     var a_ready = false;
-    for (ready) |id| if (id.eql(a)) { a_ready = true; };
+    for (ready) |id| if (id.eql(a)) {
+        a_ready = true;
+    };
     try testing.expect(a_ready);
 }
 
@@ -1257,7 +1489,9 @@ test "undep: tombstone beats a same-edge dep regardless of append order" {
         try f.store.append(.{ .dep = .{ .from = a, .to = b } });
         try f.store.append(.{ .undep = .{ .from = a, .to = b } });
         var edge_present = false;
-        for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) { edge_present = true; };
+        for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) {
+            edge_present = true;
+        };
         try testing.expect(!edge_present); // tombstone wins
     }
 
@@ -1270,9 +1504,11 @@ test "undep: tombstone beats a same-edge dep regardless of append order" {
         try f.store.append(.{ .add = .{ .id = a, .title = "A" } });
         try f.store.append(.{ .add = .{ .id = b, .title = "B" } });
         try f.store.append(.{ .undep = .{ .from = a, .to = b } }); // tombstone first
-        try f.store.append(.{ .dep = .{ .from = a, .to = b } });   // dep after — blocked
+        try f.store.append(.{ .dep = .{ .from = a, .to = b } }); // dep after — blocked
         var edge_present = false;
-        for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) { edge_present = true; };
+        for (f.store.needs.items) |e| if (e.from.eql(a) and e.to.eql(b)) {
+            edge_present = true;
+        };
         try testing.expect(!edge_present); // tombstone still wins
     }
 }
@@ -1568,6 +1804,13 @@ test "trk migrate-arcs converts arc: tags to declarations, strips the tag, is id
     try testing.expectEqualStrings("keep-me", f.store.get(a).?.tags.items[0]);
 
     try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "migrate-arcs", "extra" }));
+}
+
+test "trk migrate-shorts rejects extra arguments" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "migrate-shorts", "extra" }));
 }
 
 // ----------------------------------------------------------- helpers

@@ -66,10 +66,15 @@ discovery).
   complete and unblocks anything that `needs` the arc.
 - **`.tracker/`** — the append-only `log.jsonl` (+ an optional compacted `snapshot.jsonl`). It union-merges
   on concurrent appends, so parallel workers on disjoint tasks can each close their own without conflict.
+- **Short ids are frozen at mint time and never change.** `trk add` prints the full ULID, and every human
+  projection displays a short id — for a task minted going forward, that short is set ONCE and stays
+  identical across every future add/archive/compact. A task that predates this (every task minted before it
+  shipped) still gets a *dynamically-computed* short that can move as the live id set changes; run
+  `trk migrate-shorts` once to freeze those in place too (current values only — see its `--help`).
 
 ## Commands
 
-`add · dep · undep · in · arc · migrate-arcs · state · edit · show · next · list · render · tree · log · doc · compact · archive · init`
+`add · dep · undep · in · arc · migrate-arcs · migrate-shorts · state · edit · show · next · list · render · tree · log · doc · compact · archive · init`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.

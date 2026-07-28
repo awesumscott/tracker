@@ -1074,6 +1074,43 @@ test "setTitle/setBody/untag survive compaction" {
     }
 }
 
+test "short id: null by default; setShort freezes it; survives compaction verbatim" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    const b = mintId();
+
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        // A plain add carries no short (the back-compat/legacy shape).
+        try s.append(.{ .add = .{ .id = a, .title = "A" } });
+        try testing.expect(s.get(a).?.short == null);
+
+        // An add minted WITH a short (the mint-time path) freezes it immediately.
+        try s.append(.{ .add = .{ .id = b, .title = "B", .short = "01KWXRWA9" } });
+        try testing.expectEqualStrings("01KWXRWA9", s.get(b).?.short.?);
+
+        // setShort retrofits a short onto the legacy task (the migrate-shorts path).
+        try s.append(.{ .setShort = .{ .id = a, .short = "01KWXRWAA" } });
+        try testing.expectEqualStrings("01KWXRWAA", s.get(a).?.short.?);
+
+        // This is the exact spot the production bug bit: compact rewrites the
+        // whole snapshot via a re-emitted `add` per task — both frozen shorts
+        // must survive that rewrite byte-identical.
+        _ = try s.compact();
+    }
+
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try testing.expectEqualStrings("01KWXRWAA", s.get(a).?.short.?);
+        try testing.expectEqualStrings("01KWXRWA9", s.get(b).?.short.?);
+    }
+}
+
 test "setTitle last-write-wins: two setTitle events; final title is the second" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

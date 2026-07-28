@@ -12,7 +12,7 @@
 //! Value tree is the stable part of std.json. We pull typed fields off it.
 //!
 //! Schema (one object per line). `op` is the discriminator:
-//!   {"op":"add","id":"<ulid>","title":"..","body":"..","tags":["a","b"],"ts":169..}
+//!   {"op":"add","id":"<ulid>","title":"..","body":"..","tags":["a","b"],"short":"..."|omitted,"ts":169..}
 //!   {"op":"setState","id":"<ulid>","state":"open|done|blocked|dropped","ts":0}
 //!   {"op":"dep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"in","task":"<ulid>","arc":"<ulid>","seq":0,"ts":0}
@@ -25,8 +25,11 @@
 //!   {"op":"untag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"undep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"arcDeclare","id":"<ulid>","declared":true|false,"ts":0}
+//!   {"op":"setShort","id":"<ulid>","short":"...","ts":0}
 //!
-//! ts=0 is tolerated on decode (legacy lines / snapshot events).
+//! ts=0 is tolerated on decode (legacy lines / snapshot events). `add`'s
+//! "short" is likewise optional-on-decode (absent -> null): every add event
+//! written before short-id freezing existed omits it.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -105,6 +108,10 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
                 try writeJsonString(buf, gpa, t);
             }
             try buf.append(gpa, ']');
+            if (a.short) |s| {
+                try writeKey(buf, gpa, "short", &first);
+                try writeJsonString(buf, gpa, s);
+            }
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, a.ts);
         },
@@ -210,6 +217,14 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, d.ts);
         },
+        .setShort => |s| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, s.id.slice());
+            try writeKey(buf, gpa, "short", &first);
+            try writeJsonString(buf, gpa, s.short);
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, s.ts);
+        },
     }
     try buf.append(gpa, '}');
 }
@@ -285,11 +300,19 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
                 },
                 else => {},
             };
+            const short: ?[]const u8 = blk: {
+                if (obj.get("short")) |sv| switch (sv) {
+                    .string => |s| break :blk try gpa.dupe(u8, s),
+                    else => {},
+                };
+                break :blk null;
+            };
             return .{ .add = .{
                 .id = id,
                 .title = title,
                 .body = body,
                 .tags = try tags.toOwnedSlice(gpa),
+                .short = short,
                 .ts = getIntDefault(obj, "ts", 0),
             } };
         },
@@ -361,6 +384,11 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
             .declared = getBoolDefault(obj, "declared", false),
             .ts = getIntDefault(obj, "ts", 0),
         } },
+        .setShort => return .{ .setShort = .{
+            .id = try getUlid(obj, "id"),
+            .short = try gpa.dupe(u8, try getStr(obj, "short")),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
     }
 }
 
@@ -387,6 +415,56 @@ test "encode/decode round-trip add" {
     try testing.expectEqualStrings("T", ev.add.title);
     try testing.expectEqualStrings("b\"q\"", ev.add.body); // quote escaping survived
     try testing.expectEqual(@as(usize, 2), ev.add.tags.len);
+}
+
+test "encode/decode add: short is omitted when null, round-trips when set" {
+    const gpa = testing.allocator;
+    const id = try ulid.parse(&ulid.mintAt(testing.io, 100).text);
+
+    // null short -> the key is absent from the line entirely.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try encode(&buf, gpa, .{ .add = .{ .id = id, .title = "T", .ts = 100 } });
+        try testing.expect(std.mem.indexOf(u8, buf.items, "\"short\"") == null);
+
+        const ev = try decode(gpa, buf.items);
+        defer {
+            gpa.free(ev.add.title);
+            gpa.free(ev.add.body);
+            gpa.free(ev.add.tags);
+        }
+        try testing.expect(ev.add.short == null);
+    }
+
+    // A set short survives the round-trip byte-for-byte.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try encode(&buf, gpa, .{ .add = .{ .id = id, .title = "T", .short = "01ARZ3NDE", .ts = 100 } });
+
+        const ev = try decode(gpa, buf.items);
+        defer {
+            gpa.free(ev.add.title);
+            gpa.free(ev.add.body);
+            gpa.free(ev.add.tags);
+            gpa.free(ev.add.short.?);
+        }
+        try testing.expectEqualStrings("01ARZ3NDE", ev.add.short.?);
+    }
+}
+
+test "encode/decode round-trip setShort" {
+    const gpa = testing.allocator;
+    const id = try ulid.parse(&ulid.mintAt(testing.io, 100).text);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(&buf, gpa, .{ .setShort = .{ .id = id, .short = "01ARZ3NDE", .ts = 100 } });
+
+    const ev = try decode(gpa, buf.items);
+    defer gpa.free(ev.setShort.short);
+    try testing.expect(ev.setShort.id.eql(id));
+    try testing.expectEqualStrings("01ARZ3NDE", ev.setShort.short);
 }
 
 test "decode rejects junk and unknown op" {
