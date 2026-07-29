@@ -40,18 +40,23 @@ pub fn main(init: std.process.Init) !u8 {
     var store = tracker.Store.open(gpa, io, dir);
     defer store.deinit();
     store.load() catch |e| {
-        try printErr(io, "trk: failed to load store: {s}\n", .{@errorName(e)});
+        try printErr(io, gpa, "trk: failed to load store: {s}\n", .{@errorName(e)});
         return 1;
     };
     // Best-effort config is non-fatal: warn but proceed on a malformed file.
     if (store.config_malformed)
-        printErr(io, "trk: warning: {s}/{s} is malformed — using default config\n", .{ tracker.store.tracker_subdir, tracker.store.config_name }) catch {};
-    // A self-wait cycle already baked into the log (mediated by `in` arc
-    // membership — see Store.load's doc comment) is likewise non-fatal:
-    // warn but keep going, since refusing to load would brick the repo.
-    if (store.self_wait_warning) |p|
+        printErr(io, gpa, "trk: warning: {s}/{s} is malformed — using default config\n", .{ tracker.store.tracker_subdir, tracker.store.config_name }) catch {};
+    // Every self-wait cycle already baked into the log (mediated by `in` arc
+    // membership — see Store.load's doc comment) is likewise non-fatal: warn
+    // on EACH one but keep going, since refusing to load would brick the
+    // repo. Looping (not just the first) matters: a log can carry more than
+    // one independent stuck pair, and reporting only one would leave every
+    // other cycled task exactly as silently invisible as the bug this
+    // warning exists to kill.
+    for (store.self_wait_cycles.items) |p|
         printErr(
             io,
+            gpa,
             "trk: warning: {s} and {s} form a self-wait cycle across needs + arc-membership edges — " ++
                 "neither can ever complete while depending on the other; fix with `trk undep` or by " ++
                 "re-parenting the membership (`trk in`)\n",
@@ -103,7 +108,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.ReadOnly,
             error.NoArc,
             => {},
-            else => try printErr(io, "trk: error: {s}\n", .{@errorName(e)}),
+            else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),
         }
         return 1;
     }
@@ -118,8 +123,18 @@ fn isReadOnly(environ: std.process.Environ, gpa: std.mem.Allocator) bool {
     return val.len != 0;
 }
 
-fn printErr(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [256]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+/// Format + write a message to stderr. gpa-allocated (not a fixed stack
+/// buffer) so a longer message — e.g. the self-wait warning, whose two
+/// 26-char ULIDs alone push it past a 256-byte buffer, which is exactly the
+/// bug that made `Store.self_wait_cycles` silently produce NO visible output
+/// (found 2026-07-29): `std.fmt.bufPrint` returns `error.NoSpaceLeft` on
+/// overflow, and a `catch return;` on a fixed buffer swallows that error,
+/// eating the entire message rather than truncating or growing it. A
+/// visibility mechanism that can silently fail to print is worse than no
+/// mechanism — allocating avoids the size class of bug outright, and this
+/// path only runs on the console-error tail, not a hot loop.
+fn printErr(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const s = std.fmt.allocPrint(gpa, fmt, args) catch return;
+    defer gpa.free(s);
     std.Io.File.stderr().writeStreamingAll(io, s) catch {};
 }

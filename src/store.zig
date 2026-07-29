@@ -76,7 +76,7 @@ pub const Needs = model.Needs;
 pub const In = model.In;
 
 /// Endpoints of the back-edge that closes a self-wait cycle (see
-/// `findSelfWaitCycle`). Just a (from, to) pair — reuses `Needs`'s shape
+/// `findSelfWaitCycles`). Just a (from, to) pair — reuses `Needs`'s shape
 /// since a report is two ids, regardless of whether the closing edge was a
 /// genuine `needs` edge or an `in` membership edge (always reported in its
 /// needs-EQUIVALENT direction: arc -> task, i.e. "arc depends on task").
@@ -115,14 +115,19 @@ pub const Store = struct {
     /// expected JSON object. main.zig surfaces a one-line stderr warning; the
     /// command still runs with default config.
     config_malformed: bool = false,
-    /// A self-wait cycle found in the loaded log — mediated by `in` (arc
+    /// EVERY self-wait cycle found in the loaded log — mediated by `in` (arc
     /// membership), NOT a plain `needs` cycle (those still hard-fail `load`
-    /// via `checkAcyclic`). `null` = none found. Set by `load` from
-    /// `findSelfWaitCycle`; main.zig surfaces it as a one-line stderr
-    /// warning, same shape as `config_malformed` — the log still loads,
-    /// because refusing would brick a repo the bug already reached (exactly
-    /// the state a real repo was found in — see `findSelfWaitCycle`'s doc).
-    self_wait_warning: ?SelfWaitPair = null,
+    /// via `checkAcyclic`). Empty = none found. Set by `load` from
+    /// `findSelfWaitCycles`; main.zig surfaces each pair as a one-line
+    /// stderr warning, same shape as `config_malformed` — the log still
+    /// loads, because refusing would brick a repo the bug already reached
+    /// (exactly the state a real repo was found in — see
+    /// `findSelfWaitCycles`'s doc). Plural, not `?SelfWaitPair`, because a
+    /// log can carry more than one independent stuck pair (e.g. two
+    /// unrelated bad merges) — reporting only the first would leave every
+    /// OTHER cycled task exactly as silently unreachable as the bug this
+    /// mechanism exists to kill. gpa-owned; freed in `deinit`.
+    self_wait_cycles: std.ArrayList(SelfWaitPair) = .empty,
 
     /// Open a store rooted at `dir`. Does NOT load — call `load` for that, or
     /// `openAndLoad`. `dir` is borrowed; the caller keeps ownership/closes it.
@@ -142,6 +147,7 @@ pub const Store = struct {
         self.dep_tombstones.deinit(self.gpa);
         self.doc_paths.deinit(self.gpa);
         self.declared_arcs.deinit(self.gpa);
+        self.self_wait_cycles.deinit(self.gpa);
         self.arena.deinit();
     }
 
@@ -320,13 +326,25 @@ pub const Store = struct {
     /// carry one. Refusing to load it would brick an already-affected repo,
     /// which is strictly worse than the bug (a real repo was found in
     /// exactly this state — see `docs/design.md` "Arc-as-prereq"). So this
-    /// is a WARNING, not a load failure: `self_wait_warning` is set and
-    /// surfaced by main.zig/cli.zig; `load` still succeeds.
+    /// is a WARNING, not a load failure: EVERY such pair found is collected
+    /// into `self_wait_cycles` and surfaced by main.zig; `load` still
+    /// succeeds. Union-merge is exactly why this must run at load time and
+    /// not only at append time: two parallel worktrees can each append an
+    /// edge that is individually acyclic from that writer's own local view
+    /// (one adds `t needs arc`, the other adds `t in arc`, neither sees the
+    /// other's edge) — `append`'s incremental gate cannot catch a cycle
+    /// that only exists in the UNION of two logs neither writer held
+    /// locally; the full rescan here is the check that cannot be evaded by
+    /// that race (see store_test.zig's union-merge self-wait test).
     pub fn load(self: *Store) !void {
         try self.replayFile(snapshot_name);
         try self.replayFile(log_name);
         try self.checkAcyclic();
-        self.self_wait_warning = try self.findSelfWaitCycle();
+        // Reset before recomputing: `load` is safe to call more than once on
+        // a live Store (tests do), and the list must not accumulate stale
+        // pairs from a prior fold.
+        self.self_wait_cycles.clearRetainingCapacity();
+        try self.findSelfWaitCycles(&self.self_wait_cycles);
         self.loadConfig();
     }
 
@@ -513,19 +531,28 @@ pub const Store = struct {
     }
 
     /// Full scan of the COMBINED self-wait graph (see `combinedReaches` for
-    /// the edge-set definition) for a cycle anywhere in it. Returns the
-    /// (from, to) endpoints of the back-edge that closes the FIRST cycle the
-    /// scan hits (scan order, not necessarily insertion order), or null if
-    /// the combined graph is acyclic. Pure query: never mutates, never
-    /// raises on a found cycle — the caller decides what a cycle means
-    /// (`append` rejects via `combinedReaches`, `load` warns via this).
+    /// the edge-set definition) for EVERY cycle anywhere in it — appends the
+    /// (from, to) endpoints of the back-edge that closes each one found to
+    /// `out` (scan order, not necessarily insertion order; `out` is left
+    /// empty, not cleared, on an acyclic graph). Pure query: never mutates
+    /// self, never raises on a found cycle — the caller decides what a
+    /// cycle means (`append` rejects via `combinedReaches`, `load` warns via
+    /// this, once per pair).
+    ///
+    /// Reports ALL cycles, not just the first: a log can carry more than one
+    /// independent self-wait pair (two unrelated bad merges, or debris from
+    /// before this check existed), and stopping at the first would leave
+    /// every OTHER cycled task exactly as silently unreachable from every
+    /// view as the bug this whole mechanism exists to make visible.
     ///
     /// Unlike `combinedReaches` (a single-edge, incremental check), this is
     /// an unconditional full rescan — too expensive to run on every write,
     /// but exactly right for the ONE-TIME check right after `load`, where
     /// the log may hold structure no incremental gate ever validated (a
-    /// hand-edited log, a log predating this check, a bad merge).
-    pub fn findSelfWaitCycle(self: *Store) Error!?SelfWaitPair {
+    /// hand-edited log, a log predating this check, or a union-merge of two
+    /// worktree logs — see `load`'s doc comment for why append-time
+    /// checking alone cannot catch the merge case).
+    pub fn findSelfWaitCycles(self: *Store, out: *std.ArrayList(SelfWaitPair)) Error!void {
         var adj = std.AutoHashMapUnmanaged(Key, std.ArrayList(Ulid)){};
         defer {
             var vit = adj.valueIterator();
@@ -549,9 +576,8 @@ pub const Store = struct {
         var task_it = self.tasks.keyIterator();
         while (task_it.next()) |k| {
             if ((color.get(k.*) orelse .white) != .white) continue;
-            if (try self.selfWaitDfs(k.*, &adj, &color)) |pair| return pair;
+            try self.selfWaitDfs(k.*, &adj, &color, out);
         }
-        return null;
     }
 
     fn selfWaitDfs(
@@ -559,7 +585,8 @@ pub const Store = struct {
         start: Key,
         adj: *std.AutoHashMapUnmanaged(Key, std.ArrayList(Ulid)),
         color: *std.AutoHashMapUnmanaged(Key, Color),
-    ) Error!?SelfWaitPair {
+        out: *std.ArrayList(SelfWaitPair),
+    ) Error!void {
         var stack: std.ArrayList(Frame) = .empty;
         defer stack.deinit(self.gpa);
         try stack.append(self.gpa, .{ .node = start, .idx = 0 });
@@ -577,7 +604,11 @@ pub const Store = struct {
                         try color.put(self.gpa, nk, .gray);
                         try stack.append(self.gpa, .{ .node = nk, .idx = 0 });
                     },
-                    .gray => return SelfWaitPair{ .from = .{ .text = top.node }, .to = next_id },
+                    // A back-edge closes a cycle: RECORD it and keep scanning
+                    // (do not push/descend into an already-gray node — that
+                    // would loop forever) so a second, independent cycle
+                    // elsewhere in the graph is not left unreported.
+                    .gray => try out.append(self.gpa, .{ .from = .{ .text = top.node }, .to = next_id }),
                     .black => {},
                 }
             } else {
@@ -585,7 +616,6 @@ pub const Store = struct {
                 _ = stack.pop();
             }
         }
-        return null;
     }
 
     const Frame = struct { node: Key, idx: usize };

@@ -99,8 +99,10 @@ Defined in `model.zig` (`Task`, `Needs`, `In`, `DocRef`, `State`, the `Event` un
     would close the loop (`Store.append`'s `combinedReaches` check — see the cycle-checking note above),
     naming both ids and stating the consequence ("would wait on itself forever") rather than a bare
     `DependencyCycle`. **A log that already contains one (from before this check existed, a hand edit, or a
-    bad merge) still loads** — `Store.load` warns to stderr (`self_wait_warning`) instead of refusing,
-    because bricking an already-affected repo would be strictly worse than the bug; going forward, `append`
+    bad merge) still loads** — `Store.load` warns to stderr, once per pair found (`self_wait_cycles`, plural
+    — a log can carry more than one independent stuck pair, and reporting only the first would leave every
+    other cycled task exactly as silently invisible as the bug) instead of refusing, because bricking an
+    already-affected repo would be strictly worse than the bug; going forward, `append`
     means no NEW one can be created (found and fixed 2026-07-28, task `01KYJEDX2`).
 - **Priority = an edge/membership attribute**, the `seq` on the `in` edge — **not** a task property — so one
   task holds different positions in different arcs. **Lower `seq` sorts first.** Plus one global

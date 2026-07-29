@@ -165,6 +165,59 @@ test "self-wait: an indirect cycle through NESTED arc membership is also rejecte
     try testing.expectError(error.DependencyCycle, s.append(.{ .dep = .{ .from = a, .to = arc_b } }));
 }
 
+test "self-wait: a legitimate deep DAG with nested arcs is never flagged (no false positive)" {
+    // A long, genuinely-acyclic chain: five tasks in a straight `needs` line,
+    // each also nested three arcs deep (arc_c in arc_b in arc_a), plus a
+    // SEPARATE unrelated arc a later task needs wholesale. Nothing here
+    // waits on itself — this must load clean (no self_wait_cycles) and every
+    // edge in the chain must be independently ACCEPTED by `append`, not just
+    // tolerated by `load`.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const t1 = mintId();
+    const t2 = mintId();
+    const t3 = mintId();
+    const t4 = mintId();
+    const t5 = mintId();
+    const arc_a = mintId();
+    const arc_b = mintId();
+    const arc_c = mintId();
+    const other_arc = mintId();
+    const other_member = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    for ([_]tracker.Ulid{ t1, t2, t3, t4, t5, arc_a, arc_b, arc_c, other_arc, other_member }) |id|
+        try s.append(.{ .add = .{ .id = id } });
+
+    // Straight needs chain: t1 -> t2 -> t3 -> t4 -> t5 (deep, no cross-links).
+    try s.append(.{ .dep = .{ .from = t1, .to = t2 } });
+    try s.append(.{ .dep = .{ .from = t2, .to = t3 } });
+    try s.append(.{ .dep = .{ .from = t3, .to = t4 } });
+    try s.append(.{ .dep = .{ .from = t4, .to = t5 } });
+
+    // Nested arcs, three deep: arc_c in arc_b in arc_a. t1 is a member of the
+    // innermost arc — legitimate deep containment, not a self-wait, since t1
+    // never needs any of arc_a/arc_b/arc_c.
+    try s.append(.{ .in = .{ .task = t1, .arc = arc_c, .seq = 0 } });
+    try s.append(.{ .in = .{ .task = arc_c, .arc = arc_b, .seq = 0 } });
+    try s.append(.{ .in = .{ .task = arc_b, .arc = arc_a, .seq = 0 } });
+
+    // t5 (the tail of the chain) needs a genuinely different, unrelated arc
+    // wholesale — ordinary cross-arc sequencing, must be accepted.
+    try s.append(.{ .in = .{ .task = other_member, .arc = other_arc, .seq = 0 } });
+    try s.append(.{ .dep = .{ .from = t5, .to = other_arc } });
+
+    try testing.expectEqual(@as(usize, 0), s.self_wait_cycles.items.len);
+
+    // Re-open from disk: everything folds clean, still zero cycles.
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqual(@as(usize, 0), s2.self_wait_cycles.items.len);
+}
+
 test "self-wait: a pre-existing log with an in-mediated cycle still loads (warns, not fatal)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -197,7 +250,160 @@ test "self-wait: a pre-existing log with an in-mediated cycle still loads (warns
     try s.load(); // must NOT error
 
     try testing.expectEqual(@as(usize, 2), s.count());
-    const pair = s.self_wait_warning orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), s.self_wait_cycles.items.len);
+    const pair = s.self_wait_cycles.items[0];
+    try testing.expect((pair.from.eql(arc) and pair.to.eql(t)) or (pair.from.eql(t) and pair.to.eql(arc)));
+}
+
+test "self-wait: a task `in` ITSELF (task == arc) is rejected at append, and warns if loaded" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const x = mintId();
+
+    // append-time: the degenerate one-node self-loop is caught by the same
+    // combinedReaches gate as any other self-wait shape (start == target is
+    // reachable from itself trivially, on the very first pop).
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = x } });
+        try testing.expectError(error.DependencyCycle, s.append(.{ .in = .{ .task = x, .arc = x, .seq = 0 } }));
+    }
+
+    // load-time: a pre-existing log with the self-loop already baked in
+    // (hand-edited, or predates this check) must not brick the store, and
+    // must be reported.
+    {
+        var tmp2 = testing.tmpDir(.{});
+        defer tmp2.cleanup();
+        var sub = try tmp2.dir.createDirPathOpen(io, ".tracker", .{});
+        defer sub.close(io);
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(testing.allocator);
+        try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = x } });
+        try line.append(testing.allocator, '\n');
+        try tracker.json_codec.encode(&line, testing.allocator, .{ .in = .{ .task = x, .arc = x, .seq = 0 } });
+        try line.append(testing.allocator, '\n');
+        try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = line.items });
+
+        var s = Store.open(testing.allocator, io, tmp2.dir);
+        defer s.deinit();
+        try s.load(); // must NOT error
+        try testing.expectEqual(@as(usize, 1), s.self_wait_cycles.items.len);
+        const pair = s.self_wait_cycles.items[0];
+        try testing.expect(pair.from.eql(x) and pair.to.eql(x));
+    }
+}
+
+test "self-wait: TWO independent cycles in one log are BOTH reported, not just the first" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const arc1 = mintId();
+    const t1 = mintId();
+    const arc2 = mintId();
+    const t2 = mintId();
+
+    // Two unrelated self-wait pairs, hand-written directly (simulating debris
+    // from before this check existed / two separate bad merges). Neither
+    // pair shares a node with the other.
+    var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(testing.allocator);
+    for ([_]tracker.Ulid{ arc1, t1, arc2, t2 }) |id| {
+        try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = id } });
+        try line.append(testing.allocator, '\n');
+    }
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .dep = .{ .from = t1, .to = arc1 } });
+    try line.append(testing.allocator, '\n');
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .in = .{ .task = t1, .arc = arc1, .seq = 0 } });
+    try line.append(testing.allocator, '\n');
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .dep = .{ .from = t2, .to = arc2 } });
+    try line.append(testing.allocator, '\n');
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .in = .{ .task = t2, .arc = arc2, .seq = 0 } });
+    try line.append(testing.allocator, '\n');
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = line.items });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load(); // must NOT error
+
+    try testing.expectEqual(@as(usize, 2), s.self_wait_cycles.items.len);
+    var saw1 = false;
+    var saw2 = false;
+    for (s.self_wait_cycles.items) |pair| {
+        if ((pair.from.eql(arc1) and pair.to.eql(t1)) or (pair.from.eql(t1) and pair.to.eql(arc1))) saw1 = true;
+        if ((pair.from.eql(arc2) and pair.to.eql(t2)) or (pair.from.eql(t2) and pair.to.eql(arc2))) saw2 = true;
+    }
+    try testing.expect(saw1);
+    try testing.expect(saw2);
+}
+
+test "self-wait: union-merge of two INDIVIDUALLY-acyclic worktree logs closes a cycle neither writer saw locally" {
+    // The scenario design.md's merge model warns about: writer A appends
+    // `t needs arc` in its own worktree (fine there — `arc` is not yet a
+    // member of anything from A's local view); writer B, in a DIFFERENT
+    // worktree off the same base, appends `t in arc` (also fine there — `t`
+    // does not yet need anything from B's local view). Neither writer's
+    // local log is cyclic. Only the UNION (what git's merge=union driver
+    // produces when both branches land) is. `append`'s incremental gate
+    // never ran against the union — only the load-time full rescan can
+    // catch it, which is exactly why detection can't be write-time-only.
+    const arc = mintId();
+    const t = mintId();
+
+    // Writer A's local log: individually acyclic.
+    var tmp_a = testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    {
+        var s = Store.open(testing.allocator, io, tmp_a.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = arc } });
+        try s.append(.{ .add = .{ .id = t } });
+        try s.append(.{ .dep = .{ .from = t, .to = arc } }); // t needs arc — fine alone
+        try testing.expectEqual(@as(usize, 0), s.self_wait_cycles.items.len);
+    }
+
+    // Writer B's local log: individually acyclic (a fresh worktree off the
+    // same base — writer B never sees writer A's `dep` line).
+    var tmp_b = testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    {
+        var s = Store.open(testing.allocator, io, tmp_b.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = arc } });
+        try s.append(.{ .add = .{ .id = t } });
+        try s.append(.{ .in = .{ .task = t, .arc = arc, .seq = 0 } }); // t in arc — fine alone
+        try testing.expectEqual(@as(usize, 0), s.self_wait_cycles.items.len);
+    }
+
+    // The union-merge: git's `merge=union` driver on log.jsonl concatenates
+    // both branches' new lines (order may vary; this uses A-then-B, but the
+    // fold is order-independent for this check). Read each worktree's log
+    // bytes back and concatenate them into a third, merged log.
+    const bytes_a = try tmp_a.dir.readFileAlloc(io, ".tracker/log.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes_a);
+    const bytes_b = try tmp_b.dir.readFileAlloc(io, ".tracker/log.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes_b);
+
+    var tmp_merged = testing.tmpDir(.{});
+    defer tmp_merged.cleanup();
+    var sub = try tmp_merged.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(testing.allocator);
+    try merged.appendSlice(testing.allocator, bytes_a);
+    try merged.appendSlice(testing.allocator, bytes_b);
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = merged.items });
+
+    var s = Store.open(testing.allocator, io, tmp_merged.dir);
+    defer s.deinit();
+    try s.load(); // must NOT error — bricking a merge-produced cycle is worse than the bug
+    try testing.expectEqual(@as(usize, 1), s.self_wait_cycles.items.len);
+    const pair = s.self_wait_cycles.items[0];
     try testing.expect((pair.from.eql(arc) and pair.to.eql(t)) or (pair.from.eql(t) and pair.to.eql(arc)));
 }
 
