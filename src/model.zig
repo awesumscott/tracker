@@ -27,6 +27,26 @@ pub const State = enum {
     /// retained in the log for audit until `compact` physically GCs it. Like
     /// `done`/`dropped` it satisfies a prereq (it is finished).
     archived,
+    /// A CLAIM, not a verdict: "the commit I'm riding completes this task, pending
+    /// verification." Exists so a task close can ride the implementing commit even
+    /// for GATED work, where a compile-only builder cannot know whether the boot
+    /// gate passed and so is barred from ever asserting `done` (`done` means
+    /// "passed its gate"). Deliberately weaker than `done` in both directions:
+    /// - does NOT satisfy a `needs` edge (`satisfiesPrereq` is false) — a
+    ///   dependent must wait for the real, verified `done`, not an unverified claim.
+    /// - does NOT appear in `next`'s ready frontier (`isEligible` is false) — it
+    ///   is not available work, so surfacing it there would let a second builder
+    ///   pick it up and redo already-claimed work (the "inflate the frontier
+    ///   ambiguously" failure this state exists to avoid).
+    /// It DOES count as remaining/not-yet-built for `trk render`'s TODO.md
+    /// projection (`isRemaining` in cli.zig), with its own marker distinct from
+    /// `open` — a short, explicit "awaiting verification" queue a human or a hook
+    /// can scan (`trk list --state claimed`), rather than silently blending into
+    /// ordinary open work. The orchestrator's post-gate reconcile promotes it to
+    /// `done` (gate passed) or demotes it back to `open` with a note (gate
+    /// failed) — the existing "orchestrator alone verifies" rule is unchanged;
+    /// only what a builder agent may itself write changes.
+    claimed,
 
     /// Does this task's state satisfy a `needs` edge pointing at it?
     /// (i.e. may a dependent become eligible because of it.)
@@ -122,6 +142,19 @@ pub const Op = enum {
     /// (a direct `in`-edge, `in`+reachability, and a cosmetic `arc:` tag);
     /// see `Store.isArc`.
     arcDeclare,
+    /// Mark (or unmark) `id` as a STANDING arc: a goal container that names a
+    /// perpetual category (housekeeping, the debug/observability substrate)
+    /// rather than a completable goal. `declared: true` (`standing: true`)
+    /// excludes it from `next`'s ready frontier UNCONDITIONALLY — even once
+    /// drained, it never surfaces as the ordinary close-out prompt, because
+    /// closing it would assert a completion that never happens — while still
+    /// accepting new `in` members like any other arc. Last-write-wins on fold,
+    /// same commutation shape as `arcDeclare`; see `Store.isStanding`. A task
+    /// need not already be a declared arc for this to be set (harmless no-op
+    /// until it also is one — the only place `isStanding` is consulted is
+    /// alongside `isArc`), but `trk arc --standing` always declares the arc in
+    /// the same act for ergonomics.
+    arcStanding,
     /// Freeze a task's short id (last-write-wins on fold, but in practice
     /// written exactly once per task — by `trk migrate-shorts` for a
     /// pre-existing task that has no persisted short yet). A freshly-minted
@@ -171,6 +204,8 @@ pub const Event = union(Op) {
     undep: struct { from: Ulid, to: Ulid, ts: i64 = 0 },
     /// Declare/retract `id` as an arc root. Last-write-wins on fold.
     arcDeclare: struct { id: Ulid, declared: bool, ts: i64 = 0 },
+    /// Mark/unmark `id` as a standing arc. See `Op.arcStanding`.
+    arcStanding: struct { id: Ulid, standing: bool, ts: i64 = 0 },
     /// Freeze a task's short id. See `Op.setShort`.
     setShort: struct { id: Ulid, short: []const u8, ts: i64 = 0 },
 };

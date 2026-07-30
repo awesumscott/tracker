@@ -107,6 +107,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.DependencyCycle,
             error.ReadOnly,
             error.NoArc,
+            error.GitLogFailed,
             => {},
             else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),
         }

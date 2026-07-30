@@ -177,6 +177,37 @@ test "state rejects a bad state name cleanly" {
     try testing.expectEqual(cli.CliError.BadState, e);
 }
 
+test "state claimed: settable, marked distinctly in list/render, absent from next" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "builder self-report" } });
+
+    try f.run(&.{ "state", &a.text, "claimed" });
+    try testing.expectEqual(tracker.State.claimed, f.store.get(a).?.state);
+
+    // list: the marker distinguishes it from plain open, and it's the
+    // default-visible bucket (no --state needed, unlike archived).
+    try f.run(&.{"list"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[c] ") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") != null);
+
+    // The explicit awaiting-verification queue.
+    try f.run(&.{ "list", "--state", "claimed" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") != null);
+
+    // render: still in TODO.md (isRemaining), with the same distinct marker.
+    try f.run(&.{"render"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[c]") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") != null);
+
+    // next: NOT offered as available work — the frontier stays exactly
+    // "genuinely ready", not inflated with an unverified claim.
+    try f.run(&.{"next"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") == null);
+}
+
 // ----------------------------------------------------------- TRK_READONLY gate
 
 test "read_only refuses every mutating verb cleanly and mutates nothing" {
@@ -1010,6 +1041,40 @@ test "list filters by tag, state, and word" {
     try testing.expect(std.mem.indexOf(u8, f.out.items, "docs") == null);
 }
 
+test "list --not-tag: repeatable, ANDed exclusion — the autonomous-eligible bucket" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    const b = mintId();
+    const c = mintId();
+    const d = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "needs the rig", .tags = &.{"metal"} } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "needs a ruling", .tags = &.{"scott-decision"} } });
+    try f.store.append(.{ .add = .{ .id = c, .title = "needs BOTH", .tags = &.{ "metal", "scott-decision" } } });
+    try f.store.append(.{ .add = .{ .id = d, .title = "unblocked host work" } });
+
+    // A single --not-tag drops any task carrying it.
+    try f.run(&.{ "list", "--not-tag", "metal" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the rig") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "BOTH") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "a ruling") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "unblocked host work") != null);
+
+    // Two --not-tags AND (both excluded independently): only the fully
+    // unblocked task survives — this is the autonomous-eligible bucket.
+    try f.run(&.{ "list", "--not-tag", "metal", "--not-tag", "scott-decision" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the rig") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "a ruling") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "BOTH") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "unblocked host work") != null);
+
+    // Composes with --tag (a positive filter) and bare-term search.
+    try f.run(&.{ "list", "--tag", "metal", "--not-tag", "scott-decision" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the rig") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "BOTH") == null);
+}
+
 test "list: multi-term AND, bare positionals, case-insensitive, tag match" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
@@ -1088,6 +1153,23 @@ test "next: positional term filters the ready frontier" {
     try f.run(&.{ "next", "prism" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "prism windowed") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "scheduler") == null);
+}
+
+test "next --not-tag: repeatable, ANDed exclusion, composes with --arc" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    const b = mintId();
+    const c = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "metal-blocked", .tags = &.{"metal"} } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "scott-blocked", .tags = &.{"scott-decision"} } });
+    try f.store.append(.{ .add = .{ .id = c, .title = "clean host work" } });
+
+    try f.run(&.{ "next", "--not-tag", "metal", "--not-tag", "scott-decision" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "metal-blocked") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "scott-blocked") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "clean host work") != null);
 }
 
 // ----------------------------------------------------------- compact CLI
@@ -1497,7 +1579,7 @@ test "every verb supports --help/-h and add --help mints no task" {
     const verbs = [_][]const u8{
         "init",  "add",  "dep",  "undep",  "in",   "arc",     "migrate-arcs", "migrate-shorts",
         "state", "next", "list", "render", "tree", "compact", "archive",      "doc",
-        "show",  "edit", "log",
+        "show",  "edit", "log",  "stale",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verb_help.len);
 
@@ -1810,6 +1892,50 @@ test "trk arc declares a zero-member arc; --undo retracts it" {
     try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{"arc"}));
 }
 
+test "trk arc --standing: declares in the same act, excludes from next, --standing --undo keeps the arc" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "Housekeeping / held branches" } });
+    try testing.expect(!f.store.isArc(a));
+    try testing.expect(!f.store.isStanding(a));
+
+    // --standing on a not-yet-declared task declares it AND marks standing.
+    try f.run(&.{ "arc", &a.text, "--standing" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "declared an arc and marked standing") != null);
+    try testing.expect(f.store.isArc(a));
+    try testing.expect(f.store.isStanding(a));
+
+    // A drained standing arc never surfaces in `next`.
+    try f.run(&.{"next"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Housekeeping") == null);
+
+    // It still renders its own section (not "reading as unfinished" via a
+    // stray Arc-less bullet, and not silently omitted either).
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try f.c.renderMarkdown(&buf);
+    try testing.expect(std.mem.indexOf(u8, buf.items, "## Housekeeping / held branches") != null);
+
+    // --standing --undo clears JUST the standing mark; the arc declaration survives.
+    try f.run(&.{ "arc", &a.text, "--standing", "--undo" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "standing mark retracted") != null);
+    try testing.expect(f.store.isArc(a));
+    try testing.expect(!f.store.isStanding(a));
+    // Now a drained (still zero-member) arc surfaces as the ordinary close-out prompt.
+    try f.run(&.{"next"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Housekeeping") != null);
+
+    // Re-mark standing, then retract the arc declaration outright: the
+    // standing mark must not survive orphaned.
+    try f.run(&.{ "arc", &a.text, "--standing" });
+    try f.run(&.{ "arc", &a.text, "--undo" });
+    try testing.expect(!f.store.isArc(a));
+    try testing.expect(!f.store.isStanding(a));
+}
+
 test "trk add --arc declares the new task itself in one step" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
@@ -2001,6 +2127,80 @@ test "trk migrate-shorts rejects an unrecognized argument (it now optionally tak
     var f = try Fixture.init(alloc);
     defer f.deinit();
     try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "migrate-shorts", "extra" }));
+}
+
+// ----------------------------------------------------------- trk stale (git-log cross-reference)
+
+/// Run a git command against `dir` (via the SAME `Cwd.dir` mechanism
+/// `cmdStale` itself uses), asserting success. Frees stdout/stderr.
+fn runGitOk(alloc: std.mem.Allocator, dir: std.Io.Dir, argv: []const []const u8) !void {
+    const r = try std.process.run(alloc, io, .{ .argv = argv, .cwd = .{ .dir = dir } });
+    defer alloc.free(r.stdout);
+    defer alloc.free(r.stderr);
+    const ok = switch (r.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    if (!ok) return error.GitCommandFailed;
+}
+
+test "trk stale: finds an open task cited in a landed commit; excludes claimed and never-cited" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const cited_open = mintId();
+    const cited_claimed = mintId();
+    const uncited_open = mintId();
+    try f.store.append(.{ .add = .{ .id = cited_open, .title = "orphaned close" } });
+    try f.store.append(.{ .add = .{ .id = cited_claimed, .title = "already claimed" } });
+    try f.store.append(.{ .setState = .{ .id = cited_claimed, .state = .claimed } });
+    try f.store.append(.{ .add = .{ .id = uncited_open, .title = "never mentioned" } });
+
+    var sb1: [ulid.len]u8 = undefined;
+    const short1 = try alloc.dupe(u8, try f.c.shortId(cited_open, &sb1));
+    defer alloc.free(short1);
+    var sb2: [ulid.len]u8 = undefined;
+    const short2 = try alloc.dupe(u8, try f.c.shortId(cited_claimed, &sb2));
+    defer alloc.free(short2);
+
+    // A real git repo rooted at the fixture's own tmpDir — the SAME dir
+    // `cmdStale` resolves via `self.dir`, so this exercises the real spawn.
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "--allow-empty", "-m", "unrelated setup commit" });
+    const msg1 = try std.fmt.allocPrint(alloc, "merge({s}): completes the orphaned close", .{short1});
+    defer alloc.free(msg1);
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "--allow-empty", "-m", msg1 });
+    const msg2 = try std.fmt.allocPrint(alloc, "feat({s}): work that was already claimed", .{short2});
+    defer alloc.free(msg2);
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "--allow-empty", "-m", msg2 });
+
+    try f.run(&.{"stale"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "orphaned close") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "already claimed") == null); // claimed: excluded
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "never mentioned") == null); // never cited
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 open task(s)") != null);
+
+    // Extra args rejected cleanly.
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "stale", "extra" }));
+}
+
+test "trk stale: reports nothing when no open task is cited" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "never mentioned anywhere" } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "--allow-empty", "-m", "totally unrelated" });
+
+    try f.run(&.{"stale"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing") != null);
 }
 
 // ----------------------------------------------------------- helpers

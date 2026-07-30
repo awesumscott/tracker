@@ -67,6 +67,10 @@ pub const CliError = error{
     /// `trk add` landed a task in no arc (neither `--in` nor `--arc`) while
     /// `.tracker/config.json`'s `add.arcless` is `"error"`.
     NoArc,
+    /// `trk stale` could not run or was refused by `git log` (not a git repo,
+    /// `git` missing from PATH, non-zero exit). A clean message is already
+    /// appended to `out` before this is returned.
+    GitLogFailed,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -190,6 +194,7 @@ pub const Cli = struct {
         if (std.mem.eql(u8, cmd, "show")) return self.cmdShow(rest);
         if (std.mem.eql(u8, cmd, "edit")) return self.cmdEdit(rest);
         if (std.mem.eql(u8, cmd, "log")) return self.cmdLog(rest);
+        if (std.mem.eql(u8, cmd, "stale")) return self.cmdStale(rest);
         try self.print("trk: unknown command '{s}'\n", .{cmd});
         return error.UnknownCommand;
     }
@@ -287,13 +292,20 @@ pub const Cli = struct {
         \\  from the other direction — see `trk dep --help`.
         },
         .{ .name = "arc", .text =
-        \\trk arc <id> [--undo]
+        \\trk arc <id> [--undo] [--standing [--undo]]
         \\  Declare <id> an arc root (an `arcDeclare` event), independent of whether any
         \\  task is `in` it — the fix for an arc with genuinely zero members yet (a real
         \\  goal with no work filed), which a direct-`in`/reachability check alone cannot
         \\  express. `--undo` retracts the declaration (a no-op if <id> is still an arc
-        \\  via an `in` member). `trk add --arc` declares a brand-new task in one step.
+        \\  via an `in` member) and also clears any standing mark. `trk add --arc`
+        \\  declares a brand-new task in one step.
+        \\  --standing marks <id> a STANDING arc: a perpetual category (housekeeping,
+        \\  the debug/observability substrate) rather than a completable goal — it
+        \\  never surfaces in `trk next`, drained or not, but still accepts new `in`
+        \\  members. Declares the arc in the same act. `--standing --undo` clears
+        \\  JUST the standing mark, leaving the arc declaration intact.
         \\  e.g.  trk arc 01KX6H4V           trk arc 01KX6H4V --undo
+        \\        trk arc 01KVKHBZQ --standing           trk arc 01KVKHBZQ --standing --undo
         },
         .{ .name = "migrate-arcs", .text =
         \\trk migrate-arcs
@@ -322,30 +334,46 @@ pub const Cli = struct {
         \\  e.g.  trk migrate-shorts --min 9
         },
         .{ .name = "state", .text =
-        \\trk state <id> <open|done|blocked|dropped>
+        \\trk state <id> <open|done|blocked|dropped|claimed>
         \\  Set a task's state. `done` drops it from TODO.md and queues it for
-        \\  `trk archive`; `dropped` = won't-do (also leaves TODO.md); `blocked` is
-        \\  a manual hold. Ids accept any unique prefix.
-        \\  e.g.  trk state 01KX6H48 done
+        \\  `trk archive` — it asserts the work PASSED ITS GATE; `dropped` = won't-do
+        \\  (also leaves TODO.md); `blocked` is a manual hold. `claimed` is weaker
+        \\  than `done`: a CLAIM ("this commit completes the task, pending
+        \\  verification"), safe for a compile-only builder to write in the same
+        \\  commit as the implementing change — it stays in TODO.md (marker `[c]`,
+        \\  distinct from open `[ ]`), does NOT satisfy a dependent's prereq, and
+        \\  does NOT appear in `trk next`'s ready frontier. The orchestrator's
+        \\  post-gate reconcile promotes it to `done` or demotes it to `open`.
+        \\  `trk list --state claimed` is the awaiting-verification queue. Ids
+        \\  accept any unique prefix.
+        \\  e.g.  trk state 01KX6H48 done           trk state 01KX6H48 claimed
         },
         .{ .name = "next", .text =
-        \\trk next [--arc <id>] [--limit <n>] [--json] [<term> ...]
+        \\trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> ...]
         \\  The ready frontier: open tasks whose prereqs are ALL met. An arc root is
         \\  a container: it is held back until its non-parked members are finished,
         \\  then surfaces once as the close-out prompt (`trk state <root> done` marks
-        \\  the goal complete and unblocks anything that needs the arc). Bare <term>s
-        \\  (repeatable, ANDed) are a case-insensitive substring search over
-        \\  title+body+tags. --json emits a machine-readable array.
+        \\  the goal complete and unblocks anything that needs the arc) — UNLESS the
+        \\  arc is marked --standing (`trk arc`), in which case it never surfaces.
+        \\  Bare <term>s (repeatable, ANDed) are a case-insensitive substring search
+        \\  over title+body+tags. --not-tag <t> (repeatable, ANDed exclusion) drops
+        \\  any task carrying that tag — the autonomous-eligible bucket (no blocker
+        \\  tag) is one bare command:
+        \\    trk next --not-tag metal --not-tag scott-testing --not-tag scott-decision
+        \\  --json emits a machine-readable array.
         \\  e.g.  trk next           trk next prism windowed
         },
         .{ .name = "list", .text =
-        \\trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
+        \\trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--not-tag <t> ...]
+        \\         [--limit <n>] [--json] [<term> ...]
         \\  Every task (not just the ready frontier), filterable by arc/state/tag and
-        \\  the same bare-term search as `next`. --no-arc lists every task in NO arc
-        \\  (by the unified isArc/membership model, including needs-reachability) — the
-        \\  completeness query for "sort everything into arcs"; mutually exclusive with
-        \\  --arc. --json for machine-readable output.
+        \\  the same bare-term search as `next`. --not-tag (repeatable, ANDed
+        \\  exclusion) drops any task carrying that tag. --no-arc lists every task in
+        \\  NO arc (by the unified isArc/membership model, including needs-
+        \\  reachability) — the completeness query for "sort everything into arcs";
+        \\  mutually exclusive with --arc. --json for machine-readable output.
         \\  e.g.  trk list --state open net           trk list --no-arc
+        \\        trk list --state claimed             (the awaiting-verification queue)
         },
         .{ .name = "render", .text =
         \\trk render [--out <path>]
@@ -403,6 +431,18 @@ pub const Cli = struct {
         \\trk log [<id>] [--limit <n>]
         \\  Event history, most-recent-last: the whole log, or one task's events.
         },
+        .{ .name = "stale", .text =
+        \\trk stale
+        \\  Cross-reference: which OPEN tasks have their id cited in a LANDED commit
+        \\  message (this branch's `git log --oneline` ancestry — deliberately NOT
+        \\  `--all`, which would count unmerged worktree-branch commits as landed)
+        \\  but were never closed? Matches by exact token (full id or displayed short
+        \\  id), not raw substring. `claimed` tasks are excluded (already a healthy,
+        \\  awaiting-verification claim, not the "invisible in the haystack" rot this
+        \\  targets — see `trk state --help`). Runs `git` against the store root (the
+        \\  repo housing `.tracker/`, which may differ from where `trk` itself lives).
+        \\  e.g.  trk stale
+        },
     };
 
     /// Print one verb's help (from `verb_help`), or fall back to the full usage
@@ -432,15 +472,21 @@ pub const Cli = struct {
             \\  trk dep <from> <to>          mark <from> as needing prerequisite <to>
             \\  trk undep <from> <to>        remove the <from> needs <to> edge (tombstone; no-op if absent)
             \\  trk in <task> <arc> [--seq <n>]   add task to an arc (NOT the same as `dep` — see `trk in --help`)
-            \\  trk arc <id> [--undo]        declare/retract <id> as an arc root, even with zero members
+            \\  trk arc <id> [--undo] [--standing [--undo]]   declare/retract <id> as an arc root
+            \\      --standing marks a perpetual-category arc (never surfaces in `next`,
+            \\      drained or not, but still accepts new members); `--standing --undo`
+            \\      clears just the mark.
             \\  trk migrate-arcs             convert every legacy `arc:` tag to a real declaration; idempotent
             \\  trk migrate-shorts [--min <n>]   freeze every task's CURRENT short id so it never changes again
             \\      --min <n> is a one-time REPAIR: also lengthens an already-frozen short below n
-            \\  trk state <id> <open|done|blocked|dropped>
-            \\  trk next [--arc <id>] [--limit <n>] [--json] [<term> ...]   the ready frontier
-            \\  trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--limit <n>] [--json] [<term> ...]
+            \\  trk state <id> <open|done|blocked|dropped|claimed>
+            \\      `claimed` = a builder's self-report ("this commit completes it, pending
+            \\      verification") — safe for a compile-only agent, unlike `done`.
+            \\  trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> ...]   the ready frontier
+            \\  trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> ...]
             \\      <term> (bare or --word <term>, repeatable) ANDs a case-insensitive
-            \\      substring search over title+body+tags. --no-arc lists every task in
+            \\      substring search over title+body+tags. --not-tag (repeatable, ANDed
+            \\      exclusion) drops any task carrying that tag. --no-arc lists every task in
             \\      no arc. --json emits a machine-readable array
             \\      (id/short/title/state/priority/seq?/tags).
             \\  trk render [--out <path>]    the TODO.md markdown projection (--out > config render.out > stdout)
@@ -458,6 +504,7 @@ pub const Cli = struct {
             \\  trk show <id>                full task detail
             \\  trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...] [--add-doc <doc_id[#section]> ...] [--priority <n>]
             \\  trk log [<id>] [--limit <n>] event history (most-recent-last)
+            \\  trk stale                    open tasks cited in a landed commit but never closed
             \\
             \\Ids accept any unique prefix (git-short-hash style). A task minted after
             \\short-id freezing (or migrated via `trk migrate-shorts`) always displays
@@ -979,27 +1026,53 @@ pub const Cli = struct {
         );
     }
 
-    /// `trk arc <id> [--undo]` — declare (or, with --undo, retract) <id> as an
-    /// arc root independent of `in` membership. See `Store.isArc`.
+    /// `trk arc <id> [--undo] [--standing [--undo]]` — declare (or, with
+    /// --undo, retract) <id> as an arc root independent of `in` membership;
+    /// `--standing` additionally marks it a STANDING arc (a perpetual
+    /// category, never a `next` close-out candidate — see `Store.isStanding`).
+    /// See `Store.isArc`.
     fn cmdArc(self: *Cli, args: []const []const u8) Error!void {
         if (args.len == 0) {
-            try self.write("trk: usage: trk arc <id> [--undo]\n");
+            try self.write("trk: usage: trk arc <id> [--undo] [--standing [--undo]]\n");
             return error.UsageError;
         }
         const id = try self.resolve(args[0]);
         var undo = false;
+        var standing = false;
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--undo")) {
                 undo = true;
+            } else if (std.mem.eql(u8, args[i], "--standing")) {
+                standing = true;
             } else {
                 try self.print("trk: unknown flag '{s}'\n", .{args[i]});
                 return error.UnknownFlag;
             }
         }
-        try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = !undo } });
         var sb: [ulid.len]u8 = undefined;
+
+        if (standing and undo) {
+            // Clear JUST the standing mark; leave the arc declaration intact.
+            try self.store.append(.{ .arcStanding = .{ .id = id, .standing = false } });
+            try self.print("{s} standing mark retracted (still an arc)\n", .{try self.shortId(id, &sb)});
+            return;
+        }
+        if (standing) {
+            // Standing implies arc-ness: declare in the same act (idempotent
+            // last-write-wins if already declared).
+            try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = true } });
+            try self.store.append(.{ .arcStanding = .{ .id = id, .standing = true } });
+            try self.print("{s} declared an arc and marked standing\n", .{try self.shortId(id, &sb)});
+            return;
+        }
+
+        try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = !undo } });
         if (undo) {
+            // Retracting the arc declaration also clears any orphaned standing
+            // mark — a task that is no longer (declared) an arc has no
+            // business staying "standing" (no-op if it never was one).
+            try self.store.append(.{ .arcStanding = .{ .id = id, .standing = false } });
             try self.print("{s} arc declaration retracted\n", .{try self.shortId(id, &sb)});
         } else {
             try self.print("{s} declared an arc\n", .{try self.shortId(id, &sb)});
@@ -1131,12 +1204,12 @@ pub const Cli = struct {
 
     fn cmdState(self: *Cli, args: []const []const u8) Error!void {
         if (args.len != 2) {
-            try self.write("trk: usage: trk state <id> <open|done|blocked|dropped>\n");
+            try self.write("trk: usage: trk state <id> <open|done|blocked|dropped|claimed>\n");
             return error.UsageError;
         }
         const id = try self.resolve(args[0]);
         const st = State.fromString(args[1]) orelse {
-            try self.print("trk: '{s}' is not a state (open|done|blocked|dropped)\n", .{args[1]});
+            try self.print("trk: '{s}' is not a state (open|done|blocked|dropped|claimed)\n", .{args[1]});
             return error.BadState;
         };
         try self.store.append(.{ .setState = .{ .id = id, .state = st } });
@@ -1372,6 +1445,13 @@ pub const Cli = struct {
         // `trk next prism` is "the ready frontier, prism only".
         var words: std.ArrayList([]const u8) = .empty;
         defer words.deinit(self.gpa);
+        // `--not-tag <t>` (repeatable, ANDed exclusion): drop any task carrying
+        // ANY of these tags. The backfilled negative blocker-tag vocabulary
+        // (`metal`/`scott-testing`/`scott-decision`) makes the autonomous-
+        // eligible bucket one bare command:
+        //   trk next --not-tag metal --not-tag scott-testing --not-tag scott-decision
+        var not_tags: std.ArrayList([]const u8) = .empty;
+        defer not_tags.deinit(self.gpa);
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--arc")) {
@@ -1382,6 +1462,8 @@ pub const Cli = struct {
                 json = true;
             } else if (std.mem.eql(u8, args[i], "--word")) {
                 try words.append(self.gpa, try self.flagVal(args, &i, "--word"));
+            } else if (std.mem.eql(u8, args[i], "--not-tag")) {
+                try not_tags.append(self.gpa, try self.flagVal(args, &i, "--not-tag"));
             } else if (std.mem.startsWith(u8, args[i], "--")) {
                 try self.print("trk: unknown flag '{s}'\n", .{args[i]});
                 return error.UnknownFlag;
@@ -1405,7 +1487,9 @@ pub const Cli = struct {
             if (members) |m| {
                 if (!containsId(m, id)) continue;
             }
-            if (!allWordsMatch(self.store.get(id).?, words.items)) continue;
+            const t = self.store.get(id).?;
+            if (hasAnyTag(t, not_tags.items)) continue;
+            if (!allWordsMatch(t, words.items)) continue;
             if (limit) |lim| {
                 if (shown >= lim) break;
             }
@@ -1465,6 +1549,10 @@ pub const Cli = struct {
         // Search terms: each repeated `--word` AND each bare positional. ANDed.
         var words: std.ArrayList([]const u8) = .empty;
         defer words.deinit(self.gpa);
+        // `--not-tag <t>` (repeatable, ANDed exclusion) — see `cmdNext`'s copy
+        // of this doc for the motivating case (the autonomous-eligible bucket).
+        var not_tags: std.ArrayList([]const u8) = .empty;
+        defer not_tags.deinit(self.gpa);
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--arc")) {
@@ -1479,6 +1567,8 @@ pub const Cli = struct {
                 };
             } else if (std.mem.eql(u8, args[i], "--tag")) {
                 tag_filter = try self.flagVal(args, &i, "--tag");
+            } else if (std.mem.eql(u8, args[i], "--not-tag")) {
+                try not_tags.append(self.gpa, try self.flagVal(args, &i, "--not-tag"));
             } else if (std.mem.eql(u8, args[i], "--limit")) {
                 limit = try self.parseUsize(try self.flagVal(args, &i, "--limit"));
             } else if (std.mem.eql(u8, args[i], "--json")) {
@@ -1523,6 +1613,7 @@ pub const Cli = struct {
             }
             if (members) |m| if (!containsId(m, id)) continue;
             if (tag_filter) |tf| if (!hasTag(t, tf)) continue;
+            if (hasAnyTag(t, not_tags.items)) continue;
             if (!allWordsMatch(t, words.items)) continue;
             if (limit) |lim| if (shown >= lim) break;
             if (json) {
@@ -2273,6 +2364,135 @@ pub const Cli = struct {
             try self.print("{s}  {s}  {s}\n", .{ ts_str, @tagName(e.op), e.summary });
         }
     }
+
+    // ----------------------------------------------------------- stale
+
+    /// `trk stale` — cross-reference: which currently-`open` tasks have their
+    /// id cited in a LANDED commit message, but were never closed? The
+    /// evidence for the dominant rot found in the 2026-07-30 reconciliation:
+    /// not "the work landed under a different id" (a minority case) but
+    /// simply that the implementing commit NAMED the id and nobody ran `trk
+    /// state done` — the evidence was sitting in `git log` the whole time.
+    ///
+    /// Scans `git log --oneline` on the CURRENT branch's ancestry, DELIBERATELY
+    /// not `--all`: `--all` walks every ref, including a parallel fan-out's
+    /// unmerged worktree branches, and a hit there is not proof the work is at
+    /// HEAD (a commit can cite an id from a branch nobody has merged) — see
+    /// the `git log --all --grep` false-positive finding. `--stale` wants only
+    /// LANDED evidence. Runs `git` with cwd set to the store root (the repo
+    /// that houses `.tracker/`, which may differ from where `trk` itself
+    /// lives — `main.zig`'s `discover.findRoot` already resolved `self.dir`
+    /// to exactly that repo).
+    ///
+    /// Matches by exact TOKEN (a maximal run of ASCII alphanumerics), not raw
+    /// substring: the log text is scanned once, and each token is looked up
+    /// against an index of every open task's full id AND its displayed short
+    /// id. Token (not substring) matching means a short id can never
+    /// accidentally match as part of some longer, unrelated token.
+    ///
+    /// `claimed` tasks are deliberately EXCLUDED from the report: a claim
+    /// already IS the self-reported "this commit completes it" signal this
+    /// verb exists to surface for an `open` task that never got one —
+    /// flagging an already-claimed task again would just be noise on an
+    /// item that is already in the awaiting-verification queue (`trk list
+    /// --state claimed`), not the "invisible in the haystack" rot this
+    /// targets. See `State.claimed`.
+    fn cmdStale(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len != 0) {
+            try self.write("trk: usage: trk stale\n");
+            return error.UsageError;
+        }
+
+        const result = std.process.run(self.gpa, self.io, .{
+            .argv = &.{ "git", "log", "--oneline" },
+            .cwd = .{ .dir = self.dir },
+        }) catch |e| {
+            try self.print(
+                "trk: stale: failed to run 'git log': {s} (is the store root a git repo, and is git on PATH?)\n",
+                .{@errorName(e)},
+            );
+            return error.GitLogFailed;
+        };
+        defer self.gpa.free(result.stdout);
+        defer self.gpa.free(result.stderr);
+        const exited_ok = switch (result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!exited_ok) {
+            try self.print("trk: stale: 'git log' failed: {s}\n", .{std.mem.trimEnd(u8, result.stderr, " \t\r\n")});
+            return error.GitLogFailed;
+        }
+
+        // Citation index: every OPEN task's full id + its currently-displayed
+        // short id -> the task id. gpa-owned keys (both `id.slice()` and
+        // `shortId`'s buffer are transient).
+        var index = std.StringHashMapUnmanaged(Ulid){};
+        defer {
+            var it = index.keyIterator();
+            while (it.next()) |k| self.gpa.free(k.*);
+            index.deinit(self.gpa);
+        }
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+        for (ids) |id| {
+            const t = self.store.get(id).?;
+            if (t.state != .open) continue; // claimed/done/blocked/dropped/archived: not this report's concern
+            try index.put(self.gpa, try self.gpa.dupe(u8, id.slice()), id);
+            var sb: [ulid.len]u8 = undefined;
+            const sid = try self.shortId(id, &sb);
+            if (!std.mem.eql(u8, sid, id.slice())) {
+                try index.put(self.gpa, try self.gpa.dupe(u8, sid), id);
+            }
+        }
+
+        // Tokenize the whole log text once; on each match keep the FIRST hit
+        // per task (git log is newest-first, so that's the most recent citation).
+        var hits = std.AutoHashMapUnmanaged([ulid.len]u8, []const u8){};
+        defer hits.deinit(self.gpa);
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var tok_start: ?usize = null;
+            var ci: usize = 0;
+            while (ci <= line.len) : (ci += 1) {
+                const is_alnum = ci < line.len and std.ascii.isAlphanumeric(line[ci]);
+                if (is_alnum) {
+                    if (tok_start == null) tok_start = ci;
+                } else if (tok_start) |s| {
+                    if (index.get(line[s..ci])) |task_id| {
+                        const gop = try hits.getOrPut(self.gpa, task_id.text);
+                        if (!gop.found_existing) gop.value_ptr.* = line;
+                    }
+                    tok_start = null;
+                }
+            }
+        }
+
+        if (hits.count() == 0) {
+            try self.write("trk: stale: nothing — no open task is cited in a landed commit\n");
+            return;
+        }
+
+        // Deterministic report order.
+        const stale_ids = try self.gpa.alloc(Ulid, hits.count());
+        defer self.gpa.free(stale_ids);
+        {
+            var it = hits.keyIterator();
+            var idx: usize = 0;
+            while (it.next()) |k| : (idx += 1) stale_ids[idx] = .{ .text = k.* };
+        }
+        std.sort.pdq(Ulid, stale_ids, {}, Ulid.lessThan);
+
+        try self.print("trk: stale: {d} open task(s) cited in a landed commit but never closed:\n", .{stale_ids.len});
+        for (stale_ids) |id| {
+            const t = self.store.get(id).?;
+            var sb: [ulid.len]u8 = undefined;
+            const sid = try self.shortId(id, &sb);
+            const line = hits.get(id.text).?;
+            try self.print("{s} {s}  {s}\n    cited in: {s}\n", .{ stateMarker(t.state), sid, t.title, line });
+        }
+    }
 };
 
 // ----------------------------------------------------------- timestamp formatter
@@ -2347,6 +2567,15 @@ fn hasTag(t: Task, tag: []const u8) bool {
     return false;
 }
 
+/// True iff `t` carries ANY tag in `tags` — the `--not-tag` exclusion test
+/// (repeatable, ANDed as an exclusion: absence of every listed tag is
+/// required to pass). An empty `tags` list matches nothing (no `--not-tag`
+/// given), so the filter is a no-op by default.
+fn hasAnyTag(t: Task, tags: []const []const u8) bool {
+    for (tags) |tag| if (hasTag(t, tag)) return true;
+    return false;
+}
+
 /// True iff `word` appears (case-insensitively) in the task's title, body, or
 /// any tag. Tags are included so `--word prism` catches `#arc:display-prism`.
 fn wordMatches(t: Task, word: []const u8) bool {
@@ -2369,9 +2598,11 @@ fn containsSubCI(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Is this task still not-yet-built work (shown in the TODO projection)?
-/// open + blocked are pending; done/dropped/archived are finished or abandoned.
+/// open + blocked + claimed are pending (a claim is a commit's self-report,
+/// pending the orchestrator's verify — see `State.claimed`); done/dropped/
+/// archived are finished or abandoned.
 fn isRemaining(s: State) bool {
-    return s == .open or s == .blocked;
+    return s == .open or s == .blocked or s == .claimed;
 }
 
 /// One-char state marker for line output / the tree.
@@ -2382,6 +2613,9 @@ fn stateMarker(s: State) []const u8 {
         .blocked => "[~]",
         .dropped => "[-]",
         .archived => "[a]",
+        // Distinct from plain `open` on purpose — a claim is not verified work
+        // available to pick up (see `State.claimed`'s doc comment).
+        .claimed => "[c]",
     };
 }
 

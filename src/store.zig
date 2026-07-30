@@ -107,6 +107,11 @@ pub const Store = struct {
     /// `in` members — the structural fix for an empty goal that was previously
     /// inexpressible. See `isArc`.
     declared_arcs: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    /// Standing-arc markers (`trk arc <id> --standing`), folded from
+    /// `arcStanding{standing:true}` events. A member is excluded from `next`'s
+    /// ready frontier UNCONDITIONALLY, drained or not — see `isStanding` and
+    /// `next`.
+    standing_arcs: std.AutoHashMapUnmanaged(Key, void) = .empty,
     /// Parsed `.tracker/config.json` (defaults when the file is absent). Loaded
     /// by `load` alongside the event fold; best-effort (a malformed file yields
     /// defaults and sets `config_malformed` rather than failing the command).
@@ -147,6 +152,7 @@ pub const Store = struct {
         self.dep_tombstones.deinit(self.gpa);
         self.doc_paths.deinit(self.gpa);
         self.declared_arcs.deinit(self.gpa);
+        self.standing_arcs.deinit(self.gpa);
         self.self_wait_cycles.deinit(self.gpa);
         self.arena.deinit();
     }
@@ -305,6 +311,15 @@ pub const Store = struct {
                     try self.declared_arcs.put(self.gpa, key(x.id), {});
                 } else {
                     _ = self.declared_arcs.remove(key(x.id));
+                }
+            },
+            .arcStanding => |x| {
+                // Out-of-order tolerance like arcDeclare/dep/in.
+                _ = try self.ensureNode(x.id);
+                if (x.standing) {
+                    try self.standing_arcs.put(self.gpa, key(x.id), {});
+                } else {
+                    _ = self.standing_arcs.remove(key(x.id));
                 }
             },
             .setShort => |x| {
@@ -904,6 +919,8 @@ pub const Store = struct {
                 } });
             if (self.declared_arcs.contains(key(id)))
                 try self.emit(buf, .{ .arcDeclare = .{ .id = id, .declared = true } });
+            if (self.standing_arcs.contains(key(id)))
+                try self.emit(buf, .{ .arcStanding = .{ .id = id, .standing = true } });
             live += 1;
         }
 
@@ -1103,6 +1120,11 @@ pub const Store = struct {
                     task_id = x.id;
                     break :blk try std.fmt.allocPrint(alloc, "arc: {s}", .{if (x.declared) "declared" else "undeclared"});
                 },
+                .arcStanding => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "arc: {s}", .{if (x.standing) "marked standing" else "unmarked standing"});
+                },
                 .setShort => |x| blk: {
                     ts = x.ts;
                     task_id = x.id;
@@ -1244,6 +1266,18 @@ pub const Store = struct {
         return false;
     }
 
+    /// True iff `id` is marked a STANDING arc (`trk arc <id> --standing`): a
+    /// goal container that names a perpetual category rather than a
+    /// completable goal. Consulted only where it matters — `next` excludes a
+    /// standing arc from the ready frontier unconditionally, drained or not,
+    /// so it never surfaces as a false "this looks finished, close it?"
+    /// prompt. Meaningless (but harmless) on a task for which `isArc` is
+    /// false; `trk arc <id> --standing` always declares the arc in the same
+    /// act, so that combination should not arise via the CLI.
+    pub fn isStanding(self: *Store, id: Ulid) bool {
+        return self.standing_arcs.contains(key(id));
+    }
+
     /// Every declared-or-inferred arc root id: appears as an `in.arc`, is in
     /// `declared_arcs`, or (back-compat) carries an `arc:` tag — i.e. every id
     /// for which `isArc` is true. Caller owns the slice. Shared by `arcless`
@@ -1372,8 +1406,15 @@ pub const Store = struct {
             const t = entry.value_ptr.*;
             if (!t.state.isEligible()) continue; // only `open` is eligible
 
-            // An undrained arc root is never handed out (do the members first).
-            if (self.isArc(t.id) and !self.arcDrained(t.id)) continue;
+            if (self.isArc(t.id)) {
+                // A standing arc (a perpetual category, not a completable goal)
+                // NEVER surfaces here, drained or not — offering it as the
+                // close-out prompt would assert a completion that never
+                // happens (see `isStanding`).
+                if (self.isStanding(t.id)) continue;
+                // An undrained arc root is never handed out (do the members first).
+                if (!self.arcDrained(t.id)) continue;
+            }
 
             // Every prereq must be satisfied.
             var ready = true;

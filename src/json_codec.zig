@@ -13,7 +13,7 @@
 //!
 //! Schema (one object per line). `op` is the discriminator:
 //!   {"op":"add","id":"<ulid>","title":"..","body":"..","tags":["a","b"],"short":"..."|omitted,"ts":169..}
-//!   {"op":"setState","id":"<ulid>","state":"open|done|blocked|dropped","ts":0}
+//!   {"op":"setState","id":"<ulid>","state":"open|done|blocked|dropped|claimed","ts":0}
 //!   {"op":"dep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"in","task":"<ulid>","arc":"<ulid>","seq":0,"ts":0}
 //!   {"op":"setPriority","id":"<ulid>","priority":0,"ts":0}
@@ -25,6 +25,7 @@
 //!   {"op":"untag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"undep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"arcDeclare","id":"<ulid>","declared":true|false,"ts":0}
+//!   {"op":"arcStanding","id":"<ulid>","standing":true|false,"ts":0}
 //!   {"op":"setShort","id":"<ulid>","short":"...","ts":0}
 //!
 //! ts=0 is tolerated on decode (legacy lines / snapshot events). `add`'s
@@ -217,6 +218,14 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, d.ts);
         },
+        .arcStanding => |d| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, d.id.slice());
+            try writeKey(buf, gpa, "standing", &first);
+            try writeBool(buf, gpa, d.standing);
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, d.ts);
+        },
         .setShort => |s| {
             try writeKey(buf, gpa, "id", &first);
             try writeJsonString(buf, gpa, s.id.slice());
@@ -384,6 +393,11 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
             .declared = getBoolDefault(obj, "declared", false),
             .ts = getIntDefault(obj, "ts", 0),
         } },
+        .arcStanding => return .{ .arcStanding = .{
+            .id = try getUlid(obj, "id"),
+            .standing = getBoolDefault(obj, "standing", false),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
         .setShort => return .{ .setShort = .{
             .id = try getUlid(obj, "id"),
             .short = try gpa.dupe(u8, try getStr(obj, "short")),
@@ -465,6 +479,19 @@ test "encode/decode round-trip setShort" {
     defer gpa.free(ev.setShort.short);
     try testing.expect(ev.setShort.id.eql(id));
     try testing.expectEqualStrings("01ARZ3NDE", ev.setShort.short);
+}
+
+test "encode/decode round-trip arcStanding" {
+    const gpa = testing.allocator;
+    const id = try ulid.parse(&ulid.mintAt(testing.io, 100).text);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(&buf, gpa, .{ .arcStanding = .{ .id = id, .standing = true, .ts = 100 } });
+
+    const ev = try decode(gpa, buf.items);
+    try testing.expect(ev.arcStanding.id.eql(id));
+    try testing.expect(ev.arcStanding.standing);
+    try testing.expectEqual(@as(i64, 100), ev.arcStanding.ts);
 }
 
 test "decode rejects junk and unknown op" {

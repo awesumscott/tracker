@@ -135,6 +135,13 @@ date-based**:
 - **`archived`** — completed *and recorded* in `docs/CHANGELOG.md`. The graduation tombstone: excluded from
   every working view, retained in the log for audit until `compact` physically GCs it. Still satisfies a
   prereq (it is finished).
+- **`claimed`** — a CLAIM, not a verdict: "the commit I'm riding completes this task, pending verification."
+  Weaker than `done` in both directions on purpose — does **not** satisfy a prereq (`satisfiesPrereq` is
+  false: a dependent waits for the real, verified `done`) and is **not** `next`-eligible (a claim is not
+  available work; surfacing it there would let a second writer redo already-claimed work). It **does** count
+  as remaining for `render`'s TODO.md projection, with its own marker (`[c]`, distinct from open `[ ]`) — an
+  explicit, scannable "awaiting verification" queue (`trk list --state claimed`). See "Settled rulings" below
+  for the motivating case.
 
 **`trk archive` is the graduation step** (`cmdArchive` in `cli.zig`): it **emits each `done` task as a
 markdown bullet, then flips it to `archived`** in one move — the act of recording is the act of retiring.
@@ -189,6 +196,18 @@ makes the whole store unloadable at fold; a plain derived edge ignores `parked` 
 stubs; and derived edges are byte-identical to authored ones in the log, so no later pass can retract them.
 A root closed early, with members still open, unblocks its dependents — explicit judgment wins; the
 leftover members are candidates for `dropped`.
+
+**A standing arc never surfaces, drained or not** (`trk arc <id> --standing`; `Store.isStanding`). Some arc
+roots name a perpetual CATEGORY — housekeeping, the debug/observability substrate — not a completable goal;
+the drained-vs-complete mechanism above assumes an arc eventually finishes, which is exactly wrong for one of
+these. Closing it would assert a completion that never happens (and leaves a future child with no home);
+leaving it undrained-gated means it periodically surfaces as a false close-out prompt the moment its members
+happen to empty out. `arcStanding` is a first-class marker (mirrors `arcDeclare`'s shape exactly — an
+independent bool event, last-write-wins, carried through `compact`'s re-emission like `declared_arcs`) rather
+than a tag: it is a statement about the task's *nature*, the same kind of statement `trk arc` already makes
+for arc-ness itself, not an ad-hoc label. `next` checks it unconditionally (before the drained check), so a
+standing arc is excluded whether or not it currently has open members; membership (`in`) is untouched — it
+still accepts new children like any other arc, it just never itself becomes "the thing to do next."
 
 But it is **mechanism, not the scheduler** (the mechanism/policy split): critical-path
 choice, agent-count budgeting, and cost are **orchestrator policy on top** of the eligible set, not stored
@@ -248,6 +267,32 @@ and makes the CLI legible without an external cheat-sheet — the point being th
 *discover* the tracker's surface from the tool itself, since the tool is the primary consumer.
 The per-verb text lives in one `verb_help` table with a test asserting an entry per dispatched verb, so the
 contract can't rot as verbs are added.
+
+**`--not-tag <t>` (repeatable, ANDed) on `next`/`list` derives a query set as a complement, not a
+positive filter — deliberately.** A consumer of `next` (a metal-vs-host axis, e.g.) often wants "everything
+EXCEPT what's blocked", not "everything tagged X". A positive membership tag (`auto`, say) makes an untagged
+task ambiguous — not-eligible, or simply not-yet-triaged? — so the query can never answer "is the eligible
+bucket actually empty" with confidence, and a missed triage silently reads as ineligible. Blocker tags
+(negative, applied only where a real blocker exists) make absence mean eligible: the safe default, and the
+residual triage cost (a task that IS blocked but not yet tagged so) stays visible rather than silently
+hidden. `--not-tag metal --not-tag scott-testing --not-tag scott-decision` is then one bare command for the
+autonomous-eligible bucket — no `--json` + external filtering required.
+
+**`trk stale` cross-references git history against tracker state — read-only, best-effort, LANDED commits
+only.** The motivating case: an implementing commit routinely NAMES the task id it completes, and nobody
+runs `trk state done` — the evidence was sitting in `git log` the whole time. `trk stale` runs `git log
+--oneline` (no flags beyond that) with cwd set to the STORE ROOT (`Cli.dir`, resolved by `discover.findRoot`
+— the repo housing `.tracker/`, which the tool itself may not live in), tokenizes the output once (maximal
+alphanumeric runs), and looks each token up against an index of every OPEN task's full id + displayed short
+id (exact-token match, not substring — a short id can never accidentally match as part of an unrelated
+longer token). `claimed` tasks are excluded: a claim already IS the self-reported signal this verb exists to
+surface for a task that never got one.
+
+**Deliberately `git log`, never `git log --all`.** `--all` walks every ref, including a parallel fan-out's
+unmerged worktree branches — a commit hit there is not proof the work is at HEAD (measured in the field: a
+reconciliation pass mis-marked tasks BUILT this way before catching itself with `git merge-base
+--is-ancestor`). `trk stale` wants only LANDED evidence, so it scopes to the current branch's ancestry by
+construction rather than asking the caller to filter `--all`'s output after the fact.
 
 ## Storage, merges, and auth
 

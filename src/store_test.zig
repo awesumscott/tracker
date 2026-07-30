@@ -762,6 +762,149 @@ test "arc root eligibility: all-parked arc is vacuously drained; blocked member 
     }
 }
 
+test "claimed: does not satisfy a prereq and is not next-eligible, unlike done" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const claimed = mintId();
+    const dependent = mintId();
+    try s.append(.{ .add = .{ .id = claimed, .title = "claimed prereq" } });
+    try s.append(.{ .add = .{ .id = dependent, .title = "needs it" } });
+    try s.append(.{ .dep = .{ .from = dependent, .to = claimed } });
+    try s.append(.{ .setState = .{ .id = claimed, .state = .claimed } });
+
+    // The claimed task itself never appears in the ready frontier — it is
+    // not available work to pick up (see State.claimed's doc comment).
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(!contains(n, claimed));
+        // Its dependent stays blocked too: a claim is unverified, so it does
+        // NOT satisfy the `needs` edge the way `done` would.
+        try testing.expect(!contains(n, dependent));
+    }
+
+    // Promoting the claim to `done` (the orchestrator's post-gate reconcile)
+    // unblocks the dependent, exactly like any other verified completion.
+    try s.append(.{ .setState = .{ .id = claimed, .state = .done } });
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(contains(n, dependent));
+    }
+}
+
+test "claimed member does not drain its arc (unverified work never offers the close-out prompt)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const arc = mintId();
+    const member = mintId();
+    try s.append(.{ .add = .{ .id = arc, .title = "goal" } });
+    try s.append(.{ .add = .{ .id = member, .title = "the only task" } });
+    try s.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+    try s.append(.{ .setState = .{ .id = member, .state = .claimed } });
+
+    try testing.expect(!s.arcDrained(arc));
+    const n = try s.next(testing.allocator);
+    defer testing.allocator.free(n);
+    try testing.expect(!contains(n, arc));
+}
+
+test "standing arc: excluded from next even when drained, but keeps accepting members" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const arc = mintId();
+    try s.append(.{ .add = .{ .id = arc, .title = "Housekeeping" } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try testing.expect(!s.isStanding(arc));
+
+    // Not yet standing: a drained (zero-member) declared arc surfaces as the
+    // ordinary close-out prompt (existing, unchanged behavior).
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(contains(n, arc));
+    }
+
+    // Mark standing: it must disappear from `next` even though it is still
+    // (vacuously) drained.
+    try s.append(.{ .arcStanding = .{ .id = arc, .standing = true } });
+    try testing.expect(s.isStanding(arc));
+    try testing.expect(s.arcDrained(arc)); // still drained...
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(!contains(n, arc)); // ...but never surfaces
+    }
+
+    // A standing arc still accepts new children — membership is unaffected.
+    const child = mintId();
+    try s.append(.{ .add = .{ .id = child, .title = "a fresh residual" } });
+    try s.append(.{ .in = .{ .task = child, .arc = arc, .seq = 0 } });
+    const members = try s.membersOf(testing.allocator, arc);
+    defer testing.allocator.free(members);
+    try testing.expect(contains(members, child));
+    // The open child keeps the arc undrained AND it's still excluded from
+    // `next` (independent of drainage — the whole point of "standing").
+    try testing.expect(!s.arcDrained(arc));
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(!contains(n, arc));
+        try testing.expect(contains(n, child)); // the child itself is ordinary open work
+    }
+
+    // Unmarking standing (without retracting the arc) restores the ordinary
+    // drained-arc-surfaces behavior.
+    try s.append(.{ .setState = .{ .id = child, .state = .done } });
+    try s.append(.{ .arcStanding = .{ .id = arc, .standing = false } });
+    try testing.expect(!s.isStanding(arc));
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(contains(n, arc));
+    }
+}
+
+test "compact: a standing arc's mark survives snapshot round-trip" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const arc = mintId();
+
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = arc, .title = "Debug harness / observability" } });
+        try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+        try s.append(.{ .arcStanding = .{ .id = arc, .standing = true } });
+        _ = try s.compact();
+    }
+
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expect(s2.isArc(arc));
+    try testing.expect(s2.isStanding(arc));
+    const n = try s2.next(testing.allocator);
+    defer testing.allocator.free(n);
+    try testing.expect(!contains(n, arc));
+}
+
 test "compact: snapshot+truncate round-trips state via atomic write" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
