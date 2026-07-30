@@ -32,6 +32,17 @@
 //! ts=0 is tolerated on decode (legacy lines / snapshot events). `add`'s
 //! "short" is likewise optional-on-decode (absent -> null): every add event
 //! written before short-id freezing existed omits it.
+//!
+//! Forward-compat contract for a FUTURE op (01KYT2QET, 2026-07-30): an
+//! unrecognized `op` no longer hard-fails `Store.load` — it is skipped (and
+//! warned about), because a single line carrying a new op must not brick
+//! every not-yet-updated binary's reads. This is safe by default only because
+//! every op that exists today is monotonic in the "safe to miss" direction
+//! (see `Op` in model.zig / `peekUnknownOp` below); a future op whose effect
+//! would NOT be safe for an old binary to silently miss must carry an
+//! explicit `"breaking":true` field in its own encode() case, which routes an
+//! old binary to a hard failure instead of a silent skip. Default (absent) is
+//! `false` — every op below predates this contract and needs no change.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -286,6 +297,59 @@ fn getUlid(obj: std.json.ObjectMap, key: []const u8) DecodeError!Ulid {
     return ulid.parse(s) catch error.BadUlid;
 }
 
+/// Info about a line whose `op` is not in the CURRENT binary's `Op` enum —
+/// i.e. `decode` on it returned `error.UnknownOp`. Consulted ONLY on that
+/// path (01KYT2QET, 2026-07-30): a single log line carrying a new op used to
+/// hard-fail `Store.load` for every older binary — reads included, not just
+/// writes — which is what made `trk unin` unusable on any not-yet-updated
+/// checkout for hours the day it shipped. `Store.load` now SKIPS (and warns
+/// about) an unrecognized op by default rather than failing the whole load.
+pub const UnknownOpInfo = struct {
+    /// The raw `op` string, gpa-owned (caller frees).
+    op: []const u8,
+    /// True iff the line explicitly opts OUT of the skip-and-warn default via
+    /// a `"breaking":true` envelope field. This is the escape hatch for the
+    /// hazard skip-and-warn cannot safely be blind to: skipping is safe ONLY
+    /// while every op is monotonic in the direction "an old binary that
+    /// never applies this op sees a MORE-connected / MORE-blocked graph than
+    /// truth, never a more-satisfied one" (true of `undep`/`unin` today — an
+    /// old binary that misses one just keeps an edge that should be gone,
+    /// which can only under-eligible, never falsely mark something ready or
+    /// done). Nothing enforces that direction for an op that doesn't exist
+    /// yet. So the decision is pushed to whoever adds the NEW op, explicitly,
+    /// at write time — not inferred by the reader, which cannot know a future
+    /// op's semantics: if its effect would be unsafe for an old binary to
+    /// silently miss (e.g. it revokes a satisfaction, or deletes a task
+    /// outright rather than just an edge), the writer marks it
+    /// `"breaking":true` and an old binary refuses to load past it instead of
+    /// silently trusting stale, falsely-permissive state. Absent (or
+    /// `false`) — the default for every op that exists today — means safe to
+    /// skip.
+    breaking: bool,
+};
+
+/// Peek at a line already known to carry an unrecognized `op` (i.e. `decode`
+/// on it returned `error.UnknownOp`) and extract just the `op` string plus
+/// the `"breaking"` envelope flag, without needing to know the unrecognized
+/// op's own field shape. Re-parses the line — cheap, since this only runs on
+/// the rare unknown-op fallback path, never per-line on the hot path. Returns
+/// `null` only if the line somehow no longer parses as a JSON object with a
+/// string `op` (shouldn't happen for a line `decode` already got as far as
+/// `UnknownOp` on, but handled defensively rather than asserted).
+pub fn peekUnknownOp(gpa: std.mem.Allocator, line: []const u8) !?UnknownOpInfo {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const op_str = getStr(obj, "op") catch return null;
+    return .{
+        .op = try gpa.dupe(u8, op_str),
+        .breaking = getBoolDefault(obj, "breaking", false),
+    };
+}
+
 /// Parse one JSON line into an Event. Strings in the returned Event are dup'd
 /// into `gpa` (so they outlive the parse arena — the store owns the dup'd mem).
 /// ts=0 (missing field) is tolerated for all variants (legacy / snapshot lines).
@@ -535,4 +599,33 @@ test "encode/decode ts=0 legacy tolerance" {
     const line = "{\"op\":\"setState\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"state\":\"done\"}";
     const ev = try decode(gpa, line);
     try testing.expectEqual(@as(i64, 0), ev.setState.ts);
+}
+
+test "peekUnknownOp: extracts the op name and defaults breaking to false when absent" {
+    const gpa = testing.allocator;
+    const info = (try peekUnknownOp(gpa, "{\"op\":\"frobnicate\",\"id\":\"x\"}")).?;
+    defer gpa.free(info.op);
+    try testing.expectEqualStrings("frobnicate", info.op);
+    try testing.expect(!info.breaking);
+}
+
+test "peekUnknownOp: honors an explicit \"breaking\":true envelope flag" {
+    const gpa = testing.allocator;
+    const info = (try peekUnknownOp(gpa, "{\"op\":\"purgeTask\",\"id\":\"x\",\"breaking\":true}")).?;
+    defer gpa.free(info.op);
+    try testing.expectEqualStrings("purgeTask", info.op);
+    try testing.expect(info.breaking);
+}
+
+test "peekUnknownOp: an explicit \"breaking\":false is indistinguishable from absent" {
+    const gpa = testing.allocator;
+    const info = (try peekUnknownOp(gpa, "{\"op\":\"frobnicate\",\"breaking\":false}")).?;
+    defer gpa.free(info.op);
+    try testing.expect(!info.breaking);
+}
+
+test "peekUnknownOp: returns null on a line that isn't even a JSON object with a string op" {
+    const gpa = testing.allocator;
+    try testing.expect(try peekUnknownOp(gpa, "not json") == null);
+    try testing.expect(try peekUnknownOp(gpa, "{\"id\":\"x\"}") == null); // no op field at all
 }

@@ -68,6 +68,14 @@ pub const Config = struct {
 
 pub const Error = error{
     DependencyCycle,
+    /// `T in X` named an `X` that is not a declared arc (`trk arc X` / `trk
+    /// add --arc`, or the deprecated `arc:` tag) — see `isArc`'s doc comment
+    /// for why this can no longer be inferred from the edge itself. Not
+    /// raised for a literal self-membership (`T in T`): that shape is left to
+    /// the existing self-loop/cycle rejection regardless of declaration, so a
+    /// direct `Store.append` caller doing `x in x` still gets the
+    /// pre-existing `DependencyCycle` diagnosis, not this one.
+    UndeclaredArc,
 } || std.mem.Allocator.Error;
 
 /// A `needs` edge in memory.
@@ -81,6 +89,13 @@ pub const In = model.In;
 /// genuine `needs` edge or an `in` membership edge (always reported in its
 /// needs-EQUIVALENT direction: arc -> task, i.e. "arc depends on task").
 pub const SelfWaitPair = Needs;
+
+/// One log line `Store.load` could not interpret because its `op` is not in
+/// this binary's `model.Op` (see `Store.skipped_unknown_ops`).
+pub const SkippedOp = struct {
+    /// The raw, unrecognized `op` string. gpa-owned; freed in `deinit`.
+    op: []const u8,
+};
 
 pub const Store = struct {
     gpa: std.mem.Allocator,
@@ -138,6 +153,29 @@ pub const Store = struct {
     /// OTHER cycled task exactly as silently unreachable as the bug this
     /// mechanism exists to kill. gpa-owned; freed in `deinit`.
     self_wait_cycles: std.ArrayList(SelfWaitPair) = .empty,
+    /// EVERY log line `load` skipped because its `op` is not recognized by
+    /// this binary (01KYT2QET, 2026-07-30). Empty = none found. `load`
+    /// no longer hard-fails on an unrecognized op — a single line carrying a
+    /// new op used to brick every not-yet-updated binary's READS, not just
+    /// its writes (measured: `trk unin` was unusable on any checkout that
+    /// hadn't picked up the new op, for hours, on a single-user machine).
+    /// Skipping is the default because it is SAFE for every op that exists
+    /// today (see `json_codec.zig`'s file-doc comment) — an old binary that
+    /// misses an edge-ADD under-connects (a task looks more blocked than
+    /// truth) and one that misses an edge-REMOVE (`undep`/`unin`)
+    /// over-connects (same direction: more blocked, never less) — neither
+    /// direction can make the old binary see something as falsely ready,
+    /// satisfied, or done. A future op whose skip WOULD move that direction
+    /// (e.g. it revokes a satisfaction, or deletes a task rather than an
+    /// edge) must opt out via `"breaking":true` in its own encode() case
+    /// (`json_codec.peekUnknownOp`), which routes `load` to a hard failure
+    /// instead of a silent skip for THAT op specifically. Same reporting
+    /// shape as `self_wait_cycles`: plural (a log can carry more than one
+    /// unrecognized op), collected by `load`/`replayFile`, surfaced by
+    /// main.zig as one warning per line, never fatal on its own. The
+    /// ArrayList itself is gpa-owned (freed in `deinit`); each `.op` string
+    /// is arena-owned (freed wholesale with the rest of the arena).
+    skipped_unknown_ops: std.ArrayList(SkippedOp) = .empty,
 
     /// Open a store rooted at `dir`. Does NOT load — call `load` for that, or
     /// `openAndLoad`. `dir` is borrowed; the caller keeps ownership/closes it.
@@ -160,6 +198,7 @@ pub const Store = struct {
         self.declared_arcs.deinit(self.gpa);
         self.standing_arcs.deinit(self.gpa);
         self.self_wait_cycles.deinit(self.gpa);
+        self.skipped_unknown_ops.deinit(self.gpa);
         self.arena.deinit();
     }
 
@@ -377,7 +416,19 @@ pub const Store = struct {
     /// that only exists in the UNION of two logs neither writer held
     /// locally; the full rescan here is the check that cannot be evaded by
     /// that race (see store_test.zig's union-merge self-wait test).
+    ///
+    /// A line whose `op` is not in THIS binary's `model.Op` is likewise
+    /// non-fatal by default (01KYT2QET) — skipped and collected into
+    /// `skipped_unknown_ops` for main.zig to warn about, rather than failing
+    /// the whole load. See that field's doc comment for the safety argument
+    /// and the `"breaking"` escape hatch a future op can opt into.
     pub fn load(self: *Store) !void {
+        // Reset before replay: `load` is safe to call more than once on a
+        // live Store (tests do), and this must not accumulate stale entries
+        // from a prior fold. `replayFile` populates it as it goes, unlike
+        // `self_wait_cycles` (computed in one pass AFTER replay), so it's
+        // cleared here rather than alongside that reset below.
+        self.skipped_unknown_ops.clearRetainingCapacity();
         try self.replayFile(snapshot_name);
         try self.replayFile(log_name);
         try self.checkAcyclic();
@@ -469,12 +520,40 @@ pub const Store = struct {
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0) continue;
-            const ev = try codec.decode(self.gpa, trimmed);
-            // Free the codec's gpa-dup'd transient strings after apply re-dups
-            // into the arena.
-            defer freeEvent(self.gpa, ev);
-            try self.apply(ev);
+            const maybe_ev = codec.decode(self.gpa, trimmed);
+            if (maybe_ev) |ev| {
+                // Free the codec's gpa-dup'd transient strings after apply
+                // re-dups into the arena.
+                defer freeEvent(self.gpa, ev);
+                try self.apply(ev);
+            } else |e| {
+                // An unrecognized op is skip-and-warn by default, not fatal —
+                // see `skipped_unknown_ops`'s doc comment for why. Any OTHER
+                // decode failure on this line (bad JSON, a known op missing a
+                // required field, ...) is a genuinely corrupt line, not a
+                // forward-compat gap, and stays fatal exactly as before.
+                if (e != error.UnknownOp) return e;
+                if (try self.recordSkippedUnknownOp(trimmed)) continue;
+                return e;
+            }
         }
+    }
+
+    /// Handles one line whose `op` is unrecognized (`codec.decode` returned
+    /// `error.UnknownOp` on it). Peeks the raw line for the op name + the
+    /// `"breaking"` escape hatch (`codec.peekUnknownOp`): if the writer
+    /// marked it breaking, returns `false` so the caller propagates the
+    /// fatal error unchanged; otherwise records it into
+    /// `skipped_unknown_ops` (for main.zig to warn about) and returns `true`
+    /// so the caller skips the line and keeps loading. If the line somehow
+    /// doesn't even peek cleanly (shouldn't happen for a line `decode` got as
+    /// far as `UnknownOp` on), errs toward safety and treats it as breaking.
+    fn recordSkippedUnknownOp(self: *Store, line: []const u8) !bool {
+        const info = (try codec.peekUnknownOp(self.gpa, line)) orelse return false;
+        defer self.gpa.free(info.op);
+        if (info.breaking) return false;
+        try self.skipped_unknown_ops.append(self.gpa, .{ .op = try self.a().dupe(u8, info.op) });
+        return true;
     }
 
     fn freeEvent(gpa: std.mem.Allocator, ev: Event) void {
@@ -705,6 +784,20 @@ pub const Store = struct {
     /// time using comptime field injection. ts=0 on a loaded event means unknown /
     /// legacy (tolerated by the codec's getIntDefault fallback).
     pub fn append(self: *Store, ev_in: Event) !void {
+        // `T in X`'s `X` must already be a declared arc (01KYTFRD7) — checked
+        // BEFORE anything else so a rejected write never touches in-memory
+        // state or the log. Exempts literal self-membership (`T in T`): that
+        // shape is nonsensical regardless of `T`'s declared-ness, and is
+        // already given its own, more specific rejection further down
+        // (`combinedReaches` catches it as a trivial self-reach) — gating it
+        // behind "must be declared first" would just replace one clear
+        // diagnosis with a less specific one for no benefit. See `isArc`'s
+        // doc comment for why this can no longer be inferred from the edge.
+        switch (ev_in) {
+            .in => |x| if (!x.task.eql(x.arc) and !self.isArc(x.arc)) return error.UndeclaredArc,
+            else => {},
+        }
+
         // Stamp ts on whichever variant has the field (all do now, via comptime check).
         var ev = ev_in;
         const ts_now = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
@@ -1267,28 +1360,32 @@ pub const Store = struct {
 
     // -------------------------------------------------------------- arc-as-prereq
 
-    /// True if `id` is an arc: EXPLICITLY DECLARED (`trk arc <id>` / `trk add
-    /// --arc`, an `arcDeclare{declared:true}` event — `declared_arcs`), OR at
-    /// least one task is `in id`. A `needs` edge whose target is an arc means
-    /// "needs the whole arc."
+    /// True if `id` is an arc: EXPLICITLY DECLARED — an `arcDeclare{declared:
+    /// true}` event (`trk arc <id>` / `trk add --arc`, folded into
+    /// `declared_arcs`), OR (back-compat, read-only) the deprecated cosmetic
+    /// `arc:` slug tag. A `needs` edge whose target is an arc means "needs
+    /// the whole arc."
     ///
-    /// This is the single, unified arc-ness check — it replaces three
-    /// previously non-agreeing notions: this direct-`in`-edge test, `in`+
-    /// reachability (`membersOf`/`arcsOf`, a strictly WIDER set used for
-    /// listing/rendering — do not conflate the two), and a cosmetic `arc:`
-    /// slug tag that a render-polish commit introduced to keep an empty arc
-    /// (no `in` members yet, so invisible to the two structural checks) out of
-    /// the "Arc-less" section. Declaring makes an empty arc structurally
-    /// expressible, so the tag is no longer needed as a definition — but it is
-    /// still HONORED here, read-only, for backward compatibility with any
-    /// already-tagged arc: DEPRECATED, do not write new `arc:` tags; `trk
-    /// migrate-arcs` converts every tagged task to a real `arcDeclare` and
-    /// strips the tag.
+    /// Arc-ness is NEVER inferred from a bare `in` edge (01KYTFRD7, fixed
+    /// 2026-07-30). It used to be: `isArc` returned true for ANY id that
+    /// appeared as the `arc` of some `in` edge, with no declaration and no
+    /// check — so `trk in <anything> <X>` silently MINTED X as an arc root,
+    /// which is exactly how a reversed-argument call (`trk in <arc> <task>`
+    /// instead of `<task> <arc>`) turned `<task>` into a spurious arc root
+    /// instead of failing loud. `Store.append` now requires `T in X`'s `X` to
+    /// already satisfy `isArc` (see there) — declared first, `in` second —
+    /// which is also what makes legitimate NESTED-arc authoring (`trk arc P`,
+    /// then `trk in A P`) unambiguous: the target was already a real arc
+    /// before the edge, not retroactively promoted by it. `trk migrate-arcs`
+    /// backfilled a real `arcDeclare` for every arc that existed ONLY via
+    /// in-edge inference at the time of the fix, so this narrowing changes
+    /// nothing for any arc that existed before it landed — only a brand-new,
+    /// never-declared `in` target is affected going forward. The `arc:` tag
+    /// path is untouched by this narrowing (a separate, already-migratable
+    /// back-compat path with its own `trk migrate-arcs` handling — DEPRECATED,
+    /// do not write new `arc:` tags).
     pub fn isArc(self: *Store, id: Ulid) bool {
         if (self.declared_arcs.contains(key(id))) return true;
-        for (self.ins.items) |e| {
-            if (e.arc.eql(id)) return true;
-        }
         if (self.tasks.get(key(id))) |t| {
             for (t.tags.items) |tg| {
                 if (std.mem.startsWith(u8, tg, "arc:")) return true;
@@ -1309,10 +1406,10 @@ pub const Store = struct {
         return self.standing_arcs.contains(key(id));
     }
 
-    /// Every declared-or-inferred arc root id: appears as an `in.arc`, is in
-    /// `declared_arcs`, or (back-compat) carries an `arc:` tag — i.e. every id
-    /// for which `isArc` is true. Caller owns the slice. Shared by `arcless`
-    /// and the CLI's arc-section collector so both use the identical set.
+    /// Every declared arc root id: in `declared_arcs`, or (back-compat)
+    /// carries an `arc:` tag — i.e. every id for which `isArc` is true.
+    /// Caller owns the slice. Shared by `arcless` and the CLI's arc-section
+    /// collector so both use the identical set.
     pub fn arcRoots(self: *Store, alloc: std.mem.Allocator) ![]Ulid {
         var out: std.ArrayList(Ulid) = .empty;
         var it = self.tasks.keyIterator();

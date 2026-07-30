@@ -62,22 +62,44 @@ Defined in `model.zig` (`Task`, `Needs`, `In`, `DocRef`, `State`, the `Event` un
     **load-bearing, not optional**: pure reachability cannot express an arc's *first* task or an orphan goal
     (nothing depends on it yet), so "slot a new issue into an arc" needs a membership primitive, not just a
     prereq edge.
-- **Arc-ness is a DECLARED property (`isArc`, `store.zig`) — one definition, not three.** A task is an arc
-  iff it is **explicitly declared** (`trk arc <id>` / `trk add --arc`, an `arcDeclare` event — last-write-wins
-  on fold, `--undo` retracts) **or** at least one task carries a direct `in X` edge. Declaring makes an
-  arc with **genuinely zero members** expressible (a real goal with no work filed yet, previously
-  inexpressible by either structural check alone); the `in`-edge path needs no migration — every arc
-  built before `arcDeclare` existed keeps working unchanged. *(Supersedes an earlier state where `isArc`
-  (direct `in` only), `membersOf`/`arcsOf` reachability, and a cosmetic `arc:<slug>` tag — introduced in a
-  render-polish commit purely to keep an empty arc out of the "Arc-less" section — silently disagreed: an
-  arc populated only via `dep`/`needs` edges could read `isArc`-false while `list --arc` showed it full.
-  The tag is still read as an implicit declaration at load time for backward compatibility (DEPRECATED —
-  `trk migrate-arcs` converts every tagged task to a real declaration and strips the tag; `add`/`edit`
-  warn on stderr if a new `arc:` tag is written).)*
+- **Arc-ness is a DECLARED property (`isArc`, `store.zig`) — one definition, not three, and NEVER inferred
+  from an edge.** A task is an arc iff it is **explicitly declared** (`trk arc <id>` / `trk add --arc`, an
+  `arcDeclare` event — last-write-wins on fold, `--undo` retracts) **or** (back-compat, read-only) it carries
+  the deprecated `arc:<slug>` tag. Declaring makes an arc with **genuinely zero members** expressible (a real
+  goal with no work filed yet, previously inexpressible by either structural check alone).
+  *(Supersedes an earlier state where `isArc` (direct `in` only), `membersOf`/`arcsOf` reachability, and the
+  `arc:<slug>` tag — introduced in a render-polish commit purely to keep an empty arc out of the "Arc-less"
+  section — silently disagreed: an arc populated only via `dep`/`needs` edges could read `isArc`-false while
+  `list --arc` showed it full. The tag is still honored read-only for backward compatibility — DEPRECATED,
+  `trk migrate-arcs` converts every tagged task to a real declaration and strips the tag; `add`/`edit` warn
+  on stderr if a new `arc:` tag is written.)*
+  **The direct-`in`-edge inference clause was ITSELF deleted (01KYTFRD7, 2026-07-30)** — `isArc` no longer
+  returns true merely because some task carries `in X`. It had looked like the harmless, migration-free third
+  path (any arc built before `arcDeclare` existed "just worked"), but it meant `trk in <anything> <X>`
+  silently MINTED `X` as an arc root with no declaration and no check: a reversed-argument call
+  (`trk in <arc> <task>` instead of `<task> <arc>`) turned the intended *task* into a spurious arc, four
+  times in one session, and twice left a task a member of *itself* (permanently unschedulable — see
+  "Arc-as-prereq" below). **`Store.append` now requires `T in X`'s `X` to already satisfy `isArc` before the
+  edge is written** — declared first, membership second, exactly what legitimate nested-arc authoring
+  (`trk arc P`, then `trk in A P`) already looked like; a prior lane had judged "reject the mistake shape
+  without rejecting genuine nesting" impossible precisely because arc-hood was inferred, which made the two
+  shapes structurally identical at write time. Requiring declaration first makes them different by
+  construction: the mistake targets an UNDECLARED id, genuine nesting never does. Rejected with a distinct
+  `error.UndeclaredArc` (never conflated with `DependencyCycle`), except for a literal self-membership
+  (`T in T`) — left to the existing self-loop rejection regardless of declaration, since that shape is
+  nonsensical independent of `T`'s declared-ness. **`trk migrate-arcs` backfills a real `arcDeclare` for
+  every id that was an arc ONLY via this inference** (a second pass alongside its pre-existing `arc:`-tag
+  migration) — run once, before the inference clause was deleted, so every arc that existed *before* the fix
+  answers `isArc` identically *after* it; only a brand-new, never-declared `in` target is affected going
+  forward. `trk unin` (mirrors `undep`) remains the recovery mechanism for a wrong-*direction* `in` between
+  two ids that are BOTH already-declared arcs — the declared-arc gate closes the "mint a spurious arc" shape,
+  not a swap between two arcs that already legitimately exist.
   **`membersOf`/`arcsOf` stay the strictly WIDER read projection**: a task is *in* an arc if it's a direct
   `in` member **or** `needs`-reachable from one (it auto-surfaces a shared prereq in every arc that reaches
-  it) — never conflate this with `isArc` (arc-ness of the root itself). A new prereq of an existing arc
-  member auto-joins that arc via reachability; a genuinely new arc task is added with one `in` edge.
+  it) — never conflate this with `isArc` (arc-ness of the root itself); this projection is **unaffected** by
+  the inference deletion (it never consulted `isArc`, only the raw `in` edge set). A new prereq of an
+  existing arc member auto-joins that arc via reachability; a genuinely new arc task is added by declaring
+  its arc (if not already one) and then one `in` edge.
   **`Store.arcless`** is the completeness counterpart — every task in NO arc by this unified model
   (`trk list --no-arc`; `render`'s header counts it as drift every regeneration) — the terminating
   condition for "sort everything into arcs". `trk add` warns to stderr (escalate to a hard error via
@@ -338,13 +360,20 @@ The merge model is **owned** here, because it gates how parallel agents may touc
   tombstones, and correctly so — by compaction every tombstoned edge is already folded out of `needs`/`ins`
   (absent) and the snapshot emits only surviving edges, so no stray `dep`/`in` line survives to need
   blocking. A literal self-membership `trk in X X` is rejected outright (both at the CLI, with a dedicated
-  message, and structurally via the cycle-detector, which treats `start == target` as trivially reachable);
-  a *backwards* two-distinct-id `in` (task/arc swapped) is deliberately NOT hard-rejected at write time —
-  the pre-write graph state left by "an established arc's first member is another already-established arc"
-  (legitimate nested-arc authoring) is indistinguishable from the mistake shape (an established id becoming
-  a member of a not-yet-declared id), so a heuristic reject would false-positive on genuine nesting. `unin`
-  is the general recovery mechanism instead: it removes whichever `in` edge was actually written, by
-  replaying the SAME (possibly wrong-order) arguments with `unin` in place of `in`.
+  message, and structurally via the cycle-detector, which treats `start == target` as trivially reachable).
+  A *backwards* two-distinct-id `in` (task/arc swapped) is **now hard-rejected at write time for the common
+  case** (01KYTFRD7, 2026-07-30, superseding the reasoning below): the declared-arc requirement (see
+  "Arc-ness is a DECLARED property" above) makes "an established arc's first member is another
+  already-established arc" (legitimate nested-arc authoring) and "an established id becoming a member of a
+  not-yet-declared id" (the mistake) DIFFERENT pre-write graph states, not the same one — genuine nesting
+  always declares the outer arc first, the mistake never declares its accidental "arc" at all. *(Superseded
+  reasoning, kept for the record: a heuristic reject based on prior-graph-shape alone genuinely was
+  impossible to make safe, because — before arc-hood required declaration — both shapes looked identical at
+  write time; the fix wasn't a smarter heuristic, it was removing the ambiguity the heuristic would have had
+  to resolve.)* `unin` remains the general recovery mechanism for the shape the declared-arc gate does NOT
+  catch: a wrong-*direction* `in` between two ids that are BOTH already legitimately declared arcs (e.g. two
+  sibling arcs, swapped) — it removes whichever `in` edge was actually written, by replaying the SAME
+  (possibly wrong-order) arguments with `unin` in place of `in`.
 - **Store-root discovery is bounded at a worktree; `TRK_READONLY` backstops the rest.** `findRoot`
   (`src/discover.zig`) walks up for `.tracker/`, git-style, but never past a linked worktree's root
   (its `.git` is a plain FILE, never a directory — the on-disk marker, no git binary needed): a
@@ -461,3 +490,36 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   `trk doc unset <doc_id>` tombstones a mapping via an empty-path `setDocPath` — the fold removes the
   entry (refs fall back to the raw `doc_id`), the snapshot never emits it, so `compact` GCs the
   tombstone; idempotent, and a later `set` revives it under the same last-write-wins fold.
+- **An unrecognized log op is skip-and-warn by default, never fatal — with an explicit escape hatch for a
+  genuinely unsafe future one (01KYT2QET, 2026-07-30).** `Store.load` used to hard-fail the instant it hit a
+  line whose `op` wasn't in `model.Op` — a single line written by a NEWER binary broke `load` for EVERY
+  not-yet-updated one, reads included, not just writes (measured: `trk unin`'s own rollout — see the `unin`
+  entry above — made itself unusable on any checkout that hadn't picked up the new op, for hours, on a
+  single-user machine; the next new op would have repeated it). Now `replayFile` catches exactly
+  `error.UnknownOp` (never a genuinely malformed line — bad JSON or a KNOWN op missing a field stays fatal,
+  scoped by the error variant, not a blanket catch), records it into `Store.skipped_unknown_ops` (same
+  reporting shape as `self_wait_cycles` — plural, main.zig warns once per line, load still succeeds), and
+  keeps folding every other line in the file.
+  - **Why skip is the SAFE default for every op that exists today, not a blind guess:** every current op is
+    monotonic in one direction — an old binary that misses an edge-ADD (`dep`/`in`/...) under-connects (a
+    task reads more blocked than truth) and one that misses an edge-REMOVE (`undep`/`unin`) over-connects
+    (an edge that should be gone lingers) — both directions can only make the old binary MORE conservative,
+    never let it see something as falsely ready, satisfied, or done. That property is what makes "just
+    ignore it" safe; it is NOT a property the reader can verify about an op it has never heard of.
+  - **The escape hatch: `"breaking":true` in the op's own JSON envelope, decided by the WRITER, never
+    inferred by the reader.** A future op whose skip would NOT stay in the safe direction (e.g. it revokes a
+    prior satisfaction, or deletes a task outright rather than an edge — either could let a stale binary
+    treat something as ready/done that truth says it isn't) sets this field in its own `encode()` case;
+    `json_codec.peekUnknownOp` reads it back on the unknown-op fallback path ONLY (never on a line whose op
+    IS recognized) and `replayFile` propagates the fatal error instead of skipping for that op specifically.
+    Nothing is retrofit onto the 15 ops that exist today — the field is consulted, never written, until a
+    future op's author needs it. This is the same "require the explicit call, don't infer it" shape as the
+    arc-declaration ruling above — same root cause (the tracker inferring something it should have required
+    stated), same fix shape, different surface.
+  - *Rejected: a schema/version field on the log, checked at load.* Works, but couples every future addition
+    to a single global version bump and forces an explicit compatibility matrix; a per-op flag is
+    finer-grained (most future ops likely ARE safe to skip, so most additions need no version bump at all)
+    and keeps the safety judgment next to the code that best knows it — the op's own definition.
+  - *Rejected: status quo (hard-fail) + an explicit flag-day process.* Solves nothing for the single-user,
+    continuously-updated case this incident actually was — the flag-day discipline is exactly the thing that
+    was skipped under real work pressure, which is how the incident happened in the first place.

@@ -41,6 +41,7 @@ test "append -> fold round-trip across a re-open from disk" {
         // arc needing its own member is redundant with membership, not a cycle.
         try s.append(.{ .dep = .{ .from = a, .to = b } });
         try s.append(.{ .setState = .{ .id = a, .state = .done } });
+        try s.append(.{ .arcDeclare = .{ .id = a, .declared = true } }); // `in` now requires a declared arc
         try s.append(.{ .in = .{ .task = b, .arc = a, .seq = 3 } });
         try s.append(.{ .setPriority = .{ .id = b, .priority = -2 } });
         try s.append(.{ .tag = .{ .id = a, .tag = "metal" } });
@@ -141,6 +142,156 @@ test "acyclic: a fold over a log that already contains a cycle errors" {
     try testing.expectError(error.DependencyCycle, s.load());
 }
 
+// --------------------------------------------------------- unknown-op forward-compat (01KYT2QET)
+
+test "load: a log with only known ops is entirely unaffected (no skipped-op noise)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    const b = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = a, .title = "A" } });
+    try s.append(.{ .add = .{ .id = b, .title = "B" } });
+    try s.append(.{ .dep = .{ .from = b, .to = a } });
+
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqual(@as(usize, 0), s2.skipped_unknown_ops.items.len);
+    try testing.expectEqual(@as(usize, 2), s2.count());
+}
+
+test "load: a non-breaking unknown op is skipped and warned about, never fatal — surrounding lines still fold" {
+    // The 01KYT2QET incident shape: a log written by a NEWER binary carries
+    // an op this (older) binary's `model.Op` doesn't have. Before this fix,
+    // `Store.load` hard-failed on the very first such line — which is what
+    // made `trk unin` unusable on any not-yet-updated checkout. Now it is
+    // skipped (recorded, for main.zig to warn about) and the fold continues:
+    // every OTHER line, before and after the unknown one, still applies.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    const b = mintId();
+
+    var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(testing.allocator);
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = a, .title = "A" } });
+    try line.append(testing.allocator, '\n');
+    // A future op this binary has never heard of, written by a newer `trk`.
+    try line.appendSlice(testing.allocator, "{\"op\":\"purgeTask\",\"id\":\"nonexistent\"}\n");
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = b, .title = "B" } });
+    try line.append(testing.allocator, '\n');
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .dep = .{ .from = b, .to = a } });
+    try line.append(testing.allocator, '\n');
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = line.items });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load(); // must NOT error
+
+    try testing.expectEqual(@as(usize, 2), s.count()); // a and b both present
+    try testing.expectEqual(@as(usize, 1), s.skipped_unknown_ops.items.len);
+    try testing.expectEqualStrings("purgeTask", s.skipped_unknown_ops.items[0].op);
+
+    // The lines AFTER the unknown one still applied: b needs a is a real edge.
+    const n = try s.next(testing.allocator);
+    defer testing.allocator.free(n);
+    try testing.expect(contains(n, a));
+    try testing.expect(!contains(n, b)); // blocked on a (open)
+}
+
+test "load: TWO unknown ops are BOTH reported, not just the first" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(testing.allocator);
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = a } });
+    try line.append(testing.allocator, '\n');
+    try line.appendSlice(testing.allocator, "{\"op\":\"purgeTask\"}\n");
+    try line.appendSlice(testing.allocator, "{\"op\":\"frobnicate\"}\n");
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = line.items });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    try testing.expectEqual(@as(usize, 2), s.skipped_unknown_ops.items.len);
+    try testing.expectEqualStrings("purgeTask", s.skipped_unknown_ops.items[0].op);
+    try testing.expectEqualStrings("frobnicate", s.skipped_unknown_ops.items[1].op);
+}
+
+test "load: re-loading a live Store resets skipped_unknown_ops, doesn't accumulate stale entries" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(testing.allocator);
+    try line.appendSlice(testing.allocator, "{\"op\":\"purgeTask\"}\n");
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = line.items });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(@as(usize, 1), s.skipped_unknown_ops.items.len);
+    try s.load(); // second load on the same live Store
+    try testing.expectEqual(@as(usize, 1), s.skipped_unknown_ops.items.len); // not 2
+}
+
+test "load: a `\"breaking\":true` unknown op is FATAL — the removal-op hazard escape hatch actually fires" {
+    // The hazard the skip-and-warn default cannot safely be blind to: a
+    // FUTURE op whose effect would be unsafe for an old binary to silently
+    // miss (unlike every op that exists today — see the file-doc comment on
+    // skipped_unknown_ops) must be able to say so. `"breaking":true` is that
+    // escape hatch; this proves it actually blocks the load rather than
+    // being silently ignored like the ordinary case above.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(testing.allocator);
+    try tracker.json_codec.encode(&line, testing.allocator, .{ .add = .{ .id = a } });
+    try line.append(testing.allocator, '\n');
+    try line.appendSlice(testing.allocator, "{\"op\":\"purgeTask\",\"id\":\"whatever\",\"breaking\":true}\n");
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = line.items });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try testing.expectError(error.UnknownOp, s.load());
+    // The breaking line is never silently recorded as "just skipped" —
+    // load fails outright instead.
+    try testing.expectEqual(@as(usize, 0), s.skipped_unknown_ops.items.len);
+}
+
+test "load: a genuinely malformed line (not a forward-compat gap) still hard-fails, unaffected by skip-and-warn" {
+    // Skip-and-warn is scoped EXACTLY to `error.UnknownOp` — an unparseable
+    // line, or a KNOWN op missing a required field, is real corruption, not
+    // a newer binary's op this one hasn't learned yet, and must stay fatal.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = "not json at all\n" });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try testing.expectError(error.NotAnObject, s.load());
+}
+
 test "self-wait: an indirect cycle through NESTED arc membership is also rejected" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -154,6 +305,11 @@ test "self-wait: an indirect cycle through NESTED arc membership is also rejecte
     try s.append(.{ .add = .{ .id = a } });
     try s.append(.{ .add = .{ .id = arc_c } });
     try s.append(.{ .add = .{ .id = arc_b } });
+    // `in` now requires an already-declared arc — declare both containers
+    // before nesting into them (this IS what legitimate nested-arc authoring
+    // looks like: declare, then add members).
+    try s.append(.{ .arcDeclare = .{ .id = arc_c, .declared = true } });
+    try s.append(.{ .arcDeclare = .{ .id = arc_b, .declared = true } });
     try s.append(.{ .in = .{ .task = a, .arc = arc_c, .seq = 0 } }); // a in arc_c
     try s.append(.{ .in = .{ .task = arc_c, .arc = arc_b, .seq = 0 } }); // arc_c in arc_b
 
@@ -199,13 +355,18 @@ test "self-wait: a legitimate deep DAG with nested arcs is never flagged (no fal
 
     // Nested arcs, three deep: arc_c in arc_b in arc_a. t1 is a member of the
     // innermost arc — legitimate deep containment, not a self-wait, since t1
-    // never needs any of arc_a/arc_b/arc_c.
+    // never needs any of arc_a/arc_b/arc_c. `in` requires each container
+    // already declared before nesting into it.
+    try s.append(.{ .arcDeclare = .{ .id = arc_c, .declared = true } });
+    try s.append(.{ .arcDeclare = .{ .id = arc_b, .declared = true } });
+    try s.append(.{ .arcDeclare = .{ .id = arc_a, .declared = true } });
     try s.append(.{ .in = .{ .task = t1, .arc = arc_c, .seq = 0 } });
     try s.append(.{ .in = .{ .task = arc_c, .arc = arc_b, .seq = 0 } });
     try s.append(.{ .in = .{ .task = arc_b, .arc = arc_a, .seq = 0 } });
 
     // t5 (the tail of the chain) needs a genuinely different, unrelated arc
     // wholesale — ordinary cross-arc sequencing, must be accepted.
+    try s.append(.{ .arcDeclare = .{ .id = other_arc, .declared = true } });
     try s.append(.{ .in = .{ .task = other_member, .arc = other_arc, .seq = 0 } });
     try s.append(.{ .dep = .{ .from = t5, .to = other_arc } });
 
@@ -376,6 +537,7 @@ test "self-wait: union-merge of two INDIVIDUALLY-acyclic worktree logs closes a 
         try s.load();
         try s.append(.{ .add = .{ .id = arc } });
         try s.append(.{ .add = .{ .id = t } });
+        try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } }); // `in` requires a declared arc
         try s.append(.{ .in = .{ .task = t, .arc = arc, .seq = 0 } }); // t in arc — fine alone
         try testing.expectEqual(@as(usize, 0), s.self_wait_cycles.items.len);
     }
@@ -421,6 +583,8 @@ test "membership: in-edge and reachability-via-needs, shared prereq in two arcs"
     try s.load();
     for ([_]tracker.Ulid{ arc1, arc2, m1, m2, shared }) |id|
         try s.append(.{ .add = .{ .id = id } });
+    try s.append(.{ .arcDeclare = .{ .id = arc1, .declared = true } });
+    try s.append(.{ .arcDeclare = .{ .id = arc2, .declared = true } });
     try s.append(.{ .in = .{ .task = m1, .arc = arc1, .seq = 0 } });
     try s.append(.{ .in = .{ .task = m2, .arc = arc2, .seq = 0 } });
     try s.append(.{ .dep = .{ .from = m1, .to = shared } }); // m1 needs shared
@@ -448,11 +612,16 @@ test "membership: in-edge and reachability-via-needs, shared prereq in two arcs"
 
 // --------------------------------------------------------- isArc unification
 
-test "isArc: declared-with-zero-members, in-member, arc: tag (back-compat), and plain task" {
+test "isArc: declared-with-zero-members, arc: tag (back-compat), and plain task — NOT in-membership" {
+    // isArc has exactly TWO paths now (01KYTFRD7, 2026-07-30): explicit
+    // declaration, and the deprecated `arc:` tag, read-only. A bare `in`
+    // edge is NOT a third path — that inference is exactly the bug that let
+    // `trk in <anything> <X>` silently mint X as an arc root with no
+    // declaration and no check.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const declared_empty = mintId();
-    const in_based = mintId();
+    const declared_with_member = mintId();
     const member = mintId();
     const tagged = mintId();
     const plain = mintId();
@@ -461,21 +630,21 @@ test "isArc: declared-with-zero-members, in-member, arc: tag (back-compat), and 
     defer s.deinit();
     try s.load();
     try s.append(.{ .add = .{ .id = declared_empty, .title = "Declared, no members" } });
-    try s.append(.{ .add = .{ .id = in_based, .title = "Has a member" } });
+    try s.append(.{ .add = .{ .id = declared_with_member, .title = "Declared, has a member" } });
     try s.append(.{ .add = .{ .id = member } });
     try s.append(.{ .add = .{ .id = tagged, .title = "Legacy tag", .tags = &.{"arc:legacy"} } });
     try s.append(.{ .add = .{ .id = plain, .title = "Not an arc" } });
 
     try s.append(.{ .arcDeclare = .{ .id = declared_empty, .declared = true } });
-    try s.append(.{ .in = .{ .task = member, .arc = in_based, .seq = 0 } });
+    try s.append(.{ .arcDeclare = .{ .id = declared_with_member, .declared = true } });
+    try s.append(.{ .in = .{ .task = member, .arc = declared_with_member, .seq = 0 } });
 
     // Before declaration, a bare task with zero `in` members and no tag is not
     // an arc — proves the fix is additive, not "everything is now an arc".
     try testing.expect(!s.isArc(plain));
 
-    // All three arc-ness paths now agree via the single `isArc` check.
     try testing.expect(s.isArc(declared_empty));
-    try testing.expect(s.isArc(in_based));
+    try testing.expect(s.isArc(declared_with_member));
     try testing.expect(s.isArc(tagged)); // back-compat: an `arc:` tag still counts
     try testing.expect(!s.isArc(plain));
     try testing.expect(!s.isArc(member)); // a member is not itself an arc
@@ -493,12 +662,45 @@ test "isArc: declared-with-zero-members, in-member, arc: tag (back-compat), and 
     try s.append(.{ .arcDeclare = .{ .id = declared_empty, .declared = false } });
     try testing.expect(!s.isArc(declared_empty));
 
-    // But retracting a declaration on a task that ALSO has a direct `in`
-    // member leaves it an arc (the `in`-edge path is independent).
-    try s.append(.{ .arcDeclare = .{ .id = in_based, .declared = true } });
-    try testing.expect(s.isArc(in_based));
-    try s.append(.{ .arcDeclare = .{ .id = in_based, .declared = false } });
-    try testing.expect(s.isArc(in_based)); // still true: the `in` member remains
+    // Retracting a declaration on a task that STILL has a direct `in` member
+    // now un-arcs it too — arc-ness has exactly one authoring primitive
+    // (declaration), so there is no second path left to keep it alive. The
+    // `in` edge itself is untouched (membersOf/arcsOf, the wider reachability
+    // view, are independent of isArc — see their own doc comments) but the
+    // root is no longer recognized as an arc root until re-declared.
+    try s.append(.{ .arcDeclare = .{ .id = declared_with_member, .declared = false } });
+    try testing.expect(!s.isArc(declared_with_member));
+    const still_members = try s.membersOf(testing.allocator, declared_with_member);
+    defer testing.allocator.free(still_members);
+    try testing.expect(contains(still_members, member)); // the edge itself survives
+}
+
+test "in: the target must already be a declared arc — an undeclared id is refused, not silently minted" {
+    // The actual 01KYTFRD7 incident shape: `trk in <task> <arc>` (or a
+    // reversed-argument slip) against an id that was never declared. Under
+    // the OLD inference this silently MINTED the id as an arc root; now it
+    // is refused outright, before touching the log or in-memory state.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const task = mintId();
+    const not_yet_an_arc = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = task, .title = "T" } });
+    try s.append(.{ .add = .{ .id = not_yet_an_arc, .title = "Not declared" } });
+
+    try testing.expectError(error.UndeclaredArc, s.append(.{ .in = .{ .task = task, .arc = not_yet_an_arc, .seq = 0 } }));
+    try testing.expect(!s.isArc(not_yet_an_arc)); // the mistake never mints an arc
+    try testing.expectEqual(@as(usize, 0), s.ins.items.len); // and never touches the edge set
+
+    // Declaring it first is all that's needed — this is exactly what
+    // legitimate nested-arc authoring already looks like (`trk arc P` then
+    // `trk in A P`), so no real use is blocked, only the undeclared-id shape.
+    try s.append(.{ .arcDeclare = .{ .id = not_yet_an_arc, .declared = true } });
+    try s.append(.{ .in = .{ .task = task, .arc = not_yet_an_arc, .seq = 0 } });
+    try testing.expectEqual(@as(usize, 1), s.ins.items.len);
 }
 
 // ------------------------------------------------------------------ arcless
@@ -517,6 +719,7 @@ test "arcless: excludes arc roots + members (direct and reachable), includes str
     try s.load();
     for ([_]tracker.Ulid{ arc, member, shared_prereq, declared_empty, stray }) |id|
         try s.append(.{ .add = .{ .id = id } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try s.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
     try s.append(.{ .dep = .{ .from = member, .to = shared_prereq } });
     try s.append(.{ .arcDeclare = .{ .id = declared_empty, .declared = true } });
@@ -532,11 +735,11 @@ test "arcless: excludes arc roots + members (direct and reachable), includes str
     try testing.expectEqual(@as(usize, 1), al.len);
 }
 
-test "arcRoots: matches exactly what isArc is true for, across all three paths" {
+test "arcRoots: matches exactly what isArc is true for — declared + arc: tag, NOT a bare in-target" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const declared = mintId();
-    const in_target = mintId();
+    const in_target = mintId(); // declared explicitly before being used as an `in` target
     const tagged = mintId();
     const plain = mintId();
 
@@ -548,6 +751,7 @@ test "arcRoots: matches exactly what isArc is true for, across all three paths" 
     try s.append(.{ .add = .{ .id = plain } });
     try s.append(.{ .add = .{ .id = tagged, .tags = &.{"arc:x"} } });
     try s.append(.{ .arcDeclare = .{ .id = declared, .declared = true } });
+    try s.append(.{ .arcDeclare = .{ .id = in_target, .declared = true } });
     try s.append(.{ .in = .{ .task = plain, .arc = in_target, .seq = 0 } });
 
     const roots = try s.arcRoots(testing.allocator);
@@ -573,6 +777,7 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
     try s.load();
     for ([_]tracker.Ulid{ arc, pre, dep1, dep2, lone }) |id|
         try s.append(.{ .add = .{ .id = id } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try s.append(.{ .dep = .{ .from = dep1, .to = pre } });
     try s.append(.{ .dep = .{ .from = dep2, .to = pre } });
     try s.append(.{ .in = .{ .task = dep1, .arc = arc, .seq = 5 } });
@@ -665,6 +870,7 @@ test "needs an arc: gates on the ROOT's state (the judgment), not on drainage" {
     try s.append(.{ .add = .{ .id = m1, .title = "member 1" } });
     try s.append(.{ .add = .{ .id = m2, .title = "member 2" } });
     try s.append(.{ .add = .{ .id = dependent, .title = "needs the whole arc" } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try s.append(.{ .in = .{ .task = m1, .arc = arc, .seq = 0 } });
     try s.append(.{ .in = .{ .task = m2, .arc = arc, .seq = 1 } });
     try s.append(.{ .dep = .{ .from = dependent, .to = arc } }); // dependent needs the ARC
@@ -727,6 +933,7 @@ test "arc root eligibility: all-parked arc is vacuously drained; blocked member 
     const stub = mintId();
     try s.append(.{ .add = .{ .id = arc1, .title = "scaffold arc" } });
     try s.append(.{ .add = .{ .id = stub, .title = "future stub", .tags = &.{"parked"} } });
+    try s.append(.{ .arcDeclare = .{ .id = arc1, .declared = true } });
     try s.append(.{ .in = .{ .task = stub, .arc = arc1, .seq = 0 } });
     try testing.expect(s.arcDrained(arc1));
     {
@@ -743,6 +950,7 @@ test "arc root eligibility: all-parked arc is vacuously drained; blocked member 
     const held = mintId();
     try s.append(.{ .add = .{ .id = arc2, .title = "held arc" } });
     try s.append(.{ .add = .{ .id = held, .title = "on hold" } });
+    try s.append(.{ .arcDeclare = .{ .id = arc2, .declared = true } });
     try s.append(.{ .in = .{ .task = held, .arc = arc2, .seq = 0 } });
     try s.append(.{ .setState = .{ .id = held, .state = .blocked } });
     try testing.expect(!s.arcDrained(arc2));
@@ -810,6 +1018,7 @@ test "claimed member does not drain its arc (unverified work never offers the cl
     const member = mintId();
     try s.append(.{ .add = .{ .id = arc, .title = "goal" } });
     try s.append(.{ .add = .{ .id = member, .title = "the only task" } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try s.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
     try s.append(.{ .setState = .{ .id = member, .state = .claimed } });
 
@@ -957,6 +1166,7 @@ test "compact: full round-trip with deps, ins, tags, docrefs, and a dropped task
         try s.append(.{ .tag = .{ .id = t1, .tag = "alpha" } }); // unsorted
         try s.append(.{ .docref = .{ .id = t2, .doc_id = "doc-a", .section_id = "s1" } });
         try s.append(.{ .dep = .{ .from = t2, .to = t1 } });
+        try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
         try s.append(.{ .in = .{ .task = t1, .arc = arc, .seq = 5 } });
         try s.append(.{ .setState = .{ .id = t1, .state = .done } });
         try s.append(.{ .setState = .{ .id = dead, .state = .dropped } });
@@ -964,8 +1174,9 @@ test "compact: full round-trip with deps, ins, tags, docrefs, and a dropped task
         const r = try s.compact();
         // 3 live tasks (arc, t1, t2); dead excluded.
         try testing.expectEqual(@as(usize, 3), r.live_tasks);
-        // log had 12 events.
-        try testing.expectEqual(@as(usize, 12), r.log_events_before);
+        // log had 13 events (12 + the arcDeclare this test now requires
+        // before `in` can target `arc`).
+        try testing.expectEqual(@as(usize, 13), r.log_events_before);
     }
 
     // Re-open: verify state is exactly preserved.
@@ -1795,6 +2006,7 @@ test "unin: removes an existing in edge (positive direction)" {
     const arc = mintId();
     try s.append(.{ .add = .{ .id = task, .title = "T" } });
     try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try s.append(.{ .in = .{ .task = task, .arc = arc, .seq = 5 } });
     {
         const before = try s.membersOf(testing.allocator, arc);
@@ -1823,6 +2035,7 @@ test "unin: does NOT remove a DIFFERENT in edge (negative direction — no over-
     try s.append(.{ .add = .{ .id = t1, .title = "T1" } });
     try s.append(.{ .add = .{ .id = t2, .title = "T2" } });
     try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try s.append(.{ .in = .{ .task = t1, .arc = arc, .seq = 0 } });
     try s.append(.{ .in = .{ .task = t2, .arc = arc, .seq = 0 } });
 
@@ -1854,6 +2067,7 @@ test "unin: does NOT remove a `needs` edge between the same two ids (edge-kind i
     // the combined self-wait graph (b -> a), so this is not a self-wait
     // shape and both edges coexist legally — unlike `a needs b` + `a in b`,
     // which WOULD be a member needing its own arc (rejected elsewhere).
+    try s.append(.{ .arcDeclare = .{ .id = b, .declared = true } });
     try s.append(.{ .dep = .{ .from = b, .to = a } }); // b needs a
     try s.append(.{ .in = .{ .task = a, .arc = b, .seq = 0 } }); // a in b — distinct edge, same pair
 
@@ -1875,6 +2089,7 @@ test "unin: tombstone beats a same-edge in regardless of append order (union-mer
         const arc = mintId();
         try s.append(.{ .add = .{ .id = task, .title = "T" } });
         try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+        try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
         try s.append(.{ .in = .{ .task = task, .arc = arc, .seq = 0 } });
         try s.append(.{ .unin = .{ .task = task, .arc = arc } });
         try testing.expectEqual(@as(usize, 0), s.ins.items.len);
@@ -1891,6 +2106,7 @@ test "unin: tombstone beats a same-edge in regardless of append order (union-mer
         const arc = mintId();
         try s.append(.{ .add = .{ .id = task, .title = "T" } });
         try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+        try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
         try s.append(.{ .unin = .{ .task = task, .arc = arc } }); // tombstone first
         try s.append(.{ .in = .{ .task = task, .arc = arc, .seq = 0 } }); // blocked
         try testing.expectEqual(@as(usize, 0), s.ins.items.len);
@@ -1913,37 +2129,77 @@ test "unin: no-op on a non-existent edge, and never errors" {
     try testing.expectEqual(@as(usize, 0), s.ins.items.len);
 }
 
-test "unin: clears a backwards `in` and the CORRECT-direction `in` can then be re-added" {
-    // The exact incident shape (01KYSYBVK): an agent runs `trk in <arc>
-    // <task>` (swapped), producing In{task=<arc-id>, arc=<task-id>} instead of
-    // the intended In{task=<task-id>, arc=<arc-id>}. `unin <arc-id> <task-id>`
-    // (replaying the SAME wrong-order args, per the CLI help text) must clear
-    // exactly that edge and leave the graph able to accept the correct one.
+test "in: the swap shape that minted a spurious arc (01KYSYBVK) is now refused outright, not merely recoverable" {
+    // The original incident: `trk in <arc> <task>` (swapped), producing
+    // In{task=<arc-id>, arc=<task-id>} instead of the intended
+    // In{task=<task-id>, arc=<arc-id>}. Under the OLD in-edge inference this
+    // silently MINTED task_id as a spurious arc root, recoverable only via
+    // `unin`. With arc-hood no longer inferred (01KYTFRD7), the same swap now
+    // fails at `append` — task_id was never declared, so the mistake edge is
+    // never created at all, and `unin` is never needed for THIS shape.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var s = Store.open(testing.allocator, io, tmp.dir);
     defer s.deinit();
     try s.load();
 
-    const arc_id = mintId(); // the REAL arc
+    const arc_id = mintId(); // the REAL (but not-yet-declared) arc
     const task_id = mintId(); // the REAL leaf task meant to join it
 
     try s.append(.{ .add = .{ .id = arc_id, .title = "Arc" } });
     try s.append(.{ .add = .{ .id = task_id, .title = "Task" } });
 
-    // The mistake: `trk in arc_id task_id` (swapped) -> In{task=arc_id, arc=task_id}.
-    try s.append(.{ .in = .{ .task = arc_id, .arc = task_id, .seq = 0 } });
-    try testing.expect(s.isArc(task_id)); // task_id wrongly became an arc
+    // The mistake: `trk in arc_id task_id` (swapped) -> would-be
+    // In{task=arc_id, arc=task_id}. Refused: task_id is not a declared arc.
+    try testing.expectError(error.UndeclaredArc, s.append(.{ .in = .{ .task = arc_id, .arc = task_id, .seq = 0 } }));
+    try testing.expect(!s.isArc(task_id)); // never wrongly became an arc
+    try testing.expectEqual(@as(usize, 0), s.ins.items.len); // no edge to recover from
 
-    // Recovery: unin with the SAME (wrong-order) args.
-    try s.append(.{ .unin = .{ .task = arc_id, .arc = task_id } });
-    try testing.expectEqual(@as(usize, 0), s.ins.items.len);
-
-    // Now the CORRECT edge can be written: task_id in arc_id.
+    // Declare arc_id (the real arc), then the CORRECT edge writes cleanly.
+    try s.append(.{ .arcDeclare = .{ .id = arc_id, .declared = true } });
     try s.append(.{ .in = .{ .task = task_id, .arc = arc_id, .seq = 0 } });
     const members = try s.membersOf(testing.allocator, arc_id);
     defer testing.allocator.free(members);
     try testing.expect(contains(members, task_id));
+}
+
+test "unin: still needed for a wrong-direction `in` BETWEEN TWO ALREADY-DECLARED arcs" {
+    // The declared-arc gate closes the "mint a spurious arc" shape above, but
+    // NOT every swap shape: if BOTH ids already independently satisfy isArc
+    // (both declared, e.g. legitimate nested-arc authoring), a swapped `trk
+    // in <B> <A>` instead of `<A> <B>` still passes the gate (both sides are
+    // declared arcs) and still writes the wrong-direction membership edge.
+    // `unin` remains the general recovery mechanism for exactly this case.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const outer = mintId();
+    const inner = mintId();
+    try s.append(.{ .add = .{ .id = outer, .title = "Outer arc" } });
+    try s.append(.{ .add = .{ .id = inner, .title = "Inner arc" } });
+    try s.append(.{ .arcDeclare = .{ .id = outer, .declared = true } });
+    try s.append(.{ .arcDeclare = .{ .id = inner, .declared = true } });
+
+    // Intended: inner in outer. Mistake: outer in inner (swapped) — passes
+    // the declared-arc gate on BOTH ids, since both are real arcs.
+    try s.append(.{ .in = .{ .task = outer, .arc = inner, .seq = 0 } });
+    {
+        const members = try s.membersOf(testing.allocator, inner);
+        defer testing.allocator.free(members);
+        try testing.expect(contains(members, outer)); // the wrong-direction edge landed
+    }
+
+    // Recovery: unin with the SAME (wrong-order) args, then the correct edge.
+    try s.append(.{ .unin = .{ .task = outer, .arc = inner } });
+    try testing.expectEqual(@as(usize, 0), s.ins.items.len);
+
+    try s.append(.{ .in = .{ .task = inner, .arc = outer, .seq = 0 } });
+    const members = try s.membersOf(testing.allocator, outer);
+    defer testing.allocator.free(members);
+    try testing.expect(contains(members, inner));
 }
 
 // ----- helpers -----

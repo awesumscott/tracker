@@ -87,6 +87,7 @@ test "add with --tag/--in/--needs produces the right event sequence" {
     const pre = mintId();
     try f.store.append(.{ .add = .{ .id = arc, .title = "Arc root" } });
     try f.store.append(.{ .add = .{ .id = pre, .title = "Prereq" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
 
     // `trk add "New task" --tag wm --tag metal --in <arc> --seq 3 --needs <pre> --priority -5`
     try f.run(&.{ "add", "New task", "--tag", "wm", "--tag", "metal", "--in", &arc.text, "--seq", "3", "--needs", &pre.text, "--priority", "-5" });
@@ -577,6 +578,8 @@ test "render: arcs, shared prereq under both, markers, determinism" {
     try f.store.append(.{ .add = .{ .id = m2, .title = "Member two" } });
     try f.store.append(.{ .add = .{ .id = shared, .title = "Shared prereq" } });
     try f.store.append(.{ .add = .{ .id = lone, .title = "Lonely task" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc1, .declared = true } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc2, .declared = true } });
     try f.store.append(.{ .in = .{ .task = m1, .arc = arc1, .seq = 0 } });
     try f.store.append(.{ .in = .{ .task = m2, .arc = arc2, .seq = 0 } });
     try f.store.append(.{ .dep = .{ .from = m1, .to = shared } });
@@ -617,6 +620,8 @@ test "render: a task shared by two arcs is anchored once; the repeat links back,
     try f.store.append(.{ .add = .{ .id = m1, .title = "Member one" } });
     try f.store.append(.{ .add = .{ .id = m2, .title = "Member two" } });
     try f.store.append(.{ .add = .{ .id = shared, .title = "Shared prereq", .body = "the shared body" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc1, .declared = true } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc2, .declared = true } });
     try f.store.append(.{ .in = .{ .task = m1, .arc = arc1, .seq = 0 } });
     try f.store.append(.{ .in = .{ .task = m2, .arc = arc2, .seq = 0 } });
     try f.store.append(.{ .dep = .{ .from = m1, .to = shared } });
@@ -685,6 +690,7 @@ test "render: arc seq renders as (seq N), never bare [N]; seq 0 is omitted entir
     try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
     try f.store.append(.{ .add = .{ .id = default_seq, .title = "Default seq task" } });
     try f.store.append(.{ .add = .{ .id = ordered, .title = "Ordered task" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = default_seq, .arc = arc, .seq = 0 } });
     try f.store.append(.{ .in = .{ .task = ordered, .arc = arc, .seq = 2 } });
 
@@ -715,6 +721,8 @@ test "render: the repeat-listing (shared task) also uses (seq N), never bare [N]
     try f.store.append(.{ .add = .{ .id = arc1, .title = "Arc one" } });
     try f.store.append(.{ .add = .{ .id = arc2, .title = "Arc two" } });
     try f.store.append(.{ .add = .{ .id = shared, .title = "Shared" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc1, .declared = true } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc2, .declared = true } });
     try f.store.append(.{ .in = .{ .task = shared, .arc = arc1, .seq = 0 } });
     try f.store.append(.{ .in = .{ .task = shared, .arc = arc2, .seq = 5 } });
 
@@ -915,6 +923,7 @@ test "tree rooted at an arc nests its members" {
     try f.store.append(.{ .add = .{ .id = arc, .title = "The Arc" } });
     try f.store.append(.{ .add = .{ .id = m, .title = "Member" } });
     try f.store.append(.{ .add = .{ .id = pre, .title = "Prereq" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = m, .arc = arc, .seq = 0 } });
     try f.store.append(.{ .dep = .{ .from = m, .to = pre } });
 
@@ -966,6 +975,7 @@ test "dep: a task needing its own arc is rejected (self-wait, direct)" {
     const t = mintId();
     try f.store.append(.{ .add = .{ .id = arc, .title = "Arc root" } });
     try f.store.append(.{ .add = .{ .id = t, .title = "Member" } });
+    try f.run(&.{ "arc", &arc.text });
     try f.run(&.{ "in", &t.text, &arc.text });
 
     // t is a direct member of arc; t needing arc closes the loop.
@@ -982,6 +992,7 @@ test "in: joining an arc a task already (transitively) needs is rejected (self-w
     const t = mintId();
     try f.store.append(.{ .add = .{ .id = arc, .title = "Arc root" } });
     try f.store.append(.{ .add = .{ .id = t, .title = "Member" } });
+    try f.run(&.{ "arc", &arc.text });
     // t needs the arc BEFORE ever being a member of it — fine on its own,
     // since arc isn't yet a container t belongs to.
     try f.run(&.{ "dep", &t.text, &arc.text });
@@ -1005,6 +1016,8 @@ test "dep: a legitimate cross-arc prereq is still accepted (over-rejection guard
     try f.store.append(.{ .add = .{ .id = arc_y, .title = "Arc Y" } });
     try f.store.append(.{ .add = .{ .id = tx, .title = "Task in X" } });
     try f.store.append(.{ .add = .{ .id = ty, .title = "Task in Y" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc_x, .declared = true } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc_y, .declared = true } });
     try f.store.append(.{ .in = .{ .task = tx, .arc = arc_x, .seq = 0 } });
     try f.store.append(.{ .in = .{ .task = ty, .arc = arc_y, .seq = 0 } });
 
@@ -1240,6 +1253,7 @@ test "trk doc: render shows resolved path#section for registered docref, raw id 
     const arc = mintId();
     try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
     try f.store.append(.{ .add = .{ .id = task, .title = "My task" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = task, .arc = arc, .seq = 0 } });
 
     // Two docrefs: one registered, one not.
@@ -1301,6 +1315,7 @@ test "trk show: full detail with prereqs, dependents, arc, docrefs" {
     try f.store.append(.{ .setState = .{ .id = pre, .state = .done } });
     try f.store.append(.{ .dep = .{ .from = task, .to = pre } }); // task needs pre
     try f.store.append(.{ .dep = .{ .from = dep, .to = task } }); // dep needs task
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = task, .arc = arc, .seq = 2 } });
     try f.store.append(.{ .docref = .{ .id = task, .doc_id = "myref", .section_id = "s1" } });
     try f.store.append(.{ .setDocPath = .{ .doc_id = "myref", .path = "docs/myref.md" } });
@@ -1812,6 +1827,7 @@ test "unin: removes an existing in edge" {
     const arc = mintId();
     try f.store.append(.{ .add = .{ .id = task, .title = "T" } });
     try f.store.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = task, .arc = arc, .seq = 0 } });
 
     var found = false;
@@ -1841,6 +1857,7 @@ test "unin: leaves an UNRELATED in edge alone (no over-removal)" {
     try f.store.append(.{ .add = .{ .id = t1, .title = "T1" } });
     try f.store.append(.{ .add = .{ .id = t2, .title = "T2" } });
     try f.store.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = t1, .arc = arc, .seq = 0 } });
     try f.store.append(.{ .in = .{ .task = t2, .arc = arc, .seq = 0 } });
 
@@ -1895,7 +1912,7 @@ test "in: rejects task == arc with a clear self-membership message (not the gene
     try testing.expectEqual(@as(usize, 0), f.store.ins.items.len);
 }
 
-test "in: a swapped-argument mistake is recoverable via unin with the SAME (wrong) order, then the correct edge can be added" {
+test "in: a swapped-argument mistake against an UNDECLARED target now fails outright (01KYTFRD7) — no unin needed" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -1905,18 +1922,58 @@ test "in: a swapped-argument mistake is recoverable via unin with the SAME (wron
     try f.store.append(.{ .add = .{ .id = arc_id, .title = "Arc" } });
     try f.store.append(.{ .add = .{ .id = task_id, .title = "Task" } });
 
-    // The mistake: `trk in <arc> <task>` instead of `<task> <arc>`.
-    try f.run(&.{ "in", &arc_id.text, &task_id.text });
-    try testing.expect(f.store.isArc(task_id)); // task_id wrongly became an arc
+    // The mistake: `trk in <arc> <task>` instead of `<task> <arc>`. Under the
+    // OLD in-edge inference this silently minted task_id as a spurious arc;
+    // now it is refused — task_id was never declared.
+    const e = f.runExpectErr(&.{ "in", &arc_id.text, &task_id.text });
+    try testing.expectEqual(cli.CliError.UndeclaredArc, e);
+    try testing.expect(!f.store.isArc(task_id)); // never wrongly became an arc
+    try testing.expectEqual(@as(usize, 0), f.store.ins.items.len); // no edge to recover from
 
-    // Recovery: unin replays the SAME (wrong-order) args.
-    try f.run(&.{ "unin", &arc_id.text, &task_id.text });
-    try testing.expectEqual(@as(usize, 0), f.store.ins.items.len);
-
-    // The correct edge now applies cleanly.
+    // Declaring the REAL arc first, then the correct edge, applies cleanly —
+    // no `unin` recovery step needed for this shape.
+    try f.run(&.{ "arc", &arc_id.text });
     try f.run(&.{ "in", &task_id.text, &arc_id.text });
     var found = false;
-    for (f.store.ins.items) |e| if (e.task.eql(task_id) and e.arc.eql(arc_id)) {
+    for (f.store.ins.items) |ev| if (ev.task.eql(task_id) and ev.arc.eql(arc_id)) {
+        found = true;
+    };
+    try testing.expect(found);
+}
+
+test "unin: still needed for a wrong-direction `in` BETWEEN TWO ALREADY-DECLARED arcs" {
+    // The declared-arc gate closes the "mint a spurious arc" shape (above),
+    // but not every swap: if BOTH ids already independently satisfy isArc
+    // (legitimate nested-arc authoring), a swapped `trk in <B> <A>` instead
+    // of `<A> <B>` still passes the gate and still writes the wrong-direction
+    // edge — `unin` remains the general recovery mechanism for that case.
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const outer = mintId();
+    const inner = mintId();
+    try f.store.append(.{ .add = .{ .id = outer, .title = "Outer arc" } });
+    try f.store.append(.{ .add = .{ .id = inner, .title = "Inner arc" } });
+    try f.run(&.{ "arc", &outer.text });
+    try f.run(&.{ "arc", &inner.text });
+
+    // Intended: inner in outer. Mistake: outer in inner (swapped) — passes,
+    // since both ids are declared arcs.
+    try f.run(&.{ "in", &outer.text, &inner.text });
+    var wrong_direction = false;
+    for (f.store.ins.items) |ev| if (ev.task.eql(outer) and ev.arc.eql(inner)) {
+        wrong_direction = true;
+    };
+    try testing.expect(wrong_direction);
+
+    // Recovery: unin with the SAME (wrong-order) args, then the correct edge.
+    try f.run(&.{ "unin", &outer.text, &inner.text });
+    try testing.expectEqual(@as(usize, 0), f.store.ins.items.len);
+
+    try f.run(&.{ "in", &inner.text, &outer.text });
+    var found = false;
+    for (f.store.ins.items) |ev| if (ev.task.eql(inner) and ev.arc.eql(outer)) {
         found = true;
     };
     try testing.expect(found);
@@ -2090,6 +2147,7 @@ test "trk add with neither --in nor --arc warns to stderr, NEVER pollutes stdout
     // --in or --arc silences it.
     const arc = mintId();
     try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.run(&.{ "add", "Sorted task", "--in", &arc.text });
     try testing.expectEqual(@as(usize, 0), f.warn.items.len);
 }
@@ -2148,6 +2206,7 @@ test "trk list --no-arc: composes with --state/--tag, mutually exclusive with --
     try f.store.append(.{ .add = .{ .id = orphan_open, .title = "Orphan open", .tags = &.{"net"} } });
     try f.store.append(.{ .add = .{ .id = orphan_done, .title = "Orphan done" } });
     try f.store.append(.{ .setState = .{ .id = orphan_done, .state = .done } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
 
     try f.run(&.{ "list", "--no-arc" });
@@ -2186,6 +2245,7 @@ test "render header: arc-less drift count matches actual arc-less remaining task
     try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
     try f.store.append(.{ .add = .{ .id = member, .title = "Member" } });
     try f.store.append(.{ .add = .{ .id = orphan, .title = "Orphan" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
 
     var buf1: std.ArrayList(u8) = .empty;

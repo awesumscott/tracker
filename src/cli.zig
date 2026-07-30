@@ -67,6 +67,10 @@ pub const CliError = error{
     /// `trk add` landed a task in no arc (neither `--in` nor `--arc`) while
     /// `.tracker/config.json`'s `add.arcless` is `"error"`.
     NoArc,
+    /// `trk in <task> <arc>` (or `trk add --in <arc>`) named an `<arc>` that
+    /// is not a declared arc — see `Store.isArc`/`Store.append`'s doc
+    /// comments for why this is no longer inferred from the edge itself.
+    UndeclaredArc,
     /// `trk stale` could not run or was refused by `git log` (not a git repo,
     /// `git` missing from PATH, non-zero exit). A clean message is already
     /// appended to `out` before this is returned.
@@ -251,8 +255,10 @@ pub const Cli = struct {
         \\       [--in <arc> [--seq <n>]] [--arc] [--needs <id> ...] [--priority <n>] [-v]
         \\  Create a task. Prints ONLY the new full ULID (scriptable: ID=$(trk add "x"));
         \\  -v/--verbose prints the friendly "added <short> (<full>)" instead. --needs
-        \\  wires prerequisite edges, --in adds it to an EXISTING arc as a member, --arc
-        \\  declares THIS new task itself an arc root (even with zero members yet), --doc
+        \\  wires prerequisite edges, --in adds it to an EXISTING, ALREADY-DECLARED arc as
+        \\  a member (refused with UndeclaredArc otherwise — declare it first with `trk
+        \\  arc`), --arc declares THIS new task itself an arc root (even with zero members
+        \\  yet, and needs no prior declaration), --doc
         \\  attaches a design pointer (register the id first with `trk doc set`). Priority:
         \\  int, lower first. Neither --in nor --arc given -> a stderr warning (never
         \\  stdout); escalate to a hard error via .tracker/config.json's add.arcless.
@@ -283,24 +289,30 @@ pub const Cli = struct {
         .{ .name = "in", .text =
         \\trk in <task> <arc> [--seq <n>]
         \\  Add <task> to arc <arc> as a DIRECT member, optionally ordered by --seq.
+        \\  <arc> MUST already be a declared arc (`trk arc <arc>` / `trk add --arc`) —
+        \\  `in` no longer mints one on the fly. Rejected with `UndeclaredArc` if it
+        \\  isn't; declare it first, then retry.
         \\  ARGUMENT ORDER: <task> FIRST, <arc> SECOND — the opposite of how you'd say
         \\  "arc needs task" via `trk dep <arc> <task>`. Reversing it (`trk in <arc>
-        \\  <task>`) does NOT error in general (both ids are valid tasks) — it silently
-        \\  makes <arc> a member of <task> instead, exactly backwards. If unsure,
-        \\  verify after with `trk tree <arc>` (the new task should appear nested
-        \\  under it) or `trk show <task>` (its `arcs:` list should include <arc>).
-        \\  A backwards call is fixed with `trk unin <task> <arc>` — same argument
-        \\  order as this command, NOT swapped (see `trk unin --help`).
-        \\  `in` and `dep` are NOT interchangeable: `in` is the authoring primitive that
-        \\  makes <arc> an arc (`isArc` — also true for a task declared via `trk arc`,
-        \\  with zero members); `dep` only adds a `needs` prerequisite edge, and merely
-        \\  auto-JOINS an existing arc via reachability when the prereq's dependent is
-        \\  already a member — it can never, by itself, create a new arc.
+        \\  <task>`) either fails outright (if <task> was never declared an arc — the
+        \\  common case, and the whole point of the declared-arc requirement above) or,
+        \\  if BOTH ids happen to already be declared arcs, silently makes <arc> a
+        \\  member of <task> instead, exactly backwards. If unsure, verify after with
+        \\  `trk tree <arc>` (the new task should appear nested under it) or
+        \\  `trk show <task>` (its `arcs:` list should include <arc>).
+        \\  A backwards call between two already-declared arcs is fixed with
+        \\  `trk unin <task> <arc>` — same argument order as this command, NOT swapped
+        \\  (see `trk unin --help`).
+        \\  `in` and `dep` are NOT interchangeable: `in` is the membership-authoring
+        \\  primitive (requires <arc> already declared, per above); `dep` only adds a
+        \\  `needs` prerequisite edge, and merely auto-JOINS an existing arc via
+        \\  reachability when the prereq's dependent is already a member.
         \\  Rejected if <task> already (directly or transitively) NEEDS <arc>: the
         \\  membership would close the same self-wait loop `dep` guards against, just
         \\  from the other direction — see `trk dep --help`. Also rejected if <task>
         \\  and <arc> are the same id (a task cannot be a member of itself).
-        \\  e.g.  trk in 01KX6H4V 01KVX4K0     (add 01KX6H4V to arc 01KVX4K0)
+        \\  e.g.  trk arc 01KVX4K0               (declare 01KVX4K0 an arc, once)
+        \\        trk in 01KX6H4V 01KVX4K0       (add 01KX6H4V to arc 01KVX4K0)
         },
         .{ .name = "unin", .text =
         \\trk unin <task> <arc>
@@ -332,10 +344,13 @@ pub const Cli = struct {
         },
         .{ .name = "migrate-arcs", .text =
         \\trk migrate-arcs
-        \\  One-time (but idempotent/re-runnable) migration: for every task carrying a
-        \\  legacy `arc:<slug>` tag, emit an `arcDeclare{declared:true}` and strip the
-        \\  tag. Prints what it changed, one line per migrated task, plus a summary
-        \\  count. A second run finds nothing (the tag is gone) — safe to re-run blind.
+        \\  One-time (but idempotent/re-runnable) migration, two passes: (1) for every
+        \\  task carrying a legacy `arc:<slug>` tag, emit an `arcDeclare{declared:true}`
+        \\  and strip the tag; (2) for every id that is an arc ONLY because some task
+        \\  carries a direct `in` edge naming it (never explicitly declared), emit an
+        \\  `arcDeclare{declared:true}` for it too. Prints what it changed, one line per
+        \\  migrated task, plus a summary count. A second run finds nothing — safe to
+        \\  re-run blind.
         },
         .{ .name = "migrate-shorts", .text =
         \\trk migrate-shorts [--min <n>]
@@ -502,7 +517,7 @@ pub const Cli = struct {
             \\      --standing marks a perpetual-category arc (never surfaces in `next`,
             \\      drained or not, but still accepts new members); `--standing --undo`
             \\      clears just the mark.
-            \\  trk migrate-arcs             convert every legacy `arc:` tag to a real declaration; idempotent
+            \\  trk migrate-arcs             backfill real declarations for legacy `arc:` tags AND in-edge-only arcs; idempotent
             \\  trk migrate-shorts [--min <n>]   freeze every task's CURRENT short id so it never changes again
             \\      --min <n> is a one-time REPAIR: also lengthens an already-frozen short below n
             \\  trk state <id> <open|done|blocked|dropped|claimed>
@@ -889,6 +904,20 @@ pub const Cli = struct {
         // Resolve referenced ids BEFORE minting, so a bad --in/--needs fails
         // without leaving a half-built task in the log.
         const arc_id: ?Ulid = if (in_arc) |a| try self.resolve(a) else null;
+        // `--in` must name an already-declared arc, checked here (not left to
+        // the `.in` append below) so the failure happens BEFORE minting —
+        // same "no half-built task in the log" reasoning as --needs.
+        if (arc_id) |a| {
+            if (!self.store.isArc(a)) {
+                var ab: [ulid.len]u8 = undefined;
+                const as = try self.shortId(a, &ab);
+                try self.print(
+                    "trk: refusing: {s} is not a declared arc — declare it first with `trk arc {s}` (or `trk add --arc`), then retry\n",
+                    .{ as, as },
+                );
+                return error.UndeclaredArc;
+            }
+        }
         var need_ids = try self.gpa.alloc(Ulid, needs.items.len);
         defer self.gpa.free(need_ids);
         for (needs.items, 0..) |n, idx| need_ids[idx] = try self.resolve(n);
@@ -1040,6 +1069,26 @@ pub const Cli = struct {
                 );
                 return error.DependencyCycle;
             }
+            if (e == error.UndeclaredArc) {
+                var tb: [ulid.len]u8 = undefined;
+                var ab: [ulid.len]u8 = undefined;
+                const ts = try self.shortId(task, &tb);
+                const as = try self.shortId(arc, &ab);
+                // `arc` has never been declared (`trk arc`/`trk add --arc`)
+                // — `in` no longer mints one on the fly (01KYTFRD7). The
+                // single most common real-world cause is the SAME
+                // argument-order slip cmdDep/the cycle branch above warn
+                // about: `trk in <arc> <task>` instead of `<task> <arc>`,
+                // where the intended arc ends up in the TASK position and
+                // the intended task — never declared — ends up where an arc
+                // is required.
+                try self.print(
+                    "trk: refusing: {s} is not a declared arc — declare it first with `trk arc {s}` (or `trk add --arc`), then retry `trk in {s} {s}`\n" ++
+                        "trk: hint: if this looks backwards, double check argument order — it's `trk in <task> <arc>`, not <arc> <task>.\n",
+                    .{ as, as, ts, as },
+                );
+                return error.UndeclaredArc;
+            }
             return e;
         };
         var tb: [ulid.len]u8 = undefined;
@@ -1138,11 +1187,24 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- migrate-arcs
 
-    /// `trk migrate-arcs` — one-time-but-idempotent conversion of every legacy
-    /// `arc:<slug>` tag to a real `arcDeclare` event, stripping the tag. Safe
-    /// to re-run: a task whose tag was already stripped has none left to find,
-    /// so a second pass changes nothing (structural idempotency, not a
-    /// separate "already migrated" check).
+    /// `trk migrate-arcs` — one-time-but-idempotent backfill onto real
+    /// `arcDeclare` events, in two independent passes:
+    ///
+    ///   1. Every legacy `arc:<slug>` tag → `arcDeclare` + strip the tag
+    ///      (pre-existing).
+    ///   2. Every id that is an arc ONLY because some task carries a direct
+    ///      `in` edge naming it (01KYTFRD7, 2026-07-30 — added the same day
+    ///      `Store.isArc`'s in-edge inference was deleted). This pass is what
+    ///      makes deleting that inference SAFE rather than merely bypassed:
+    ///      it backfills a real declaration for every arc that existed
+    ///      because of it, so `isArc`'s answer for every arc that existed
+    ///      BEFORE this landed is unchanged after — only a brand-new,
+    ///      never-declared `in` target is affected going forward (and that
+    ///      is now refused at `append`, not silently minted).
+    ///
+    /// Safe to re-run: pass 1 finds nothing once tags are stripped, pass 2
+    /// finds nothing once every in-edge target carries a declaration — both
+    /// are structural idempotency, not a separate "already migrated" check.
     fn cmdMigrateArcs(self: *Cli, args: []const []const u8) Error!void {
         if (args.len != 0) {
             try self.write("trk: migrate-arcs takes no arguments\n");
@@ -1152,6 +1214,8 @@ pub const Cli = struct {
         defer self.gpa.free(ids);
 
         var migrated: usize = 0;
+
+        // Pass 1: legacy `arc:` tags.
         for (ids) |id| {
             const t = self.store.get(id).?;
             if (!hasArcTag(t)) continue;
@@ -1172,6 +1236,29 @@ pub const Cli = struct {
             });
             migrated += 1;
         }
+
+        // Pass 2: every UNIQUE `in.arc` id not already declared (by config,
+        // by pass 1 above, or from before this migration ever ran). Iterates
+        // `self.store.ins` directly — the same field the CLI already reaches
+        // into elsewhere (render/tree) — rather than adding a new Store
+        // query for a one-time migration pass.
+        var seen: std.AutoHashMapUnmanaged([ulid.len]u8, void) = .empty;
+        defer seen.deinit(self.gpa);
+        for (self.store.ins.items) |e| {
+            const gop = try seen.getOrPut(self.gpa, e.arc.text);
+            if (gop.found_existing) continue;
+            if (self.store.declared_arcs.contains(e.arc.text)) continue;
+
+            try self.store.append(.{ .arcDeclare = .{ .id = e.arc, .declared = true } });
+
+            var sb: [ulid.len]u8 = undefined;
+            const title = if (self.store.get(e.arc)) |t| t.title else "";
+            try self.print("migrated {s}  {s}  (declared; was in-edge-inferred only)\n", .{
+                try self.shortId(e.arc, &sb), title,
+            });
+            migrated += 1;
+        }
+
         if (migrated == 0) {
             try self.write("migrate-arcs: nothing to migrate\n");
         } else {

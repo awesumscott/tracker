@@ -62,6 +62,19 @@ pub fn main(init: std.process.Init) !u8 {
                 "re-parenting the membership (`trk in`)\n",
             .{ &p.from.text, &p.to.text },
         ) catch {};
+    // Every log line whose `op` this binary doesn't recognize is likewise
+    // non-fatal: warn on EACH one but keep going (see Store.load's doc
+    // comment / skipped_unknown_ops — a single new-op line must not brick
+    // reads on a not-yet-updated binary). Looping, not just the first, for
+    // the same reason as the self-wait loop above.
+    for (store.skipped_unknown_ops.items) |s|
+        printErr(
+            io,
+            gpa,
+            "trk: warning: skipped a log line with unrecognized op \"{s}\" — this binary may be older " ++
+                "than the log; install the latest `trk` to see its effect\n",
+            .{s.op},
+        ) catch {};
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -107,6 +120,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.DependencyCycle,
             error.ReadOnly,
             error.NoArc,
+            error.UndeclaredArc,
             error.GitLogFailed,
             => {},
             else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),

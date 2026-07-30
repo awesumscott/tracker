@@ -109,7 +109,12 @@ pub const In = struct {
     seq: i32,
 };
 
-/// The op discriminator for a log event.
+/// The op discriminator for a log event. Adding a variant here is a
+/// forward-compat event for every OLDER binary, not just a new feature for
+/// this one (01KYT2QET): an unrecognized op is skipped-and-warned by
+/// `Store.load`, not fatal, so decide whether that default is SAFE for the
+/// new op's semantics — see `json_codec.zig`'s file-level doc comment and
+/// `peekUnknownOp`'s `"breaking"` escape hatch before adding one.
 pub const Op = enum {
     add,
     setState,
