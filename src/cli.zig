@@ -180,6 +180,7 @@ pub const Cli = struct {
         if (std.mem.eql(u8, cmd, "dep")) return self.cmdDep(rest);
         if (std.mem.eql(u8, cmd, "undep")) return self.cmdUndep(rest);
         if (std.mem.eql(u8, cmd, "in")) return self.cmdIn(rest);
+        if (std.mem.eql(u8, cmd, "unin")) return self.cmdUnin(rest);
         if (std.mem.eql(u8, cmd, "arc")) return self.cmdArc(rest);
         if (std.mem.eql(u8, cmd, "migrate-arcs")) return self.cmdMigrateArcs(rest);
         if (std.mem.eql(u8, cmd, "migrate-shorts")) return self.cmdMigrateShorts(rest);
@@ -211,13 +212,13 @@ pub const Cli = struct {
     }
 
     /// Every verb whose dispatch writes persisted state: an appended log
-    /// event (`add`/`dep`/`undep`/`in`/`state`/`edit`/`doc set`/`doc unset`),
-    /// a scaffolded `.tracker/` (`init`), a rewritten snapshot (`compact`), or
-    /// an out-file (`render`, `archive`). Everything else (`next`/`list`/
-    /// `show`/`tree`/`log`/`doc list`/`doc resolve`/`help`) is read-only.
-    /// `read_only` (`TRK_READONLY`) gates exactly this set.
+    /// event (`add`/`dep`/`undep`/`in`/`unin`/`state`/`edit`/`doc set`/`doc
+    /// unset`), a scaffolded `.tracker/` (`init`), a rewritten snapshot
+    /// (`compact`), or an out-file (`render`, `archive`). Everything else
+    /// (`next`/`list`/`show`/`tree`/`log`/`doc list`/`doc resolve`/`help`) is
+    /// read-only. `read_only` (`TRK_READONLY`) gates exactly this set.
     const mutating_verbs = [_][]const u8{
-        "init", "add", "dep", "undep", "in", "arc", "migrate-arcs", "migrate-shorts", "state", "render", "compact", "archive", "edit",
+        "init", "add", "dep", "undep", "in", "unin", "arc", "migrate-arcs", "migrate-shorts", "state", "render", "compact", "archive", "edit",
     };
 
     fn isMutating(cmd: []const u8, rest: []const []const u8) bool {
@@ -282,6 +283,14 @@ pub const Cli = struct {
         .{ .name = "in", .text =
         \\trk in <task> <arc> [--seq <n>]
         \\  Add <task> to arc <arc> as a DIRECT member, optionally ordered by --seq.
+        \\  ARGUMENT ORDER: <task> FIRST, <arc> SECOND — the opposite of how you'd say
+        \\  "arc needs task" via `trk dep <arc> <task>`. Reversing it (`trk in <arc>
+        \\  <task>`) does NOT error in general (both ids are valid tasks) — it silently
+        \\  makes <arc> a member of <task> instead, exactly backwards. If unsure,
+        \\  verify after with `trk tree <arc>` (the new task should appear nested
+        \\  under it) or `trk show <task>` (its `arcs:` list should include <arc>).
+        \\  A backwards call is fixed with `trk unin <task> <arc>` — same argument
+        \\  order as this command, NOT swapped (see `trk unin --help`).
         \\  `in` and `dep` are NOT interchangeable: `in` is the authoring primitive that
         \\  makes <arc> an arc (`isArc` — also true for a task declared via `trk arc`,
         \\  with zero members); `dep` only adds a `needs` prerequisite edge, and merely
@@ -289,7 +298,21 @@ pub const Cli = struct {
         \\  already a member — it can never, by itself, create a new arc.
         \\  Rejected if <task> already (directly or transitively) NEEDS <arc>: the
         \\  membership would close the same self-wait loop `dep` guards against, just
-        \\  from the other direction — see `trk dep --help`.
+        \\  from the other direction — see `trk dep --help`. Also rejected if <task>
+        \\  and <arc> are the same id (a task cannot be a member of itself).
+        \\  e.g.  trk in 01KX6H4V 01KVX4K0     (add 01KX6H4V to arc 01KVX4K0)
+        },
+        .{ .name = "unin", .text =
+        \\trk unin <task> <arc>
+        \\  Remove the <task> in <arc> membership edge (tombstoned; a no-op if
+        \\  absent). Exact mirror of `undep`, for the `in` edge kind. Same argument
+        \\  order as `trk in` (task first, arc second) — do NOT swap.
+        \\  To undo a swapped-argument `trk in` mistake, replay the SAME two ids in
+        \\  the SAME (wrong) order you originally typed, just with `unin` swapped
+        \\  in for `in` — e.g. if `trk in A B` was meant to be `trk in B A`, the fix
+        \\  is `trk unin A B` (not `trk unin B A`), because the edge that actually
+        \\  got written has A in the task slot and B in the arc slot.
+        \\  e.g.  trk unin 01KX6H4V 01KVX4K0
         },
         .{ .name = "arc", .text =
         \\trk arc <id> [--undo] [--standing [--undo]]
@@ -471,7 +494,10 @@ pub const Cli = struct {
             \\      Neither --in nor --arc -> warns to stderr (escalate via config's add.arcless).
             \\  trk dep <from> <to>          mark <from> as needing prerequisite <to>
             \\  trk undep <from> <to>        remove the <from> needs <to> edge (tombstone; no-op if absent)
-            \\  trk in <task> <arc> [--seq <n>]   add task to an arc (NOT the same as `dep` — see `trk in --help`)
+            \\  trk in <task> <arc> [--seq <n>]   add task to an arc, task FIRST (NOT the same order as
+            \\      `dep`'s arc-needs-task phrasing — see `trk in --help`)
+            \\  trk unin <task> <arc>         remove the <task> in <arc> edge (tombstone; no-op if absent;
+            \\      same arg order as `trk in` — fixes a swapped-argument `in` mistake)
             \\  trk arc <id> [--undo] [--standing [--undo]]   declare/retract <id> as an arc root
             \\      --standing marks a perpetual-category arc (never surfaces in `next`,
             \\      drained or not, but still accepts new members); `--standing --undo`
@@ -981,6 +1007,16 @@ pub const Cli = struct {
                 return error.UnknownFlag;
             }
         }
+        // A task cannot be a member of itself. Caught explicitly (rather than
+        // left to the generic cycle-detector, which WOULD also reject it, but
+        // with a confusing "X already needs X" message) so the diagnosis is
+        // immediate and unambiguous.
+        if (task.eql(arc)) {
+            var tb: [ulid.len]u8 = undefined;
+            const ts = try self.shortId(task, &tb);
+            try self.print("trk: refusing: {s} cannot be a member of itself\n", .{ts});
+            return error.DependencyCycle;
+        }
         self.store.append(.{ .in = .{ .task = task, .arc = arc, .seq = seq } }) catch |e| {
             if (e == error.DependencyCycle) {
                 var tb: [ulid.len]u8 = undefined;
@@ -992,9 +1028,15 @@ pub const Cli = struct {
                 // side — `task` already (directly or transitively) needs
                 // `arc`, so making it a member too means `arc` can never
                 // drain (it's waiting on a member that's waiting on it).
+                // The single most common real-world cause of THIS specific
+                // rejection is a swapped argument order (`trk in <arc>
+                // <task>` instead of `<task> <arc>`) landing on top of an
+                // edge the swap already created — so the hint is worth the
+                // line even though it isn't always the cause.
                 try self.print(
-                    "trk: refusing: {s} in {s} would close a cycle — {s} already (directly or transitively) needs {s}, so {s} would wait on itself forever (it can never finish while depending on a member that's waiting on it)\n",
-                    .{ ts, as, ts, as, as },
+                    "trk: refusing: {s} in {s} would close a cycle — {s} already (directly or transitively) needs {s}, so {s} would wait on itself forever (it can never finish while depending on a member that's waiting on it)\n" ++
+                        "trk: hint: if this looks backwards, double check argument order — it's `trk in <task> <arc>`, not <arc> <task>. `trk unin {s} {s}` removes a wrongly-directed edge.\n",
+                    .{ ts, as, ts, as, as, ts, as },
                 );
                 return error.DependencyCycle;
             }
@@ -1003,6 +1045,21 @@ pub const Cli = struct {
         var tb: [ulid.len]u8 = undefined;
         var ab: [ulid.len]u8 = undefined;
         try self.print("{s} in arc {s} (seq {d})\n", .{ try self.shortId(task, &tb), try self.shortId(arc, &ab), seq });
+    }
+
+    // ----------------------------------------------------------- unin
+
+    fn cmdUnin(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len != 2) {
+            try self.write("trk: usage: trk unin <task> <arc>\n");
+            return error.UsageError;
+        }
+        const task = try self.resolve(args[0]);
+        const arc = try self.resolve(args[1]);
+        try self.store.append(.{ .unin = .{ .task = task, .arc = arc } });
+        var tb: [ulid.len]u8 = undefined;
+        var ab: [ulid.len]u8 = undefined;
+        try self.print("{s} no longer in {s}\n", .{ try self.shortId(task, &tb), try self.shortId(arc, &ab) });
     }
 
     // ----------------------------------------------------------- arc

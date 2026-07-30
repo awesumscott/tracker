@@ -9,7 +9,7 @@ file, which becomes a generated projection — structure the value once, render 
 dogfooded: the tool tracks its own development.
 
 The tool is `trk` (a small Zig host tool). Subcommands:
-`add`/`dep`/`undep`/`in`/`arc`/`migrate-arcs`/`state`/`edit`/`show`/`next`/`list`/`render`/`tree`/`log`/`doc`/`compact`/`archive`.
+`add`/`dep`/`undep`/`in`/`unin`/`arc`/`migrate-arcs`/`state`/`edit`/`show`/`next`/`list`/`render`/`tree`/`log`/`doc`/`compact`/`archive`.
 
 What this doc owns: the **data model** (the two-edge DAG, edge-attribute priority, doc-refs), the **`next`
 query**, the **arc/wave tree-print**, the **state lifecycle / changelog handoff**, and the **merge model +
@@ -326,12 +326,25 @@ The merge model is **owned** here, because it gates how parallel agents may touc
   - *Why a blanket "all appends commute" claim was rejected for the general case:* independent top-level
     declarations commute unconditionally; *same-task* events don't. *Disjoint*-task events do — which is the
     narrower property disjoint-writer actually rests on.
-- **Edge removal (`undep`) is a fold-time tombstone, log-replay-scoped.** `undep` appends an edge-tombstone
-  the fold applies as *tombstone-beats-`dep`* — order-independent under union-merge (a concurrent same-edge
-  `dep` loses regardless of append order). The tombstone set is a **fold-time** construct: `compact`/
-  `serializeState` neither emit `undep` ops nor persist tombstones, and correctly so — by compaction every
-  `undep` is already folded into `needs` (the tombstoned edge absent) and the snapshot emits only surviving
-  edges, so no stray `dep` line survives to need blocking.
+- **Edge removal (`undep`/`unin`) is a fold-time tombstone, log-replay-scoped.** `undep` appends an
+  edge-tombstone the fold applies as *tombstone-beats-`dep`* — order-independent under union-merge (a
+  concurrent same-edge `dep` loses regardless of append order). `unin` is the exact mirror for the `in`
+  edge kind (tombstone-beats-`in`, over `(task, arc)` instead of `(from, to)`) — added 2026-07-30 (01KYSYBVK)
+  to close a gap where `dep`/`undep` were a matched append/tombstone pair but `in` had no inverse at all, so
+  a task/arc argument-order slip on `trk in` was permanently uncorrectable (the cycle-detector treats a
+  wrongly-directed `in` edge as equivalent to a `needs` edge, so even the CORRECT-order `in`/`dep` call is
+  then rejected as closing a cycle — the only way out is removing the bad edge itself). Both tombstone sets
+  are a **fold-time** construct: `compact`/`serializeState` neither emit `undep`/`unin` ops nor persist
+  tombstones, and correctly so — by compaction every tombstoned edge is already folded out of `needs`/`ins`
+  (absent) and the snapshot emits only surviving edges, so no stray `dep`/`in` line survives to need
+  blocking. A literal self-membership `trk in X X` is rejected outright (both at the CLI, with a dedicated
+  message, and structurally via the cycle-detector, which treats `start == target` as trivially reachable);
+  a *backwards* two-distinct-id `in` (task/arc swapped) is deliberately NOT hard-rejected at write time —
+  the pre-write graph state left by "an established arc's first member is another already-established arc"
+  (legitimate nested-arc authoring) is indistinguishable from the mistake shape (an established id becoming
+  a member of a not-yet-declared id), so a heuristic reject would false-positive on genuine nesting. `unin`
+  is the general recovery mechanism instead: it removes whichever `in` edge was actually written, by
+  replaying the SAME (possibly wrong-order) arguments with `unin` in place of `in`.
 - **Store-root discovery is bounded at a worktree; `TRK_READONLY` backstops the rest.** `findRoot`
   (`src/discover.zig`) walks up for `.tracker/`, git-style, but never past a linked worktree's root
   (its `.git` is a plain FILE, never a directory — the on-disk marker, no git binary needed): a

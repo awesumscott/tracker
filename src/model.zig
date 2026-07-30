@@ -133,6 +133,14 @@ pub const Op = enum {
     /// concurrent `dep` for the same edge: the tombstone wins regardless of
     /// append order on fold.
     undep,
+    /// Remove an `in` membership edge (edge tombstone; no-op if edge not
+    /// present) — the exact mirror of `undep`, for the OTHER edge kind. Under
+    /// the union-merge model, a `unin` for edge (task,arc) beats any
+    /// concurrent `in` for the same edge: the tombstone wins regardless of
+    /// append order on fold. Exists so an argument-order slip on `trk in`
+    /// (task/arc swapped) is correctable through the tool instead of
+    /// permanently uncorrectable structural debris (01KYSYBVK).
+    unin,
     /// Declare (or retract) a task as an arc root, independent of whether any
     /// task is `in` it. `declared: true` makes `isArc` true even with zero
     /// members (expresses a real goal with no work filed yet); `declared:
@@ -202,6 +210,10 @@ pub const Event = union(Op) {
     /// the edge; applied before a `dep` (in union-merge order) the `dep` dedup
     /// guard re-checks and skips re-adding it. Both orderings converge.
     undep: struct { from: Ulid, to: Ulid, ts: i64 = 0 },
+    /// Remove an `in` membership edge — the inverse of `in`, mirroring `undep`
+    /// exactly (same tombstone-beats-add fold semantics, same union-merge
+    /// convergence, just over `(task, arc)` instead of `(from, to)`).
+    unin: struct { task: Ulid, arc: Ulid, ts: i64 = 0 },
     /// Declare/retract `id` as an arc root. Last-write-wins on fold.
     arcDeclare: struct { id: Ulid, declared: bool, ts: i64 = 0 },
     /// Mark/unmark `id` as a standing arc. See `Op.arcStanding`.

@@ -1782,6 +1782,170 @@ test "setDocPath empty-path tombstone: unset survives compact + reload; live ent
     }
 }
 
+// ----------------------------------------------------------------- unin
+
+test "unin: removes an existing in edge (positive direction)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const task = mintId();
+    const arc = mintId();
+    try s.append(.{ .add = .{ .id = task, .title = "T" } });
+    try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try s.append(.{ .in = .{ .task = task, .arc = arc, .seq = 5 } });
+    {
+        const before = try s.membersOf(testing.allocator, arc);
+        defer testing.allocator.free(before);
+        try testing.expect(contains(before, task));
+    }
+
+    try s.append(.{ .unin = .{ .task = task, .arc = arc } });
+
+    const members = try s.membersOf(testing.allocator, arc);
+    defer testing.allocator.free(members);
+    try testing.expect(!contains(members, task));
+    try testing.expectEqual(@as(usize, 0), s.ins.items.len);
+}
+
+test "unin: does NOT remove a DIFFERENT in edge (negative direction — no over-removal)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const t1 = mintId();
+    const t2 = mintId();
+    const arc = mintId();
+    try s.append(.{ .add = .{ .id = t1, .title = "T1" } });
+    try s.append(.{ .add = .{ .id = t2, .title = "T2" } });
+    try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try s.append(.{ .in = .{ .task = t1, .arc = arc, .seq = 0 } });
+    try s.append(.{ .in = .{ .task = t2, .arc = arc, .seq = 0 } });
+
+    // Remove only t1's membership.
+    try s.append(.{ .unin = .{ .task = t1, .arc = arc } });
+
+    const members = try s.membersOf(testing.allocator, arc);
+    defer testing.allocator.free(members);
+    try testing.expect(!contains(members, t1));
+    try testing.expect(contains(members, t2)); // t2's edge untouched
+    try testing.expectEqual(@as(usize, 1), s.ins.items.len);
+}
+
+test "unin: does NOT remove a `needs` edge between the same two ids (edge-kind isolation)" {
+    // A `unin(task, arc)` must only ever touch the `in` edge set — a `needs`
+    // edge between the identical pair of ids (from == task, to == arc) is a
+    // structurally different relation and must survive untouched.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const a = mintId();
+    const b = mintId();
+    try s.append(.{ .add = .{ .id = a, .title = "A" } });
+    try s.append(.{ .add = .{ .id = b, .title = "B" } });
+    // b needs a, and (separately) a in b: both edges point the SAME way in
+    // the combined self-wait graph (b -> a), so this is not a self-wait
+    // shape and both edges coexist legally — unlike `a needs b` + `a in b`,
+    // which WOULD be a member needing its own arc (rejected elsewhere).
+    try s.append(.{ .dep = .{ .from = b, .to = a } }); // b needs a
+    try s.append(.{ .in = .{ .task = a, .arc = b, .seq = 0 } }); // a in b — distinct edge, same pair
+
+    try s.append(.{ .unin = .{ .task = a, .arc = b } });
+
+    try testing.expectEqual(@as(usize, 0), s.ins.items.len);
+    try testing.expectEqual(@as(usize, 1), s.needs.items.len); // dep edge untouched
+}
+
+test "unin: tombstone beats a same-edge in regardless of append order (union-merge)" {
+    // Case 1: in then unin (normal order) — edge absent after fold.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        const task = mintId();
+        const arc = mintId();
+        try s.append(.{ .add = .{ .id = task, .title = "T" } });
+        try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+        try s.append(.{ .in = .{ .task = task, .arc = arc, .seq = 0 } });
+        try s.append(.{ .unin = .{ .task = task, .arc = arc } });
+        try testing.expectEqual(@as(usize, 0), s.ins.items.len);
+    }
+
+    // Case 2: unin then in (union-merge reversed order) — tombstone still wins.
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        const task = mintId();
+        const arc = mintId();
+        try s.append(.{ .add = .{ .id = task, .title = "T" } });
+        try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+        try s.append(.{ .unin = .{ .task = task, .arc = arc } }); // tombstone first
+        try s.append(.{ .in = .{ .task = task, .arc = arc, .seq = 0 } }); // blocked
+        try testing.expectEqual(@as(usize, 0), s.ins.items.len);
+    }
+}
+
+test "unin: no-op on a non-existent edge, and never errors" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const task = mintId();
+    const arc = mintId();
+    try s.append(.{ .add = .{ .id = task, .title = "T" } });
+    try s.append(.{ .add = .{ .id = arc, .title = "A" } });
+    // No `in` edge exists — unin must be a clean no-op.
+    try s.append(.{ .unin = .{ .task = task, .arc = arc } });
+    try testing.expectEqual(@as(usize, 0), s.ins.items.len);
+}
+
+test "unin: clears a backwards `in` and the CORRECT-direction `in` can then be re-added" {
+    // The exact incident shape (01KYSYBVK): an agent runs `trk in <arc>
+    // <task>` (swapped), producing In{task=<arc-id>, arc=<task-id>} instead of
+    // the intended In{task=<task-id>, arc=<arc-id>}. `unin <arc-id> <task-id>`
+    // (replaying the SAME wrong-order args, per the CLI help text) must clear
+    // exactly that edge and leave the graph able to accept the correct one.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const arc_id = mintId(); // the REAL arc
+    const task_id = mintId(); // the REAL leaf task meant to join it
+
+    try s.append(.{ .add = .{ .id = arc_id, .title = "Arc" } });
+    try s.append(.{ .add = .{ .id = task_id, .title = "Task" } });
+
+    // The mistake: `trk in arc_id task_id` (swapped) -> In{task=arc_id, arc=task_id}.
+    try s.append(.{ .in = .{ .task = arc_id, .arc = task_id, .seq = 0 } });
+    try testing.expect(s.isArc(task_id)); // task_id wrongly became an arc
+
+    // Recovery: unin with the SAME (wrong-order) args.
+    try s.append(.{ .unin = .{ .task = arc_id, .arc = task_id } });
+    try testing.expectEqual(@as(usize, 0), s.ins.items.len);
+
+    // Now the CORRECT edge can be written: task_id in arc_id.
+    try s.append(.{ .in = .{ .task = task_id, .arc = arc_id, .seq = 0 } });
+    const members = try s.membersOf(testing.allocator, arc_id);
+    defer testing.allocator.free(members);
+    try testing.expect(contains(members, task_id));
+}
+
 // ----- helpers -----
 
 fn contains(haystack: []const tracker.Ulid, needle: tracker.Ulid) bool {

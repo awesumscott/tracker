@@ -97,6 +97,11 @@ pub const Store = struct {
     /// contains it, so a tombstone beats a `dep` regardless of fold order (the
     /// union-merge determinism requirement).
     dep_tombstones: std.AutoHashMapUnmanaged([ulid.len * 2]u8, void) = .empty,
+    /// Tombstone set for `unin` ops: every (task,arc) pair for which a `unin`
+    /// has been applied. Exact mirror of `dep_tombstones` for the `in` edge
+    /// kind — an `in` for the same pair is a no-op if this set contains it, so
+    /// the tombstone beats an `in` regardless of fold order.
+    in_tombstones: std.AutoHashMapUnmanaged([ulid.len * 2]u8, void) = .empty,
     /// Doc-id registry: maps stable doc_id strings to repo-relative paths.
     /// Keys and values are arena-owned. Last-write-wins: a second setDocPath for
     /// the same doc_id replaces the path in the map (old key/value stay in the
@@ -150,6 +155,7 @@ pub const Store = struct {
         self.needs.deinit(self.gpa);
         self.ins.deinit(self.gpa);
         self.dep_tombstones.deinit(self.gpa);
+        self.in_tombstones.deinit(self.gpa);
         self.doc_paths.deinit(self.gpa);
         self.declared_arcs.deinit(self.gpa);
         self.standing_arcs.deinit(self.gpa);
@@ -242,6 +248,10 @@ pub const Store = struct {
             .in => |x| {
                 _ = try self.ensureNode(x.task);
                 _ = try self.ensureNode(x.arc);
+                // Tombstone check: if a `unin` for this edge exists (in any
+                // fold-order position), the edge stays absent — tombstone beats
+                // add (exact mirror of `dep`'s tombstone check above).
+                if (self.in_tombstones.contains(edgeKey(x.task, x.arc))) return;
                 // An `in` (task,arc) pair is a set member; a repeat updates seq
                 // (last-write-wins on the priority attribute, idempotent on replay).
                 for (self.ins.items) |*e| {
@@ -302,6 +312,22 @@ pub const Store = struct {
                     }
                 }
                 if (idx) |i| _ = self.needs.orderedRemove(i);
+            },
+            .unin => |x| {
+                // Exact mirror of `undep`, for the `in` edge kind: record the
+                // tombstone (so a later `in` for the same pair, in union-merge
+                // order, is blocked regardless of append order), then also
+                // remove the edge if already present (handles the case where
+                // the `in` precedes the `unin` in fold order).
+                try self.in_tombstones.put(self.gpa, edgeKey(x.task, x.arc), {});
+                var idx: ?usize = null;
+                for (self.ins.items, 0..) |e, i| {
+                    if (e.task.eql(x.task) and e.arc.eql(x.arc)) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (idx) |i| _ = self.ins.orderedRemove(i);
             },
             .arcDeclare => |x| {
                 // Out-of-order tolerance like dep/in: a declare for an id we
@@ -1079,6 +1105,11 @@ pub const Store = struct {
                     ts = x.ts;
                     task_id = x.task;
                     break :blk try alloc.dupe(u8, "in arc");
+                },
+                .unin => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.task;
+                    break :blk try std.fmt.allocPrint(alloc, "unin: {s} no longer in {s}", .{ x.task.slice(), x.arc.slice() });
                 },
                 .setPriority => |x| blk: {
                     ts = x.ts;

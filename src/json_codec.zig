@@ -24,6 +24,7 @@
 //!   {"op":"setBody","id":"<ulid>","body":"...","ts":0}
 //!   {"op":"untag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"undep","from":"<ulid>","to":"<ulid>","ts":0}
+//!   {"op":"unin","task":"<ulid>","arc":"<ulid>","ts":0}
 //!   {"op":"arcDeclare","id":"<ulid>","declared":true|false,"ts":0}
 //!   {"op":"arcStanding","id":"<ulid>","standing":true|false,"ts":0}
 //!   {"op":"setShort","id":"<ulid>","short":"...","ts":0}
@@ -210,6 +211,14 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, d.ts);
         },
+        .unin => |d| {
+            try writeKey(buf, gpa, "task", &first);
+            try writeJsonString(buf, gpa, d.task.slice());
+            try writeKey(buf, gpa, "arc", &first);
+            try writeJsonString(buf, gpa, d.arc.slice());
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, d.ts);
+        },
         .arcDeclare => |d| {
             try writeKey(buf, gpa, "id", &first);
             try writeJsonString(buf, gpa, d.id.slice());
@@ -388,6 +397,11 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
             .to = try getUlid(obj, "to"),
             .ts = getIntDefault(obj, "ts", 0),
         } },
+        .unin => return .{ .unin = .{
+            .task = try getUlid(obj, "task"),
+            .arc = try getUlid(obj, "arc"),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
         .arcDeclare => return .{ .arcDeclare = .{
             .id = try getUlid(obj, "id"),
             .declared = getBoolDefault(obj, "declared", false),
@@ -492,6 +506,20 @@ test "encode/decode round-trip arcStanding" {
     try testing.expect(ev.arcStanding.id.eql(id));
     try testing.expect(ev.arcStanding.standing);
     try testing.expectEqual(@as(i64, 100), ev.arcStanding.ts);
+}
+
+test "encode/decode round-trip unin" {
+    const gpa = testing.allocator;
+    const task = try ulid.parse(&ulid.mintAt(testing.io, 100).text);
+    const arc = try ulid.parse(&ulid.mintAt(testing.io, 200).text);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(&buf, gpa, .{ .unin = .{ .task = task, .arc = arc, .ts = 150 } });
+
+    const ev = try decode(gpa, buf.items);
+    try testing.expect(ev.unin.task.eql(task));
+    try testing.expect(ev.unin.arc.eql(arc));
+    try testing.expectEqual(@as(i64, 150), ev.unin.ts);
 }
 
 test "decode rejects junk and unknown op" {

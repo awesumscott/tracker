@@ -225,6 +225,7 @@ test "read_only refuses every mutating verb cleanly and mutates nothing" {
         &.{ "dep", &a.text, &a.text },
         &.{ "undep", &a.text, &a.text },
         &.{ "in", &a.text, &a.text },
+        &.{ "unin", &a.text, &a.text },
         &.{ "arc", &a.text },
         &.{"migrate-arcs"},
         &.{"migrate-shorts"},
@@ -1577,7 +1578,7 @@ test "every verb supports --help/-h and add --help mints no task" {
     // The full dispatch set. Kept in lockstep with the `verb_help` table via the
     // count assertion below, so a new verb without a help entry is caught.
     const verbs = [_][]const u8{
-        "init",  "add",  "dep",  "undep",  "in",   "arc",     "migrate-arcs", "migrate-shorts",
+        "init",  "add",  "dep",  "undep",  "in",   "unin",    "arc",          "migrate-arcs", "migrate-shorts",
         "state", "next", "list", "render", "tree", "compact", "archive",      "doc",
         "show",  "edit", "log",  "stale",
     };
@@ -1798,6 +1799,127 @@ test "undep: no-op on a non-existent edge" {
     try f.run(&.{ "undep", &a.text, &b.text });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "no longer needs") != null);
     try testing.expectEqual(@as(usize, 0), f.store.needs.items.len);
+}
+
+// ----------------------------------------------------------- unin
+
+test "unin: removes an existing in edge" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const task = mintId();
+    const arc = mintId();
+    try f.store.append(.{ .add = .{ .id = task, .title = "T" } });
+    try f.store.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try f.store.append(.{ .in = .{ .task = task, .arc = arc, .seq = 0 } });
+
+    var found = false;
+    for (f.store.ins.items) |e| if (e.task.eql(task) and e.arc.eql(arc)) {
+        found = true;
+    };
+    try testing.expect(found);
+
+    try f.run(&.{ "unin", &task.text, &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "no longer in") != null);
+
+    var still = false;
+    for (f.store.ins.items) |e| if (e.task.eql(task) and e.arc.eql(arc)) {
+        still = true;
+    };
+    try testing.expect(!still);
+}
+
+test "unin: leaves an UNRELATED in edge alone (no over-removal)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t1 = mintId();
+    const t2 = mintId();
+    const arc = mintId();
+    try f.store.append(.{ .add = .{ .id = t1, .title = "T1" } });
+    try f.store.append(.{ .add = .{ .id = t2, .title = "T2" } });
+    try f.store.append(.{ .add = .{ .id = arc, .title = "A" } });
+    try f.store.append(.{ .in = .{ .task = t1, .arc = arc, .seq = 0 } });
+    try f.store.append(.{ .in = .{ .task = t2, .arc = arc, .seq = 0 } });
+
+    try f.run(&.{ "unin", &t1.text, &arc.text });
+
+    var t1_present = false;
+    var t2_present = false;
+    for (f.store.ins.items) |e| {
+        if (e.task.eql(t1) and e.arc.eql(arc)) t1_present = true;
+        if (e.task.eql(t2) and e.arc.eql(arc)) t2_present = true;
+    }
+    try testing.expect(!t1_present);
+    try testing.expect(t2_present); // untouched
+}
+
+test "unin: no-op on a non-existent edge" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const task = mintId();
+    const arc = mintId();
+    try f.store.append(.{ .add = .{ .id = task, .title = "T" } });
+    try f.store.append(.{ .add = .{ .id = arc, .title = "A" } });
+    // No in edge — unin is a no-op, must not error.
+    try f.run(&.{ "unin", &task.text, &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "no longer in") != null);
+    try testing.expectEqual(@as(usize, 0), f.store.ins.items.len);
+}
+
+test "unin: wrong argument count is a usage error" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const e = f.runExpectErr(&.{"unin"});
+    try testing.expectEqual(cli.CliError.UsageError, e);
+}
+
+// ------------------------------------------------- in: self-membership + swap recovery
+
+test "in: rejects task == arc with a clear self-membership message (not the generic cycle text)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const x = mintId();
+    try f.store.append(.{ .add = .{ .id = x, .title = "X" } });
+
+    const e = f.runExpectErr(&.{ "in", &x.text, &x.text });
+    try testing.expectEqual(cli.CliError.DependencyCycle, e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "cannot be a member of itself") != null);
+    try testing.expectEqual(@as(usize, 0), f.store.ins.items.len);
+}
+
+test "in: a swapped-argument mistake is recoverable via unin with the SAME (wrong) order, then the correct edge can be added" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc_id = mintId();
+    const task_id = mintId();
+    try f.store.append(.{ .add = .{ .id = arc_id, .title = "Arc" } });
+    try f.store.append(.{ .add = .{ .id = task_id, .title = "Task" } });
+
+    // The mistake: `trk in <arc> <task>` instead of `<task> <arc>`.
+    try f.run(&.{ "in", &arc_id.text, &task_id.text });
+    try testing.expect(f.store.isArc(task_id)); // task_id wrongly became an arc
+
+    // Recovery: unin replays the SAME (wrong-order) args.
+    try f.run(&.{ "unin", &arc_id.text, &task_id.text });
+    try testing.expectEqual(@as(usize, 0), f.store.ins.items.len);
+
+    // The correct edge now applies cleanly.
+    try f.run(&.{ "in", &task_id.text, &arc_id.text });
+    var found = false;
+    for (f.store.ins.items) |e| if (e.task.eql(task_id) and e.arc.eql(arc_id)) {
+        found = true;
+    };
+    try testing.expect(found);
 }
 
 // ----------------------------------------------------------- show --body
