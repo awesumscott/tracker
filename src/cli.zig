@@ -301,11 +301,18 @@ pub const Cli = struct {
     const VerbHelp = struct { name: []const u8, text: []const u8 };
     pub const verb_help = [_]VerbHelp{
         .{ .name = "init", .text =
-        \\trk init [--out <path>] [--force]
+        \\trk init [--out <path>] [--force] [--no-gitattributes]
         \\  Scaffold a fresh tracker: .tracker/ + an empty log, a config.json
-        \\  (render.out defaults to docs/TODO.md; set it with --out), and a starter
-        \\  TODO.md. Idempotent + non-destructive: never overwrites an existing
-        \\  TODO.md; --force rewrites config.json only.
+        \\  (render.out defaults to docs/TODO.md; set it with --out), a
+        \\  .tracker/.gitattributes, and a starter TODO.md. Idempotent +
+        \\  non-destructive: never overwrites an existing TODO.md or
+        \\  .gitattributes; --force rewrites config.json only.
+        \\  The .gitattributes union-merges log.jsonl (parallel-worktree appends
+        \\  combine) and pins snapshot.jsonl + quarantine.jsonl to the text driver
+        \\  (a raced compact must surface as a conflict). It goes INSIDE .tracker/
+        \\  on purpose: git resolves attributes per directory and the nearest file
+        \\  wins, so a later root-level `*.jsonl` glob cannot capture the baselines.
+        \\  --no-gitattributes skips it (a repo managing attributes centrally).
         \\  e.g.  trk init            trk init --out TODO.md
         },
         .{ .name = "add", .text =
@@ -499,8 +506,9 @@ pub const Cli = struct {
         \\  A GHOST id (one the log carries events for but no `add` anywhere) is GC'd
         \\  too, and its log lines are moved to .tracker/quarantine.jsonl first — it is
         \\  not a task, and writing it out would promote a nameless husk into a real
-        \\  one. Reported by id, never silent. Never compact while fan-out worktrees
-        \\  are in flight.
+        \\  one. Reported by id, never silent. Warns (stderr) if .tracker/.gitattributes
+        \\  is missing a pin — this is the verb that creates the two files that must
+        \\  never be union-merged. Never compact while fan-out worktrees are in flight.
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
@@ -578,9 +586,10 @@ pub const Cli = struct {
             \\trk — an in-repo issue tracker
             \\
             \\Usage:
-            \\  trk init [--out <path>] [--force]   scaffold .tracker/ + config.json + a starter TODO.md
-            \\      Idempotent and non-destructive: never overwrites an existing TODO.md (or
-            \\      config.json without --force). --out sets config's render.out (default docs/TODO.md).
+            \\  trk init [--out <path>] [--force] [--no-gitattributes]   scaffold .tracker/ + config.json
+            \\      + .tracker/.gitattributes + a starter TODO.md. Idempotent and non-destructive: never
+            \\      overwrites an existing TODO.md or .gitattributes (or config.json without --force).
+            \\      --out sets config's render.out (default docs/TODO.md).
             \\  trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...] [--in <arc> [--seq <n>]] [--arc]
             \\                    [--needs <id> ...] [--priority <n>] [-v]   (prints the new ULID; -v = friendly)
             \\      Neither --in nor --arc -> warns to stderr (escalate via config's add.arcless).
@@ -832,25 +841,32 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- init
 
-    /// `trk init [--out <path>] [--force]` — scaffold a fresh project's tracker.
+    /// `trk init [--out <path>] [--force] [--no-gitattributes]` — scaffold a fresh
+    /// project's tracker.
     /// Three artifacts, each created only if absent (idempotent, non-destructive):
     ///   1. `.tracker/` + an empty `log.jsonl` (today made lazily on first write;
     ///      init makes it explicit so `trk next` works immediately),
     ///   2. `.tracker/config.json` with a default `render.out` (rewritten only
     ///      under `--force`),
-    ///   3. a starter `TODO.md` at the render path — a valid empty projection.
+    ///   3. `.tracker/.gitattributes` — the merge semantics the whole model rests
+    ///      on (see `store.gitattributes_text`), skippable with
+    ///      `--no-gitattributes` for a repo that manages attributes centrally,
+    ///   4. a starter `TODO.md` at the render path — a valid empty projection.
     /// The TODO.md is NEVER overwritten (unlike `trk render`, which regenerates
     /// its projection by design): if one exists init leaves it and reports it, so
     /// init can't clobber a live projection or a user's file.
     fn cmdInit(self: *Cli, args: []const []const u8) Error!void {
         var out_arg: ?[]const u8 = null;
         var force = false;
+        var write_attrs = true;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--out")) {
                 out_arg = try self.flagVal(args, &i, "--out");
             } else if (std.mem.eql(u8, args[i], "--force")) {
                 force = true;
+            } else if (std.mem.eql(u8, args[i], "--no-gitattributes")) {
+                write_attrs = false;
             } else {
                 try self.print("trk: unknown flag '{s}'\n", .{args[i]});
                 return error.UnknownFlag;
@@ -912,7 +928,29 @@ pub const Cli = struct {
             });
         }
 
-        // 3. Seed a starter TODO.md at render_out — ONLY if none exists.
+        // 3. .tracker/.gitattributes — never overwritten (a project may have
+        //    tuned it), and never written at the repo ROOT: git resolves
+        //    attributes per directory and the nearest file wins, so keeping the
+        //    pins here makes them immune to a later root-level `*.jsonl` glob
+        //    instead of dependent on a "keep these lines last" convention.
+        if (write_attrs) {
+            const ga = tracker.store.gitattributes_name;
+            if (self.dirHas(sub, ga)) {
+                try self.print("{s}/{s} already exists — left untouched\n", .{ sd, ga });
+            } else {
+                sub.writeFile(self.io, .{
+                    .sub_path = ga,
+                    .data = tracker.store.gitattributes_text,
+                    .flags = .{},
+                }) catch {
+                    try self.print("trk: init: cannot write {s}/{s}\n", .{ sd, ga });
+                    return error.WriteFailed;
+                };
+                try self.print("created {s}/{s} (log union-merges; the baselines conflict on purpose)\n", .{ sd, ga });
+            }
+        }
+
+        // 4. Seed a starter TODO.md at render_out — ONLY if none exists.
         if (self.fileExists(render_out)) {
             try self.print("{s} already exists — left untouched (init never overwrites it)\n", .{render_out});
         } else {
@@ -1458,6 +1496,7 @@ pub const Cli = struct {
         const result = try self.store.compact();
         // `compact` re-scans `ghost_tasks` itself, so the list read below is the
         // set it actually GC'd, not a stale load-time one.
+        try self.warnUnpinnedAttrs();
         try self.print(
             "compacted: {d} events -> {d} live tasks, log truncated\n",
             .{ result.log_events_before, result.live_tasks },
@@ -1475,6 +1514,63 @@ pub const Cli = struct {
                 "  If a snapshot was clobbered and these were real tasks, restore\n" ++
                     "  .tracker/snapshot.jsonl from git and append the quarantine file back onto\n" ++
                     "  .tracker/log.jsonl — the ids still match.\n",
+            );
+        }
+    }
+
+    /// Warn (to stderr, never stdout) when `.tracker/.gitattributes` is absent or
+    /// missing one of its pins. Called from `compact` because that is the verb
+    /// which CREATES `snapshot.jsonl`/`quarantine.jsonl` — the exact moment two
+    /// files that must never be union-merged come into existence.
+    ///
+    /// The claim is deliberately narrow. trk is std-only and never shells out to
+    /// git, so it cannot ask what attributes are actually in EFFECT (a parent
+    /// `.gitattributes`, `.git/info/attributes` and `core.attributesFile` all
+    /// feed that, and reimplementing git's resolution would be worse than not
+    /// checking). What it can check is its OWN file, so a missing one says
+    /// "absent, and here is what it would do" rather than "your repo is wrong" —
+    /// a repo that pins these at the root is correct too, just not visibly so
+    /// from here.
+    fn warnUnpinnedAttrs(self: *Cli) Error!void {
+        const sd = tracker.store.tracker_subdir;
+        const ga = tracker.store.gitattributes_name;
+        var sub = self.dir.openDir(self.io, sd, .{}) catch return;
+        defer sub.close(self.io);
+
+        const bytes = sub.readFileAlloc(self.io, ga, self.gpa, .unlimited) catch {
+            try self.warn.print(self.gpa,
+                "trk: warning: {s}/{s} is absent. {s} and {s} are whole-file baselines that " ++
+                    "must NOT be union-merged (a raced compact has to surface as a conflict), and " ++
+                    "{s} must be. If this repo pins them elsewhere, ignore this; otherwise run " ++
+                    "`trk init` to write it.\n",
+                .{ sd, ga, tracker.store.snapshot_name, tracker.store.quarantine_name, tracker.store.log_name },
+            );
+            return;
+        };
+        defer self.gpa.free(bytes);
+
+        // Each pin as its own line, leading/trailing whitespace ignored. Matching
+        // whole lines rather than substrings so a mention inside a COMMENT (this
+        // file is heavily commented, and the comments name every pattern) can't
+        // pass the check.
+        const pins = [_][]const u8{
+            tracker.store.log_name ++ " merge=union",
+            tracker.store.snapshot_name ++ " merge=text",
+            tracker.store.quarantine_name ++ " merge=text",
+        };
+        for (pins) |pin| {
+            var found = false;
+            var it = std.mem.splitScalar(u8, bytes, '\n');
+            while (it.next()) |line| {
+                if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), pin)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try self.warn.print(self.gpa,
+                "trk: warning: {s}/{s} has no `{s}` line — re-add it or delete the file and " ++
+                    "re-run `trk init`.\n",
+                .{ sd, ga, pin },
             );
         }
     }

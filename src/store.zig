@@ -48,11 +48,50 @@ pub const tracker_subdir = ".tracker";
 pub const log_name = "log.jsonl";
 pub const snapshot_name = "snapshot.jsonl";
 pub const config_name = "config.json";
+/// Git merge semantics for the store's three files, written by `trk init` INTO
+/// `.tracker/` rather than the repo root. Two reasons it lives here and not
+/// there: git resolves attributes per directory and the file nearest the path
+/// WINS, so these pins cannot be overridden by a later root-level glob (a root
+/// `*.jsonl merge=union` would otherwise silently capture the two baselines);
+/// and `.tracker/` is a directory trk owns, so writing it needs no append-to-a-
+/// foreign-file semantics and cannot clobber a project's own attributes.
+/// Patterns are relative to this file's own directory, so it works whether or
+/// not `.tracker/` sits at the repo root (`discover.findRoot` does not assume
+/// it does).
+pub const gitattributes_name = ".gitattributes";
+pub const gitattributes_text =
+    \\# Written by `trk init`. Kept INSIDE .tracker/ deliberately: git resolves
+    \\# attributes per directory and the file nearest the path wins, so these
+    \\# cannot be overridden by a broader pattern in a parent .gitattributes.
+    \\#
+    \\# The append-only event log: every line is an independent, idempotent event.
+    \\# Union-merge so parallel-worktree appends combine instead of conflicting —
+    \\# that is what lets a lane close its OWN tasks in its worktree and have the
+    \\# events merge on integration. Merge-SAFE, not a general CRDT: it rests on
+    \\# the fan-out invariant that each writer mutates only its own disjoint tasks.
+    \\log.jsonl merge=union
+    \\#
+    \\# Whole-file baselines, written ONLY by a serialized, orchestrator-only
+    \\# `compact` (read-modify-rename, not append). Two sides diverging here means
+    \\# two compactions raced — a rule violation that must SURFACE as a conflict,
+    \\# never be silently combined. snapshot.jsonl is replayed on every load, so a
+    \\# union merge would interleave two baselines and duplicate/revert state;
+    \\# quarantine.jsonl (the ghost-retirement spool) is never read back by trk, so
+    \\# unioning it is merely wrong rather than corrupting — pinned for the same
+    \\# reason and to keep the pair symmetric.
+    \\snapshot.jsonl merge=text
+    \\quarantine.jsonl merge=text
+    \\
+;
+
 /// Where `compact` parks the log lines of ghost ids before it truncates the
-/// log (see `Store.compact`). Append-only, never read back by trk, and — this
-/// matters — never given `merge=union` in `.gitattributes`: it is a recovery
-/// spool, not part of the fold, and a union-merged spool would resurrect the
-/// very lines it exists to take out of circulation.
+/// log (see `Store.compact`). Append-only and never read back by trk — it is a
+/// recovery spool for a human, not part of the fold. Pinned to the default text
+/// merge driver alongside `snapshot.jsonl` (see `gitattributes_text`): it is a
+/// whole-file rewrite by a serialized `compact`, so two sides diverging on it
+/// means two compactions raced, which must surface rather than be combined.
+/// (Unioning it would NOT resurrect anything — nothing replays this file; that
+/// hazard belongs to `log.jsonl`.)
 pub const quarantine_name = "quarantine.jsonl";
 
 /// Persisted per-repo config (`.tracker/config.json`). Purely optional: a repo

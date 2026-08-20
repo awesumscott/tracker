@@ -276,6 +276,31 @@ no longer hand-edit backlog prose — they mutate through the same `add`/`dep`/`
 than editing prose anyway, and the point). This is a real, owned cost: the "open the file, append a line"
 affordance is gone, replaced by a command.
 
+**The merge semantics ship with the store, inside `.tracker/.gitattributes`** (2026-08-20). The whole merge
+model rests on git attributes — `log.jsonl` union-merged, `snapshot.jsonl` and `quarantine.jsonl` left on the
+default text driver — and nothing wrote them, so every repo re-derived them by hand or (measured across six
+of seven repos on one machine) simply didn't have them, leaving the log conflicting instead of unioning
+under live fan-out. `trk init` now writes them, and the placement is the ruling: **inside `.tracker/`, not at
+the repo root**. Git resolves attributes per directory and the file *nearest the path wins*, so pins there
+cannot be overridden by a later root-level `*.jsonl merge=union` — measured both ways: root-level pins flip
+to `union` under such a glob, `.tracker/`-level pins do not. That converts "keep these lines last, never
+widen the union pattern" from a convention someone has to remember into something git enforces. It also
+keeps `init` non-destructive in the existing sense (the file lives in a directory trk owns, so there is no
+appending to a project's own root attributes, and an existing one is never overwritten), and needs no
+git-root discovery, since patterns are relative to the file's own directory — `.tracker/` need not be at the
+repo root, which `discover.findRoot` already never assumes. `--no-gitattributes` opts out for a repo that
+manages attributes centrally.
+
+**The check is narrow on purpose.** `compact` warns (stderr) when a pin is missing, because it is the verb
+that *creates* the two files that must never be union-merged. It cannot verify what is actually in effect:
+trk is std-only and never shells out to git (`discover.zig` reads `.git` as a plain file for exactly this
+reason), and attributes resolve through parent directories, `.git/info/attributes` and `core.attributesFile`
+— reimplementing that resolution would be worse than not checking. So the warning claims only what trk can
+see about its OWN file ("absent, and here is what it would do"), never "your repo is wrong": a repo pinning
+these at the root is correct too, just not visibly so from here. The pins are matched as whole lines, since
+the shipped file names every pattern in its own comments and a substring check would pass on a file that
+only *talks* about them.
+
 **Bodies render folded, not flattened** (2026-08-20). A body long enough to hide — multi-line, or a single
 line past the summary cap — is emitted inside a `<details><summary>…</summary>` disclosure, teased by its
 first line. The projection then reads as an outline of *titles* in any HTML view (GitHub, an IDE preview)

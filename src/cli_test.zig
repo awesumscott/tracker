@@ -1640,6 +1640,109 @@ test "trk init is idempotent and never clobbers an existing TODO.md" {
     try testing.expectEqualStrings("HAND EDIT\n", todo);
 }
 
+test "trk init writes .tracker/.gitattributes with all three pins; --no-gitattributes skips it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{"init"});
+    const ga = try f.tmp.dir.readFileAlloc(io, ".tracker/.gitattributes", alloc, .unlimited);
+    defer alloc.free(ga);
+
+    // The log union-merges (parallel-worktree appends combine); the two
+    // whole-file baselines are pinned to the default text driver so a raced
+    // compact SURFACES as a conflict instead of being silently combined.
+    try testing.expect(std.mem.indexOf(u8, ga, "\nlog.jsonl merge=union\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ga, "\nsnapshot.jsonl merge=text\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ga, "\nquarantine.jsonl merge=text\n") != null);
+    // Patterns are RELATIVE to .tracker/ — a repo-root-anchored path here would
+    // silently match nothing, since the file lives inside the directory.
+    try testing.expect(std.mem.indexOf(u8, ga, "/.tracker/") == null);
+
+    // Opt out: no file at all, and init still succeeds.
+    var f2 = try Fixture.init(alloc);
+    defer f2.deinit();
+    try f2.run(&.{ "init", "--no-gitattributes" });
+    try testing.expectError(error.FileNotFound, f2.tmp.dir.access(io, ".tracker/.gitattributes", .{}));
+    try f2.tmp.dir.access(io, ".tracker/log.jsonl", .{});
+}
+
+test "trk init never clobbers a tuned .gitattributes" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try f.run(&.{"init"});
+
+    // A project may have tuned it (an extra pin, a house comment). Same ruling
+    // as TODO.md: init creates, it never overwrites.
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = ".tracker/.gitattributes",
+        .data = "log.jsonl merge=union\n# house rule\n",
+        .flags = .{},
+    });
+    try f.run(&.{"init"});
+    const ga = try f.tmp.dir.readFileAlloc(io, ".tracker/.gitattributes", alloc, .unlimited);
+    defer alloc.free(ga);
+    try testing.expectEqualStrings("log.jsonl merge=union\n# house rule\n", ga);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, ".gitattributes already exists") != null);
+}
+
+test "trk compact warns (on stderr) when the .gitattributes pins are missing" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try f.store.append(.{ .add = .{ .id = mintId(), .title = "a task" } });
+
+    // No .tracker/.gitattributes at all (the Fixture scaffolds the store
+    // directly, without going through `init`).
+    try f.run(&.{"compact"});
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, ".gitattributes is absent") != null);
+    // The warning is stderr-bound: stdout stays scriptable.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, ".gitattributes") == null);
+
+    // A file that exists but has lost a pin names the missing line specifically.
+    f.warn.clearRetainingCapacity();
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = ".tracker/.gitattributes",
+        .data = "log.jsonl merge=union\nsnapshot.jsonl merge=text\n",
+        .flags = .{},
+    });
+    try f.run(&.{"compact"});
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "quarantine.jsonl merge=text") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "log.jsonl merge=union") == null);
+
+    // All three present -> silent.
+    f.warn.clearRetainingCapacity();
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = ".tracker/.gitattributes",
+        .data = tracker.store.gitattributes_text,
+        .flags = .{},
+    });
+    try f.run(&.{"compact"});
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, ".gitattributes") == null);
+}
+
+test "compact's pin check matches whole lines, not comment mentions" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // One append so `.tracker/` exists on disk (the Fixture creates it lazily).
+    try f.store.append(.{ .add = .{ .id = mintId(), .title = "a task" } });
+
+    // The shipped file NAMES every pattern in its comments. A substring check
+    // would pass on a file that only talks about the pins without setting them.
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = ".tracker/.gitattributes",
+        .data = "# we should add log.jsonl merge=union and snapshot.jsonl merge=text someday\n",
+        .flags = .{},
+    });
+    try f.run(&.{"compact"});
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "log.jsonl merge=union") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "snapshot.jsonl merge=text") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "quarantine.jsonl merge=text") != null);
+}
+
 test "trk init --force rewrites config with a custom --out; leaves an existing TODO.md" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
