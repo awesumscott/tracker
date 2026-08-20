@@ -1,0 +1,21 @@
+# Written by `trk init`. Kept INSIDE .tracker/ deliberately: git resolves
+# attributes per directory and the file nearest the path wins, so these
+# cannot be overridden by a broader pattern in a parent .gitattributes.
+#
+# The append-only event log: every line is an independent, idempotent event.
+# Union-merge so parallel-worktree appends combine instead of conflicting —
+# that is what lets a lane close its OWN tasks in its worktree and have the
+# events merge on integration. Merge-SAFE, not a general CRDT: it rests on
+# the fan-out invariant that each writer mutates only its own disjoint tasks.
+log.jsonl merge=union
+#
+# Whole-file baselines, written ONLY by a serialized, orchestrator-only
+# `compact` (read-modify-rename, not append). Two sides diverging here means
+# two compactions raced — a rule violation that must SURFACE as a conflict,
+# never be silently combined. snapshot.jsonl is replayed on every load, so a
+# union merge would interleave two baselines and duplicate/revert state;
+# quarantine.jsonl (the ghost-retirement spool) is never read back by trk, so
+# unioning it is merely wrong rather than corrupting — pinned for the same
+# reason and to keep the pair symmetric.
+snapshot.jsonl merge=text
+quarantine.jsonl merge=text
