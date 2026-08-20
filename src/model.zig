@@ -218,6 +218,33 @@ pub fn eventTs(ev: Event) i64 {
     };
 }
 
+/// Every TASK id an event references: one for a scalar/tag/docref op, two for
+/// an edge (`dep`/`undep`/`in`/`unin`), none for `setDocPath` (it names a doc,
+/// not a task). Unused slots are `null`. Distinct from `eventTs`'s `inline
+/// else` shape because the field NAMES differ per op — the point of the helper
+/// is to keep that per-op knowledge in one place. Used by `Store.compact` to
+/// decide which raw log lines belong to a ghost id.
+pub fn eventTaskIds(ev: Event) [2]?Ulid {
+    return switch (ev) {
+        .add => |x| .{ x.id, null },
+        .setState => |x| .{ x.id, null },
+        .setPriority => |x| .{ x.id, null },
+        .setTitle => |x| .{ x.id, null },
+        .setBody => |x| .{ x.id, null },
+        .setShort => |x| .{ x.id, null },
+        .tag => |x| .{ x.id, null },
+        .untag => |x| .{ x.id, null },
+        .docref => |x| .{ x.id, null },
+        .arcDeclare => |x| .{ x.id, null },
+        .arcStanding => |x| .{ x.id, null },
+        .dep => |x| .{ x.from, x.to },
+        .undep => |x| .{ x.from, x.to },
+        .in => |x| .{ x.task, x.arc },
+        .unin => |x| .{ x.task, x.arc },
+        .setDocPath => .{ null, null },
+    };
+}
+
 /// Every variant carries `ts: i64 = 0` — wall-clock ms at append time.
 /// ts=0 means unknown (legacy log lines without a ts field).
 pub const Event = union(Op) {

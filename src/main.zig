@@ -69,16 +69,17 @@ pub fn main(init: std.process.Init) !u8 {
     // the same reason as the self-wait loop above.
     // Every ghost task (an id the fold materialized with no `add` behind it) is
     // likewise non-fatal at load: warn on EACH one and keep going, so the data
-    // that IS there stays readable. `trk compact` is the one verb that refuses,
-    // because that is the step which makes the loss permanent. Looping, not
-    // just the first, for the same reason as the loops above.
+    // that IS there stays readable. Looping, not just the first, for the same
+    // reason as the loops above. This fires on EVERY command, which is why
+    // `compact` needs no refusal of its own — it GCs the ghost and spools its
+    // lines to .tracker/quarantine.jsonl, reporting what it took out.
     for (store.ghost_tasks.items) |id|
         printErr(
             io,
             gpa,
-            "trk: warning: {s} has no `add` event in the log — its title/tags/arcs are " ++
-                "missing, not empty (a union-merge that outlived a compact). Recover the add from " ++
-                "git history of .tracker/log.jsonl before compacting\n",
+            "trk: warning: {s} has no `add` event anywhere in the fold — its title/tags/arcs " ++
+                "are missing, not empty (a union-merge that outlived a compact). It is not a real " ++
+                "task; `trk compact` will GC it and quarantine its log lines\n",
             .{&id.text},
         ) catch {};
     // Every task whose late-merged events were withheld as provably stale. Not
@@ -159,7 +160,6 @@ pub fn main(init: std.process.Init) !u8 {
             error.NoArc,
             error.UndeclaredArc,
             error.GitLogFailed,
-            error.GhostTasks,
             => {},
             else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),
         }

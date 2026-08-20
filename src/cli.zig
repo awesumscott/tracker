@@ -493,13 +493,14 @@ pub const Cli = struct {
         \\  under their dependents; a shared prereq prints once, then "(seen)").
         },
         .{ .name = "compact", .text =
-        \\trk compact [--force]
+        \\trk compact
         \\  Rewrite the snapshot + truncate the log, physically GC'ing archived/dropped
         \\  tasks. Orchestrator-only (rewrites the whole snapshot — the merge flashpoint).
-        \\  REFUSED while any task id appears in the log with no `add` event (a ghost
-        \\  left by a union-merge that outlived its add): compacting bakes the loss in.
-        \\  Recover the add from git history first, or --force past it. Never compact
-        \\  while fan-out worktrees are in flight.
+        \\  A GHOST id (one the log carries events for but no `add` anywhere) is GC'd
+        \\  too, and its log lines are moved to .tracker/quarantine.jsonl first — it is
+        \\  not a task, and writing it out would promote a nameless husk into a real
+        \\  one. Reported by id, never silent. Never compact while fan-out worktrees
+        \\  are in flight.
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
@@ -1444,41 +1445,38 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- compact
 
-    /// `trk compact [--force]` — rewrite the snapshot from current in-memory
-    /// state and truncate the log. Prints a one-line summary on success.
-    /// Refused (unless `--force`) while the fold carries ghost tasks — see
-    /// `Store.ghost_tasks`.
+    /// `trk compact` — rewrite the snapshot from current in-memory state and
+    /// truncate the log. Prints a one-line summary on success, plus a named
+    /// report of any ghost ids it GC'd (see `Store.compact`): those are the one
+    /// thing here a human may want to act on, so they are never folded into the
+    /// count alone.
     fn cmdCompact(self: *Cli, args: []const []const u8) Error!void {
-        var force = false;
-        for (args) |arg| {
-            if (std.mem.eql(u8, arg, "--force")) {
-                force = true;
-            } else {
-                try self.write("trk: usage: trk compact [--force]\n");
-                return error.UsageError;
-            }
+        if (args.len != 0) {
+            try self.write("trk: usage: trk compact\n");
+            return error.UsageError;
         }
-        const result = self.store.compact(force) catch |e| switch (e) {
-            error.GhostTasks => {
-                try self.write(
-                    "trk: compact refused: the log carries events for ids with no `add` event —\n" ++
-                        "  compacting now would bake their degraded state (no title, no tags, no arcs)\n" ++
-                        "  into the snapshot and truncate the log the originals are recoverable from:\n",
-                );
-                for (self.store.ghost_tasks.items) |id|
-                    try self.print("    {s}\n", .{&id.text});
-                try self.write(
-                    "  Recover each `add` from git history of .tracker/log.jsonl (earliest add event),\n" ++
-                        "  or re-file the task; then re-run. `trk compact --force` proceeds anyway.\n",
-                );
-                return e;
-            },
-            else => return e,
-        };
+        const result = try self.store.compact();
+        // `compact` re-scans `ghost_tasks` itself, so the list read below is the
+        // set it actually GC'd, not a stale load-time one.
         try self.print(
             "compacted: {d} events -> {d} live tasks, log truncated\n",
             .{ result.log_events_before, result.live_tasks },
         );
+        if (result.ghosts != 0) {
+            try self.print(
+                "  {d} ghost id(s) GC'd (no `add` event anywhere in the fold — not tasks, the\n" ++
+                    "  residue of events about ids that no longer exist). {d} log line(s) moved to\n" ++
+                    "  .tracker/{s}, nothing destroyed:\n",
+                .{ result.ghosts, result.quarantined_lines, tracker.store.quarantine_name },
+            );
+            for (self.store.ghost_tasks.items) |id|
+                try self.print("    {s}\n", .{&id.text});
+            try self.write(
+                "  If a snapshot was clobbered and these were real tasks, restore\n" ++
+                    "  .tracker/snapshot.jsonl from git and append the quarantine file back onto\n" ++
+                    "  .tracker/log.jsonl — the ids still match.\n",
+            );
+        }
     }
 
     // ----------------------------------------------------------- archive

@@ -440,12 +440,34 @@ The merge model is **owned** here, because it gates how parallel agents may touc
   digging the original `add` lines out of git history. `load` now collects every such id into
   `Store.ghost_tasks` (sorted, since map iteration order is not stable) and main.zig warns once per id —
   non-fatal, on the same footing as `self_wait_cycles`, because the data that IS there stays readable.
-- **`compact` refuses while ghosts are present** (`--force` overrides). Compaction is the step that makes
-  the shear permanent: `serializeState` writes the ghost's degraded state into the new baseline and then
-  truncates the log the original `add` was still recoverable from. The precondition is recomputed inside
-  `compact`, not trusted from load time, since an append in between can introduce one. This is the
-  structural half of the standing operational rule: **never compact while fan-out worktrees are in
-  flight** — a lane whose base predates the compact will union-merge the GC'd events straight back in.
+- **`compact` GCs a ghost and quarantines its log lines — it does not refuse** (2026-08-20). A ghost is not
+  a task; it is the residue of events about an id that no longer exists. `serializeState` therefore treats
+  `!has_add` as a collection class alongside `dropped`/`archived` (`isCollectable`), dropping the node *and
+  every edge touching it*, and `compact` first spools every log line referencing a ghost id to
+  `.tracker/quarantine.jsonl` (append-only, headed by a `{"op":"quarantine",…}` line naming the run's ids,
+  never `merge=union`, never read back — an unknown `op` is skip-and-warn, so a human can cat the spool back
+  onto the log to recover it). The result is reported by id, never a bare count.
+  - **Why GC rather than the refusal this replaced.** The irreversible step was never the truncation — the
+    log lines are in git either way — it was the *promotion*: writing an `add` for the husk makes it
+    indistinguishable from a real task (it now HAS an add, so the load-time ghost warning goes quiet
+    forever) and surfaces it in `next`/`render` as nameless open work. Refusing also had no reachable exit
+    but `--force`, which did exactly that promoting: the ghost's events live in `log.jsonl`, every load
+    re-materializes it, and nothing but `compact` clears that file — so the refusal was a deadlock whose
+    only key was the destructive path. Both remedies it printed were unreachable from the CLI: `add` mints
+    a fresh ULID (so re-filing cannot re-home the orphaned events), and appending a recovered `add` by hand
+    is exactly the `.tracker/` hand-edit the tool exists to remove. The load-time warning already fires on
+    **every** command, so dropping the refusal costs no signal.
+  - **What a ghost actually means**, narrowed: the snapshot re-emits an `add` for every live task, so a live
+    task cannot be a ghost unless the snapshot itself was clobbered or a conflict hand-resolved badly. The
+    ordinary cause is that the task was `dropped`/`archived`, a `compact` GC'd it, and a stale lane then
+    appended an event to it — where "discard the stale event" *is* the right answer. The rarer clobbered-
+    snapshot case is what the quarantine spool is for: restore `snapshot.jsonl` from git, append the spool
+    back onto the log, ids intact.
+  - The ghost set is re-scanned inside `compact` rather than trusted from load time, but only to stay
+    aligned with this process's own appends. It cannot see another writer's post-load appends — those lines
+    were never folded, and this compaction truncates them regardless. That hazard is bought off by the
+    standing operational rule, not by a rescan: **never compact while fan-out worktrees are in flight** — a
+    lane whose base predates the compact will union-merge the GC'd events straight back in.
 - **The snapshot carries a PER-TASK watermark, and a log event older than it is withheld and reported**
   (2026-08-20, task `01M0EM3G6`). `compact` stamps each `add` it writes with `wm` — the `ts` of the newest
   event folded into the state being written (carried forward, so a task nothing has touched since an earlier

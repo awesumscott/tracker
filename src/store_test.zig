@@ -226,11 +226,79 @@ test "replay: an event for an id with no add is a GHOST, reported not silent" {
     try testing.expect(!s.get(ghost).?.has_add);
     try testing.expect(s.get(live).?.has_add);
 
-    // Compaction is refused: it would write the ghost's degraded state into the
-    // snapshot and truncate the log the original add is recoverable from.
-    try testing.expectError(error.GhostTasks, s.compact(false));
-    // ...and forced through when the operator says so.
-    _ = try s.compact(true);
+    // Compaction GCs the ghost rather than writing its degraded state out as a
+    // real `add` — and spools the orphaned line to quarantine.jsonl first.
+    const r = try s.compact();
+    try testing.expectEqual(@as(usize, 1), r.live_tasks); // only `live` survives
+    try testing.expectEqual(@as(usize, 1), r.ghosts);
+    try testing.expectEqual(@as(usize, 1), r.quarantined_lines);
+
+    // The spool holds the orphaned line verbatim, under a header naming the id.
+    var sub = try tmp.dir.openDir(io, ".tracker", .{});
+    defer sub.close(io);
+    const spool = try sub.readFileAlloc(io, "quarantine.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(spool);
+    try testing.expect(std.mem.indexOf(u8, spool, "a body with no task") != null);
+    try testing.expect(std.mem.indexOf(u8, spool, "\"op\":\"quarantine\"") != null);
+    try testing.expect(std.mem.indexOf(u8, spool, &ghost.text) != null);
+
+    // Re-folding the compacted store: the ghost is GONE, not resurrected as a
+    // nameless open task — which is the whole point, since an emitted `add`
+    // would have made it indistinguishable from a real one.
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqual(@as(usize, 0), s2.ghost_tasks.items.len);
+    try testing.expect(s2.get(ghost) == null);
+    try testing.expect(s2.get(live) != null);
+
+    // A clean store never creates the spool, and a second compact is a no-op
+    // for it (no ghosts left to report).
+    const r2 = try s2.compact();
+    try testing.expectEqual(@as(usize, 0), r2.ghosts);
+    try testing.expectEqual(@as(usize, 0), r2.quarantined_lines);
+}
+
+test "compact: a ghost's EDGES are collected with it, and a clean store writes no spool" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const live = mintId();
+    const ghost = mintId();
+
+    // A stale lane's `dep` onto a GC'd id: the edge materializes the ghost node
+    // (ensureNode), so the edge must be dropped with it or the snapshot would
+    // carry a needs edge to a task that isn't there.
+    try writeRawLog(tmp.dir, &.{
+        .{ .add = .{ .id = live, .title = "real task", .ts = 100 } },
+        .{ .dep = .{ .from = live, .to = ghost, .ts = 200 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(@as(usize, 1), s.ghost_tasks.items.len);
+
+    const r = try s.compact();
+    try testing.expectEqual(@as(usize, 1), r.ghosts);
+    try testing.expectEqual(@as(usize, 1), r.quarantined_lines);
+
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expect(s2.get(ghost) == null);
+    try testing.expectEqual(@as(usize, 0), s2.needs.items.len);
+
+    // No ghosts -> no quarantine file at all (it is never created speculatively).
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try writeRawLog(tmp2.dir, &.{.{ .add = .{ .id = live, .title = "clean", .ts = 100 } }});
+    var s3 = Store.open(testing.allocator, io, tmp2.dir);
+    defer s3.deinit();
+    try s3.load();
+    _ = try s3.compact();
+    var sub2 = try tmp2.dir.openDir(io, ".tracker", .{});
+    defer sub2.close(io);
+    try testing.expectError(error.FileNotFound, sub2.access(io, "quarantine.jsonl", .{}));
 }
 
 /// Same as `writeRawLog`, into `snapshot.jsonl` — the baseline half.
@@ -358,7 +426,7 @@ test "compact: stamps each task's watermark, and carries it forward untouched" {
     const stamped = s.get(a).?.last_ts;
     try testing.expect(stamped != 0);
 
-    _ = try s.compact(false);
+    _ = try s.compact();
     {
         var sub = try tmp.dir.openDir(io, ".tracker", .{});
         defer sub.close(io);
@@ -375,7 +443,7 @@ test "compact: stamps each task's watermark, and carries it forward untouched" {
     defer s2.deinit();
     try s2.load();
     try testing.expectEqual(stamped, s2.get(a).?.watermark);
-    _ = try s2.compact(false);
+    _ = try s2.compact();
 
     var s3 = Store.open(testing.allocator, io, tmp.dir);
     defer s3.deinit();
@@ -402,7 +470,7 @@ test "replay: a placeholder whose add arrives LATER in the file is not a ghost" 
     defer s.deinit();
     try s.load();
     try testing.expectEqual(@as(usize, 0), s.ghost_tasks.items.len);
-    _ = try s.compact(false); // precondition satisfied
+    _ = try s.compact(); // precondition satisfied
 }
 
 // --------------------------------------------------------- unknown-op forward-compat (01KYT2QET)
@@ -1442,7 +1510,7 @@ test "compact: a standing arc's mark survives snapshot round-trip" {
         try s.append(.{ .add = .{ .id = arc, .title = "Debug harness / observability" } });
         try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
         try s.append(.{ .arcStanding = .{ .id = arc, .standing = true } });
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     var s2 = Store.open(testing.allocator, io, tmp.dir);
@@ -1469,7 +1537,7 @@ test "compact: snapshot+truncate round-trips state via atomic write" {
         try s.append(.{ .add = .{ .id = b, .title = "B" } });
         try s.append(.{ .dep = .{ .from = b, .to = a } });
         try s.append(.{ .setState = .{ .id = a, .state = .done } });
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
     // Re-open: state must fold identically from the snapshot (+ empty log).
     {
@@ -1512,7 +1580,7 @@ test "compact: full round-trip with deps, ins, tags, docrefs, and a dropped task
         try s.append(.{ .setState = .{ .id = t1, .state = .done } });
         try s.append(.{ .setState = .{ .id = dead, .state = .dropped } });
         try s.append(.{ .setPriority = .{ .id = t2, .priority = 3 } });
-        const r = try s.compact(false);
+        const r = try s.compact();
         // 3 live tasks (arc, t1, t2); dead excluded.
         try testing.expectEqual(@as(usize, 3), r.live_tasks);
         // log had 13 events (12 + the arcDeclare this test now requires
@@ -1581,7 +1649,7 @@ test "compact: log truncated + snapshot non-empty; add after compact appends to 
         try s.load();
         try s.append(.{ .add = .{ .id = a, .title = "A" } });
         try s.append(.{ .add = .{ .id = b, .title = "B" } });
-        _ = try s.compact(false);
+        _ = try s.compact();
 
         // After compact: log must be empty (0 events), snapshot non-empty.
         {
@@ -1629,7 +1697,7 @@ test "compact: determinism — two compactions of the same state are byte-identi
         try s.append(.{ .add = .{ .id = a, .title = "A", .body = "" } });
         try s.append(.{ .dep = .{ .from = c, .to = b } });
         try s.append(.{ .dep = .{ .from = b, .to = a } });
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     // Read first snapshot.
@@ -1645,7 +1713,7 @@ test "compact: determinism — two compactions of the same state are byte-identi
         var s = Store.open(testing.allocator, io, tmp.dir);
         defer s.deinit();
         try s.load();
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     const snap2 = blk: {
@@ -1675,7 +1743,7 @@ test "compact: a declared (zero-member) arc's isArc survives snapshot round-trip
         try s.append(.{ .add = .{ .id = dropped_declared } });
         try s.append(.{ .arcDeclare = .{ .id = dropped_declared, .declared = true } });
         try s.append(.{ .setState = .{ .id = dropped_declared, .state = .dropped } });
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     var s2 = Store.open(testing.allocator, io, tmp.dir);
@@ -1702,7 +1770,7 @@ test "compact: dropped task absent post-compact; done task survives and unblocks
         try s.append(.{ .dep = .{ .from = dep, .to = prereq } });
         try s.append(.{ .setState = .{ .id = prereq, .state = .done } });
         try s.append(.{ .setState = .{ .id = abandoned, .state = .dropped } });
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     {
@@ -1741,7 +1809,7 @@ test "compact: archived task is GC'd but still unblocks its dependent pre-compac
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
         try testing.expect(contains(n, dep)); // archived prereq unblocks dep
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     {
@@ -1804,7 +1872,7 @@ test "compact: crash-safety shape — snapshot written + old log = pre-compactio
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
         // Build the snapshot via a throwaway compact + restore the old log.
-        _ = try s.compact(false); // this truncates the log too (step 2)
+        _ = try s.compact(); // this truncates the log too (step 2)
         // Restore the old log so we're in the "crash between step 1 and 2" state.
         var sub = try tmp.dir.openDir(io, ".tracker", .{});
         defer sub.close(io);
@@ -1925,7 +1993,7 @@ test "docPath: survives compaction; emission is deterministic" {
         // Register in reverse alphabetical order to force sorting.
         try s.append(.{ .setDocPath = .{ .doc_id = "beta-doc", .path = expected_beta } });
         try s.append(.{ .setDocPath = .{ .doc_id = "alpha-doc", .path = expected_alpha } });
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     // Re-open: both must still resolve.
@@ -1949,7 +2017,7 @@ test "docPath: survives compaction; emission is deterministic" {
         var s = Store.open(testing.allocator, io, tmp.dir);
         defer s.deinit();
         try s.load();
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     const snap2 = blk: {
@@ -2023,7 +2091,7 @@ test "setTitle/setBody/untag survive compaction" {
         try s.append(.{ .setBody = .{ .id = a, .body = "new body" } });
         try s.append(.{ .untag = .{ .id = a, .tag = "foo" } });
         try s.append(.{ .tag = .{ .id = a, .tag = "bar" } });
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     // Re-open: verify final state.
@@ -2065,7 +2133,7 @@ test "short id: null by default; setShort freezes it; survives compaction verbat
         // This is the exact spot the production bug bit: compact rewrites the
         // whole snapshot via a re-emitted `add` per task — both frozen shorts
         // must survive that rewrite byte-identical.
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     {
@@ -2319,7 +2387,7 @@ test "setDocPath empty-path tombstone: unset survives compact + reload; live ent
         try s.append(.{ .setDocPath = .{ .doc_id = "gone", .path = "" } }); // unset
         try testing.expect(s.docPath("gone") == null);
         try testing.expectEqualStrings("docs/kept.md", s.docPath("kept").?);
-        _ = try s.compact(false);
+        _ = try s.compact();
     }
 
     // Reopen post-compact: the snapshot must carry `kept` and no trace of `gone`

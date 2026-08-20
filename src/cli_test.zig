@@ -1449,7 +1449,7 @@ test "trk next: unset priority prints `-`, and an explicit one leads the frontie
     try testing.expect(std.mem.indexOf(u8, f.out.items, "priority: -5") != null);
 }
 
-test "trk compact: refused while a ghost task is present; --force proceeds" {
+test "trk compact: a ghost is GC'd and reported by id, not refused" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -1461,15 +1461,16 @@ test "trk compact: refused while a ghost task is present; --force proceeds" {
     // after a compact GC'd the original (01M0EJGYH).
     try f.store.append(.{ .setBody = .{ .id = ghost, .body = "orphaned body" } });
 
-    const e = f.runExpectErr(&.{"compact"});
-    try testing.expectEqual(@as(anyerror, error.GhostTasks), e);
-    try testing.expect(std.mem.indexOf(u8, f.out.items, "compact refused") != null);
-    // The message must NAME the id — recovery starts by grepping git history for it.
-    try testing.expect(std.mem.indexOf(u8, f.out.items, &ghost.text) != null);
-
-    // The operator can still proceed deliberately.
-    try f.run(&.{ "compact", "--force" });
+    try f.run(&.{"compact"});
     try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted:") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "ghost id(s) GC'd") != null);
+    // The report must NAME the id: it is the only handle a recovery has.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, &ghost.text) != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "quarantine.jsonl") != null);
+
+    // `--force` is gone with the refusal it existed to bypass.
+    const e = f.runExpectErr(&.{ "compact", "--force" });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
 }
 
 test "trk edit --body -: reads stdin, round-trips byte-stable, never stores a literal dash" {

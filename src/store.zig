@@ -48,6 +48,12 @@ pub const tracker_subdir = ".tracker";
 pub const log_name = "log.jsonl";
 pub const snapshot_name = "snapshot.jsonl";
 pub const config_name = "config.json";
+/// Where `compact` parks the log lines of ghost ids before it truncates the
+/// log (see `Store.compact`). Append-only, never read back by trk, and — this
+/// matters — never given `merge=union` in `.gitattributes`: it is a recovery
+/// spool, not part of the fold, and a union-merged spool would resurrect the
+/// very lines it exists to take out of circulation.
+pub const quarantine_name = "quarantine.jsonl";
 
 /// Persisted per-repo config (`.tracker/config.json`). Purely optional: a repo
 /// with no config file behaves exactly as before (every field null → callers
@@ -1133,6 +1139,11 @@ pub const Store = struct {
         live_tasks: usize,
         /// Number of events that were in the log before it was truncated.
         log_events_before: usize,
+        /// Number of ghost ids GC'd out of this compaction (see `ghost_tasks`).
+        ghosts: usize,
+        /// Number of raw log lines moved to `quarantine.jsonl` because they
+        /// referenced a ghost id.
+        quarantined_lines: usize,
     };
 
     /// Compact: write a fresh full-state snapshot then truncate the log.
@@ -1163,25 +1174,44 @@ pub const Store = struct {
     ///     on the next load. A done prereq is what makes a dependent eligible —
     ///     losing it corrupts the graph.
     ///   - Edges (`dep`, `in`) involving a dropped endpoint are also excluded.
-    /// `force` skips the ghost-task precondition. Without it, a log carrying
-    /// events for ids that have no surviving `add` is REFUSED: compaction is
-    /// exactly the step that turns that shear into permanent loss, because
-    /// `serializeState` writes the ghost's degraded state (empty title, no tags,
-    /// no arcs) into the new baseline and then truncates the log the real `add`
-    /// might still have been recoverable from. Refusing costs a re-run; the
-    /// alternative cost git-history archaeology (01M0EJGYH).
-    pub fn compact(self: *Store, force: bool) !CompactResult {
-        // Recomputed here rather than trusted from `load`: appends since then
-        // (this process's own, or another writer's) can have introduced one, and
-        // a precondition that only holds at load time is not a precondition.
+    ///   - GHOST ids are EXCLUDED too, and their log lines are spooled to
+    ///     `quarantine.jsonl` first (see `quarantineGhosts`). A ghost is an id
+    ///     the fold only ever saw REFERENCED, never `add`ed (`ghost_tasks`) —
+    ///     it is not a task, it is the residue of events about one that no
+    ///     longer exists. Serializing it would `add` a nameless, arc-less,
+    ///     `open` task into the baseline, where it becomes indistinguishable
+    ///     from a real one (it now HAS an add, so the load-time ghost warning
+    ///     goes quiet forever) and surfaces in `next`/`render` as work. That
+    ///     promotion — not the truncation — is the irreversible step, so this
+    ///     is a GC class exactly like `dropped`/`archived`, not a refusal.
+    ///     (It was a refusal, briefly. The only exit was `--force`, which did
+    ///     the promoting; every other suggested remedy was unreachable from
+    ///     the CLI — `add` mints a fresh id, so re-filing cannot re-home the
+    ///     orphaned events, and nothing but `compact` clears the log lines
+    ///     that re-materialize the ghost on every load. A precondition whose
+    ///     sole exit is the destructive override is a speed bump, not a
+    ///     guard.)
+    pub fn compact(self: *Store) !CompactResult {
+        // Re-scanned rather than trusted from `load` because in-memory state can
+        // have moved since (this process's own appends). It deliberately does
+        // NOT see another writer's post-load appends — those lines were never
+        // folded, and this compact truncates them either way; that hazard is
+        // what "orchestrator-only, serialized, never while worktrees are in
+        // flight" buys off, not something a rescan here could catch.
         try self.collectGhostTasks();
-        if (!force and self.ghost_tasks.items.len != 0) return error.GhostTasks;
 
         // Count log events before truncation.
         const log_events_before = try self.countLogEvents();
 
         var sub = try self.dir.createDirPathOpen(self.io, tracker_subdir, .{});
         defer sub.close(self.io);
+
+        // Step 0: spool the ghosts' log lines, durable BEFORE anything is
+        // rewritten. Nothing this compaction discards is destroyed — a
+        // clobbered/mis-resolved snapshot (the one ghost cause where the add
+        // really was worth recovering) is repaired by restoring the snapshot
+        // from git and appending the spool back onto the log, ids intact.
+        const quarantined = try self.quarantineGhosts(sub);
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.gpa);
@@ -1194,7 +1224,84 @@ pub const Store = struct {
         // old log intact; crash-safe re-fold described in the doc above.
         try self.atomicWrite(sub, log_name, "");
 
-        return .{ .live_tasks = live, .log_events_before = log_events_before };
+        return .{
+            .live_tasks = live,
+            .log_events_before = log_events_before,
+            .ghosts = self.ghost_tasks.items.len,
+            .quarantined_lines = quarantined,
+        };
+    }
+
+    /// Move every log line that references a ghost id into `quarantine.jsonl`
+    /// (appended under a header line naming the run and the ids), returning how
+    /// many lines were spooled. A no-op returning 0 when there are no ghosts —
+    /// the file is never created for a clean store.
+    ///
+    /// The header is itself a JSON line with an `"op"` trk does not know, so if
+    /// a human ever cats the spool back onto the log to recover it, the header
+    /// is skip-and-warned by `replayFile` rather than breaking the fold (see
+    /// `skipped_unknown_ops`) — and the real events around it apply.
+    ///
+    /// A line that fails to decode is left alone: its op is unknown, so which
+    /// id it belongs to is unknowable, and guessing would spool a newer
+    /// binary's event on no evidence.
+    fn quarantineGhosts(self: *Store, sub: Io.Dir) !usize {
+        if (self.ghost_tasks.items.len == 0) return 0;
+
+        var ghosts: std.AutoHashMapUnmanaged(Key, void) = .empty;
+        defer ghosts.deinit(self.gpa);
+        for (self.ghost_tasks.items) |id| try ghosts.put(self.gpa, key(id), {});
+
+        const bytes = sub.readFileAlloc(self.io, log_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => return 0,
+            else => return e,
+        };
+        defer self.gpa.free(bytes);
+
+        var spool: std.ArrayList(u8) = .empty;
+        defer spool.deinit(self.gpa);
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            const ev = codec.decode(self.gpa, trimmed) catch continue;
+            defer freeEvent(self.gpa, ev);
+            var hit = false;
+            for (model.eventTaskIds(ev)) |maybe| {
+                if (maybe) |id| {
+                    if (ghosts.contains(key(id))) hit = true;
+                }
+            }
+            if (!hit) continue;
+            try spool.appendSlice(self.gpa, trimmed);
+            try spool.append(self.gpa, '\n');
+            n += 1;
+        }
+        if (n == 0) return 0;
+
+        // Hand-rolled JSON, deterministic key order — same rule as the codec.
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        const existing = sub.readFileAlloc(self.io, quarantine_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => try self.gpa.dupe(u8, ""),
+            else => return e,
+        };
+        defer self.gpa.free(existing);
+        try out.appendSlice(self.gpa, existing);
+        if (out.items.len != 0 and out.items[out.items.len - 1] != '\n')
+            try out.append(self.gpa, '\n');
+        try out.print(self.gpa, "{{\"op\":\"quarantine\",\"ts\":{d},\"reason\":\"ghost\",\"ids\":[", .{
+            std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+        });
+        for (self.ghost_tasks.items, 0..) |id, i| {
+            if (i != 0) try out.appendSlice(self.gpa, ",");
+            try out.print(self.gpa, "\"{s}\"", .{&id.text});
+        }
+        try out.appendSlice(self.gpa, "]}\n");
+        try out.appendSlice(self.gpa, spool.items);
+        try self.atomicWrite(sub, quarantine_name, out.items);
+        return n;
     }
 
     /// Count non-empty lines in the log file (≈ events before compaction).
@@ -1228,9 +1335,12 @@ pub const Store = struct {
     ///   - `dep` edges sorted by (from, to) — skipped if either endpoint is gone
     ///   - `in`  edges sorted by (task, arc) — skipped if either endpoint is gone
     ///
-    /// Both `dropped` (won't-do, retention ruling) and `archived` (completed +
-    /// recorded in the changelog) are GC'd here — compaction is where a graduated
-    /// task physically leaves the store.
+    /// `dropped` (won't-do, retention ruling), `archived` (completed + recorded
+    /// in the changelog) and GHOST nodes (no `add` ever folded — see
+    /// `ghost_tasks`) are all GC'd here: compaction is where a task with no
+    /// structural future physically leaves the store. Emitting a ghost would be
+    /// worse than dropping it — the `add` this writes is what turns a husk into
+    /// a task nothing can tell apart from a real one.
     ///
     /// Tags within each `add` are **sorted** so the output is byte-identical for
     /// the same logical state (two compactions produce the same bytes — testable).
@@ -1240,19 +1350,20 @@ pub const Store = struct {
         const all_ids = try self.sortedTaskIds(self.gpa);
         defer self.gpa.free(all_ids);
 
-        // Build a set of GC'd (dropped OR archived) task keys so edge filtering is
-        // O(1) and a graduated/abandoned task drops out of the snapshot.
+        // Build a set of GC'd (dropped, archived, or ghost) task keys so edge
+        // filtering is O(1) and a graduated/abandoned/never-added task drops out
+        // of the snapshot along with every edge that touched it.
         var gc_set = std.AutoHashMapUnmanaged(Key, void){};
         defer gc_set.deinit(self.gpa);
         for (all_ids) |id| {
-            if (isGarbage(self.tasks.get(key(id)).?.state))
+            if (isCollectable(self.tasks.get(key(id)).?))
                 try gc_set.put(self.gpa, key(id), {});
         }
 
         var live: usize = 0;
         for (all_ids) |id| {
             const t = self.tasks.get(key(id)).?;
-            if (isGarbage(t.state)) continue; // dropped/archived: excluded
+            if (isCollectable(t)) continue; // dropped/archived/ghost: excluded
 
             // Sort tags for determinism before folding them into the `add`.
             const tag_slice = try self.gpa.alloc([]const u8, t.tags.items.len);
@@ -1337,6 +1448,14 @@ pub const Store = struct {
     /// (won't-do) or `archived` (completed + recorded in the changelog).
     fn isGarbage(s: State) bool {
         return s == .dropped or s == .archived;
+    }
+
+    /// Everything compaction GCs: a garbage STATE, or a GHOST — a node the fold
+    /// only ever saw referenced, never `add`ed. The ghost's `open` state is an
+    /// artifact of `ensureNode`'s default, not a judgment anyone made about it,
+    /// so state alone can't classify it. See `ghost_tasks` and `compact`.
+    fn isCollectable(t: Task) bool {
+        return isGarbage(t.state) or !t.has_add;
     }
 
     fn lessThanStr(_: void, lhs: []const u8, rhs: []const u8) bool {
