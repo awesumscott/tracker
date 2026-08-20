@@ -276,6 +276,16 @@ no longer hand-edit backlog prose — they mutate through the same `add`/`dep`/`
 than editing prose anyway, and the point). This is a real, owned cost: the "open the file, append a line"
 affordance is gone, replaced by a command.
 
+**Bodies render folded, not flattened** (2026-08-20). A body long enough to hide — multi-line, or a single
+line past the summary cap — is emitted inside a `<details><summary>…</summary>` disclosure, teased by its
+first line. The projection then reads as an outline of *titles* in any HTML view (GitHub, an IDE preview)
+with the prose one click away, which is what keeps a backlog of prose-heavy tasks navigable. Two properties
+are load-bearing: the raw bytes are **unchanged** — nothing is dropped or elided, so the plain-text/agent
+reader (`cat docs/TODO.md`, a grep) still sees every body in full; and a short one-line body stays **inline**,
+because a disclosure whose summary *is* the whole body hides nothing and only adds markup. The teaser is
+HTML, not markdown, so it is entity-escaped (`&`, `<`) and cut at a word/UTF-8 boundary — the same class of
+care as the heading-hazard escaping applied to body lines, which still runs inside the disclosure.
+
 **The render/archive destination is persisted, not re-specified per call** (`.tracker/config.json`, added
 2026-07-10). Where `trk render` writes was previously a mandatory `--out docs/TODO.md` on every invocation —
 a ritual that also invited "forgot where it renders" drift. An optional `config.json` (`{"render":{"out":…},

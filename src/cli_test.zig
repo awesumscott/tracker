@@ -656,27 +656,86 @@ test "render: a task shared by two arcs is anchored once; the repeat links back,
     try testing.expectEqualStrings(b.items, b2.items);
 }
 
-test "render: body appears as an indented block under its bullet" {
+test "render: a multi-line body folds into a <details>; a short one-liner stays inline" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
 
     const with = mintId();
+    const short = mintId();
     const without = mintId();
     try f.store.append(.{ .add = .{ .id = with, .title = "Bodied task", .body = "first line\n\nsecond para\n" } });
+    try f.store.append(.{ .add = .{ .id = short, .title = "Short task", .body = "one short line" } });
     try f.store.append(.{ .add = .{ .id = without, .title = "Bare task" } });
 
     var b: std.ArrayList(u8) = .empty;
     defer b.deinit(alloc);
     try f.c.renderMarkdown(&b);
 
-    // The body block: blank line after the title bullet (so markdown doesn't
-    // lazy-continue the title paragraph), each body line 2-space indented,
-    // interior blank lines preserved, trailing newline trimmed.
-    try testing.expect(std.mem.indexOf(u8, b.items, "Bodied task\n\n  first line\n\n  second para\n\n") != null);
+    // The disclosure: a blank line after the title bullet (so markdown doesn't
+    // lazy-continue the title paragraph), the summary teaser = the body's first
+    // line, a blank line after the opening tag (which is what puts the body back
+    // into markdown parsing), the body lines 2-space indented with interior
+    // blanks preserved, then a blank line and the 2-space-indented close (so the
+    // disclosure stays inside the list item).
+    try testing.expect(std.mem.indexOf(u8, b.items, "Bodied task\n\n  <details><summary>first line</summary>\n\n" ++
+        "  first line\n\n  second para\n\n  </details>\n\n") != null);
+
+    // A short single-line body is left INLINE — a disclosure whose summary is
+    // the whole body hides nothing.
+    try testing.expect(std.mem.indexOf(u8, b.items, "Short task\n\n  one short line\n\n") != null);
     // A body-less task stays a single line.
     try testing.expect(std.mem.indexOf(u8, b.items, "Bare task\n") != null);
     try testing.expect(std.mem.indexOf(u8, b.items, "Bare task\n\n  ") == null);
+    // Exactly one disclosure in the whole projection, and it is balanced.
+    try testing.expectEqual(@as(usize, 1), countOccurrences(b.items, "<details>"));
+    try testing.expectEqual(@as(usize, 1), countOccurrences(b.items, "</details>"));
+}
+
+test "render: the <summary> teaser is cut at a word boundary and HTML-escaped" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{
+        .id = t,
+        .title = "Long-bodied task",
+        .body = "needs a Foo<Bar> shim & a fallback before the loader resolves the vendored module\nmore",
+    } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    // Cut back to the last space before the 72-byte cap, ellipsis appended; `&`
+    // and `<` entity-escaped, because inside <summary> the teaser is HTML, not
+    // markdown — an unescaped `<` would be swallowed as a tag and eat the rest.
+    try testing.expect(std.mem.indexOf(u8, b.items,
+        "  <details><summary>needs a Foo&lt;Bar> shim &amp; a fallback before the loader resolves the…</summary>\n") != null);
+    // The raw, unescaped form never reaches the summary line.
+    try testing.expect(std.mem.indexOf(u8, b.items, "<summary>needs a Foo<Bar>") == null);
+    // The body itself is still there in full, verbatim.
+    try testing.expect(std.mem.indexOf(u8, b.items, "  needs a Foo<Bar> shim & a fallback before the loader resolves the vendored module\n") != null);
+}
+
+test "render: the <summary> teaser never splits a UTF-8 code point" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // 71 ASCII bytes, then a 2-byte code point straddling the 72-byte cap, and
+    // no space anywhere (so the word-boundary backoff can't mask the bug).
+    const filler = "x" ** 71;
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "Wide task", .body = filler ++ "étail" } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    try testing.expect(std.unicode.utf8ValidateSlice(b.items));
+    try testing.expect(std.mem.indexOf(u8, b.items, "<summary>" ++ filler ++ "…</summary>") != null);
 }
 
 test "render: arc seq renders as (seq N), never bare [N]; seq 0 is omitted entirely" {

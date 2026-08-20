@@ -481,9 +481,11 @@ pub const Cli = struct {
         \\  explicit --out > config render.out > stdout. Overwrites the target (it is
         \\  a generated projection with a do-not-edit header) — never hand-edit it.
         \\  A task shared by several arcs is listed in full (tags, docs, body) only
-        \\  the first time; later listings link back to that anchor. The header
-        \\  reports an arc-less drift count every regeneration (`trk list --no-arc`
-        \\  for the list).
+        \\  the first time; later listings link back to that anchor. A body that is
+        \\  multi-line (or longer than one summary line) is folded into a
+        \\  <details> disclosure — collapsed to its first line in any HTML view,
+        \\  unchanged in the raw bytes. The header reports an arc-less drift count
+        \\  every regeneration (`trk list --no-arc` for the list).
         },
         .{ .name = "tree", .text =
         \\trk tree <arc-or-task>
@@ -2085,6 +2087,25 @@ pub const Cli = struct {
         const body = std.mem.trimEnd(u8, t.body, "\n");
         if (body.len != 0) {
             try buf.print(gpa, "\n", .{});
+            // A body long enough to hide is wrapped in a `<details>` disclosure
+            // so the projection reads as an outline of TITLES on GitHub (and any
+            // HTML-rendering viewer), with the prose one click away. The raw
+            // bytes are unchanged for the plain-text/agent reader — `cat
+            // TODO.md` still shows every body in full, which is why the body is
+            // NOT dropped or elided, only folded. A short single-line body is
+            // left inline: a disclosure whose summary IS the whole body hides
+            // nothing and just adds two lines of markup.
+            const collapse = !fitsInlineBody(body);
+            if (collapse) {
+                // On one line: `<details>` opens an HTML block that ends at the
+                // next blank line, and the blank line after it is what puts the
+                // body back into MARKDOWN parsing (indented into the list item)
+                // rather than raw HTML — the same load-bearing blank line as
+                // above, one level in.
+                try buf.print(gpa, "  <details><summary>", .{});
+                try self.writeBodySummary(buf, body);
+                try buf.print(gpa, "</summary>\n\n", .{});
+            }
             var it = std.mem.splitScalar(u8, body, '\n');
             while (it.next()) |line| {
                 if (line.len == 0) {
@@ -2118,8 +2139,69 @@ pub const Cli = struct {
                     }
                 }
             }
+            // Blank line before the close: `</details>` must start its own HTML
+            // block, and it keeps the bullet's 2-space indent so the disclosure
+            // stays INSIDE the list item instead of terminating it.
+            if (collapse) try buf.print(gpa, "\n  </details>\n", .{});
             try buf.print(gpa, "\n", .{});
         }
+    }
+
+    /// Byte cap on the `<summary>` teaser. Long enough to carry a real sentence
+    /// fragment, short enough that a collapsed task stays one line at a normal
+    /// width.
+    const summary_max = 72;
+
+    /// True if a body should be printed inline rather than folded into a
+    /// `<details>`: one line, and short enough that the teaser would have been
+    /// the whole of it anyway.
+    fn fitsInlineBody(body: []const u8) bool {
+        return std.mem.indexOfScalar(u8, body, '\n') == null and body.len <= summary_max;
+    }
+
+    /// The collapsed teaser: the body's first non-blank line, capped at
+    /// `summary_max` bytes (backed off to a UTF-8 boundary, with an ellipsis
+    /// when it was cut). `&` and `<` are entity-escaped — inside `<summary>`
+    /// the text is HTML, not markdown, so an unescaped `<` in a body (a type
+    /// parameter, a `<id>` placeholder, a stray tag) would be swallowed as
+    /// markup and silently eat the rest of the teaser.
+    fn writeBodySummary(self: *Cli, buf: *std.ArrayList(u8), body: []const u8) Error!void {
+        const gpa = self.gpa;
+        var first: []const u8 = "";
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len != 0) {
+                first = trimmed;
+                break;
+            }
+        }
+        // A body of nothing but blank lines has no teaser to show; the bullet
+        // still gets a disclosure, so give it a label rather than an empty one.
+        if (first.len == 0) {
+            try buf.print(gpa, "body", .{});
+            return;
+        }
+
+        var cut = first.len;
+        const truncated = cut > summary_max;
+        if (truncated) {
+            cut = summary_max;
+            // Never split a code point: back off over continuation bytes.
+            while (cut > 0 and (first[cut] & 0xC0) == 0x80) cut -= 1;
+            // Prefer a word boundary when one is close, so the teaser doesn't
+            // end mid-word; fall back to the hard cut.
+            const floor = summary_max * 3 / 4;
+            if (std.mem.lastIndexOfScalar(u8, first[0..cut], ' ')) |sp| {
+                if (sp >= floor) cut = sp;
+            }
+        }
+        for (first[0..cut]) |ch| switch (ch) {
+            '&' => try buf.print(gpa, "&amp;", .{}),
+            '<' => try buf.print(gpa, "&lt;", .{}),
+            else => try buf.append(gpa, ch),
+        };
+        if (truncated) try buf.print(gpa, "…", .{});
     }
 
     /// Index of the first non-space/tab byte in `line` (== `line.len` if the
