@@ -1355,6 +1355,149 @@ test "trk show: unknown id errors cleanly" {
     try testing.expectEqual(cli.CliError.NoSuchId, e);
 }
 
+test "trk next: unset priority prints `-`, and an explicit one leads the frontier" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const member = mintId(); // arc'd, priority unset
+    const urgent = mintId(); // arcless, priority -5
+
+    try f.store.append(.{ .add = .{ .id = arc, .title = "The Arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = member, .title = "Arc member" } });
+    try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+    try f.store.append(.{ .add = .{ .id = urgent, .title = "Urgent standalone" } });
+    try f.store.append(.{ .setPriority = .{ .id = urgent, .priority = -5 } });
+
+    try f.run(&.{"next"});
+    const out = f.out.items;
+
+    // Both columns print `-` when unset; a set priority prints its number.
+    try testing.expect(std.mem.indexOf(u8, out, "[0/-]  Arc member") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "[-/-5]  Urgent standalone") != null);
+
+    // The arcless, deliberately-raised task leads the arc'd default one.
+    const iu = std.mem.indexOf(u8, out, "Urgent standalone").?;
+    const im = std.mem.indexOf(u8, out, "Arc member").?;
+    try testing.expect(iu < im);
+
+    // `show` spells the sentinel out rather than printing a bare 0.
+    try f.run(&.{ "show", &member.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "priority: unset (ranks 100)") != null);
+    try f.run(&.{ "show", &urgent.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "priority: -5") != null);
+}
+
+test "trk compact: refused while a ghost task is present; --force proceeds" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const live = mintId();
+    const ghost = mintId();
+    try f.store.append(.{ .add = .{ .id = live, .title = "real task" } });
+    // An event for an id with no `add` — what a union-merged log looks like
+    // after a compact GC'd the original (01M0EJGYH).
+    try f.store.append(.{ .setBody = .{ .id = ghost, .body = "orphaned body" } });
+
+    const e = f.runExpectErr(&.{"compact"});
+    try testing.expectEqual(@as(anyerror, error.GhostTasks), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compact refused") != null);
+    // The message must NAME the id — recovery starts by grepping git history for it.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, &ghost.text) != null);
+
+    // The operator can still proceed deliberately.
+    try f.run(&.{ "compact", "--force" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted:") != null);
+}
+
+test "trk edit --body -: reads stdin, round-trips byte-stable, never stores a literal dash" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const task = mintId();
+    try f.store.append(.{ .add = .{ .id = task, .title = "t", .body = "old body" } });
+
+    // Wire a file as stdin — the same read path main.zig gives the real one.
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = "stdin.txt",
+        // Trailing newline is what `trk show <id> --body` emits.
+        .data = "para one\n\npara two with \"quotes\" and $dollars\n",
+    });
+    const in = try f.tmp.dir.openFile(io, "stdin.txt", .{});
+    defer in.close(io);
+    f.c.stdin = in;
+
+    try f.run(&.{ "edit", &task.text, "--body", "-" });
+
+    // Exactly one trailing newline trimmed — the one `show --body` added — so
+    // the body is what was piped, not a literal "-" (the old silent behavior).
+    try testing.expectEqualStrings(
+        "para one\n\npara two with \"quotes\" and $dollars",
+        f.store.get(task).?.body,
+    );
+
+    // And `show --body` re-adds exactly that newline, so the pipe round-trips.
+    try f.run(&.{ "show", &task.text, "--body" });
+    try testing.expectEqualStrings(
+        "para one\n\npara two with \"quotes\" and $dollars\n",
+        f.out.items,
+    );
+}
+
+test "trk edit --body -: refuses an empty stdin and an unwired one, leaving the body intact" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const task = mintId();
+    try f.store.append(.{ .add = .{ .id = task, .title = "t", .body = "precious body" } });
+
+    // No stdin wired at all: refuse rather than store "-".
+    {
+        const e = f.runExpectErr(&.{ "edit", &task.text, "--body", "-" });
+        try testing.expectEqual(@as(anyerror, error.UsageError), e);
+        try testing.expect(std.mem.indexOf(u8, f.out.items, "no stdin to read") != null);
+        try testing.expectEqualStrings("precious body", f.store.get(task).?.body);
+    }
+
+    // Wired but empty — a pipe whose upstream produced nothing. Blanking the
+    // body here is the same data loss under a different name.
+    {
+        try f.tmp.dir.writeFile(io, .{ .sub_path = "empty.txt", .data = "" });
+        const in = try f.tmp.dir.openFile(io, "empty.txt", .{});
+        defer in.close(io);
+        f.c.stdin = in;
+
+        const e = f.runExpectErr(&.{ "edit", &task.text, "--body", "-" });
+        try testing.expectEqual(@as(anyerror, error.UsageError), e);
+        try testing.expect(std.mem.indexOf(u8, f.out.items, "stdin was empty") != null);
+        try testing.expectEqualStrings("precious body", f.store.get(task).?.body);
+    }
+
+    // `--body ""` remains the explicit way to clear it.
+    try f.run(&.{ "edit", &task.text, "--body", "" });
+    try testing.expectEqualStrings("", f.store.get(task).?.body);
+}
+
+test "trk add --body -: the same stdin path on the create half" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "stdin.txt", .data = "piped body\n" });
+    const in = try f.tmp.dir.openFile(io, "stdin.txt", .{});
+    defer in.close(io);
+    f.c.stdin = in;
+
+    try f.run(&.{ "add", "piped", "--arc", "--body", "-" });
+    const id = try tracker.ulid.parse(std.mem.trim(u8, f.out.items, " \n"));
+    try testing.expectEqualStrings("piped body", f.store.get(id).?.body);
+}
+
 // ----------------------------------------------------------- edit (Wave 5)
 
 test "trk edit: title/body/add-tag/priority all apply; rm-tag removes" {

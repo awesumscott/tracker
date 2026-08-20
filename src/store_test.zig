@@ -142,6 +142,269 @@ test "acyclic: a fold over a log that already contains a cycle errors" {
     try testing.expectError(error.DependencyCycle, s.load());
 }
 
+// ------------------------------------------- replay safety under union-merge (01M0EJGYH)
+
+/// Encode `events` to newline-delimited JSON straight into `.tracker/log.jsonl`,
+/// in exactly the given order — the union-merge driver picks the order, so a
+/// test must be able to write a log the append path would never produce.
+fn writeRawLog(dir: std.Io.Dir, events: []const tracker.Event) !void {
+    var sub = try dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    for (events) |ev| {
+        try tracker.json_codec.encode(&buf, testing.allocator, ev);
+        try buf.append(testing.allocator, '\n');
+    }
+    try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = buf.items });
+}
+
+test "replay: the fold follows ts, not file order" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    // File order puts the OLDER edit last, which is what a union merge of two
+    // worktree regions routinely produces. Straight file-order replay would let
+    // "stale" win purely because the merge driver put it at the bottom.
+    try writeRawLog(tmp.dir, &.{
+        .{ .add = .{ .id = a, .title = "original", .ts = 100 } },
+        .{ .setTitle = .{ .id = a, .title = "current", .ts = 300 } },
+        .{ .setTitle = .{ .id = a, .title = "stale", .ts = 200 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqualStrings("current", s.get(a).?.title);
+}
+
+test "replay: byte-identical duplicate lines are collapsed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    const b = mintId();
+
+    // SHAPE 1 of 01M0EJGYH: a lane whose base predates a compact merges the
+    // already-folded events back in, doubling the log verbatim.
+    const evs = [_]tracker.Event{
+        .{ .add = .{ .id = a, .title = "A", .ts = 100 } },
+        .{ .add = .{ .id = b, .title = "B", .ts = 110 } },
+        .{ .dep = .{ .from = a, .to = b, .ts = 120 } },
+    };
+    try writeRawLog(tmp.dir, &(evs ++ evs));
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(@as(usize, 3), s.deduped_log_lines);
+    try testing.expectEqual(@as(usize, 2), s.tasks.count());
+    try testing.expectEqual(@as(usize, 1), s.needs.items.len); // was already deduped in apply
+    try testing.expectEqualStrings("A", s.get(a).?.title);
+}
+
+test "replay: an event for an id with no add is a GHOST, reported not silent" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const live = mintId();
+    const ghost = mintId();
+
+    // SHAPE 3: `compact` GC'd the add, then a stale lane union-merged a lone
+    // setBody back in. Replay used to reconstruct the task from that one event
+    // — full body, empty title, no tags, no arcs — and say nothing.
+    try writeRawLog(tmp.dir, &.{
+        .{ .add = .{ .id = live, .title = "real task", .ts = 100 } },
+        .{ .setBody = .{ .id = ghost, .body = "a body with no task", .ts = 200 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    try testing.expectEqual(@as(usize, 1), s.ghost_tasks.items.len);
+    try testing.expect(s.ghost_tasks.items[0].eql(ghost));
+    try testing.expect(!s.get(ghost).?.has_add);
+    try testing.expect(s.get(live).?.has_add);
+
+    // Compaction is refused: it would write the ghost's degraded state into the
+    // snapshot and truncate the log the original add is recoverable from.
+    try testing.expectError(error.GhostTasks, s.compact(false));
+    // ...and forced through when the operator says so.
+    _ = try s.compact(true);
+}
+
+/// Same as `writeRawLog`, into `snapshot.jsonl` — the baseline half.
+fn writeRawSnapshot(dir: std.Io.Dir, events: []const tracker.Event) !void {
+    var sub = try dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    for (events) |ev| {
+        try tracker.json_codec.encode(&buf, testing.allocator, ev);
+        try buf.append(testing.allocator, '\n');
+    }
+    try sub.writeFile(io, .{ .sub_path = "snapshot.jsonl", .data = buf.items });
+}
+
+test "replay: a log event older than its task's snapshot watermark is withheld, newer applies" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    // The snapshot says: as of ts 1000, this task is titled "current" and done.
+    try writeRawSnapshot(tmp.dir, &.{
+        .{ .add = .{ .id = a, .title = "current", .wm = 1000 } },
+        .{ .setState = .{ .id = a, .state = .done } },
+    });
+    // A lane whose base predates the compact merges its region back in: one
+    // event from BEFORE the watermark (a resurrection) and one from after (real
+    // new work). File order deliberately puts the stale one last.
+    try writeRawLog(tmp.dir, &.{
+        .{ .setTitle = .{ .id = a, .title = "post-compact edit", .ts = 1500 } },
+        .{ .setState = .{ .id = a, .state = .open, .ts = 500 } },
+        .{ .setTitle = .{ .id = a, .title = "resurrected pre-compact title", .ts = 500 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    // The newer edit stands; neither stale event was applied — in particular the
+    // task did NOT read `open` again, which is SHAPE 2 of 01M0EJGYH.
+    try testing.expectEqualStrings("post-compact edit", s.get(a).?.title);
+    try testing.expectEqual(tracker.State.done, s.get(a).?.state);
+
+    // Withheld, and REPORTED — one entry for the task, counting both events.
+    try testing.expectEqual(@as(usize, 1), s.superseded.items.len);
+    try testing.expect(s.superseded.items[0].id.eql(a));
+    try testing.expectEqual(@as(usize, 2), s.superseded.items[0].events);
+}
+
+test "replay: the watermark withholds only SCALARS — a stale lane's edges and tags still land" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const arc = mintId();
+    const a = mintId();
+    const b = mintId();
+
+    try writeRawSnapshot(tmp.dir, &.{
+        .{ .add = .{ .id = arc, .title = "arc", .wm = 1000 } },
+        .{ .arcDeclare = .{ .id = arc, .declared = true } },
+        .{ .add = .{ .id = a, .title = "A", .wm = 1000 } },
+        .{ .add = .{ .id = b, .title = "B", .wm = 1000 } },
+    });
+    // Every one of these predates the watermark. An edge/tag is additive and
+    // converges whatever order it folds in, so withholding it would drop real
+    // work for no safety gain — only the title (a last-write-wins scalar) is
+    // capable of REVERTING the task, and only it is withheld.
+    try writeRawLog(tmp.dir, &.{
+        .{ .dep = .{ .from = a, .to = b, .ts = 500 } },
+        .{ .in = .{ .task = a, .arc = arc, .seq = 3, .ts = 500 } },
+        .{ .tag = .{ .id = a, .tag = "kept", .ts = 500 } },
+        .{ .setTitle = .{ .id = a, .title = "reverted", .ts = 500 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    try testing.expectEqualStrings("A", s.get(a).?.title); // scalar withheld
+    try testing.expectEqual(@as(usize, 1), s.needs.items.len); // edge kept
+    try testing.expectEqual(@as(usize, 1), s.ins.items.len); // membership kept
+    try testing.expectEqual(@as(usize, 1), s.get(a).?.tags.items.len); // tag kept
+}
+
+test "replay: the watermark never judges an unknown id or an un-watermarked task" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const known = mintId();
+    const legacy = mintId();
+    const fresh = mintId();
+
+    try writeRawSnapshot(tmp.dir, &.{
+        .{ .add = .{ .id = known, .title = "known", .wm = 1000 } },
+        // No `wm` — a snapshot written before this existed. Never judged, so an
+        // old store keeps folding exactly as it did.
+        .{ .add = .{ .id = legacy, .title = "legacy" } },
+    });
+    try writeRawLog(tmp.dir, &.{
+        .{ .setTitle = .{ .id = legacy, .title = "legacy edited", .ts = 500 } },
+        // A task the snapshot has never seen: a GC'd resurrection and a lane's
+        // brand-new task are indistinguishable here, so this is APPLIED, and a
+        // resurrection missing its add surfaces through ghost_tasks instead.
+        .{ .add = .{ .id = fresh, .title = "filed by a lane", .ts = 500 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    try testing.expectEqualStrings("legacy edited", s.get(legacy).?.title);
+    try testing.expectEqualStrings("filed by a lane", s.get(fresh).?.title);
+    try testing.expectEqualStrings("known", s.get(known).?.title);
+    try testing.expectEqual(@as(usize, 0), s.superseded.items.len);
+    try testing.expectEqual(@as(usize, 0), s.ghost_tasks.items.len);
+}
+
+test "compact: stamps each task's watermark, and carries it forward untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = a, .title = "t" } }); // append stamps a real ts
+    const stamped = s.get(a).?.last_ts;
+    try testing.expect(stamped != 0);
+
+    _ = try s.compact(false);
+    {
+        var sub = try tmp.dir.openDir(io, ".tracker", .{});
+        defer sub.close(io);
+        const snap = try sub.readFileAlloc(io, "snapshot.jsonl", testing.allocator, .unlimited);
+        defer testing.allocator.free(snap);
+        try testing.expect(std.mem.indexOf(u8, snap, "\"wm\":") != null);
+    }
+
+    // Re-fold from that snapshot: the watermark survives, and a second compact
+    // re-emits it rather than resetting it to 0 (the task saw no new events, so
+    // its `last_ts` is 0 in the fresh fold — the carry-forward is what keeps the
+    // bar in place).
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqual(stamped, s2.get(a).?.watermark);
+    _ = try s2.compact(false);
+
+    var s3 = Store.open(testing.allocator, io, tmp.dir);
+    defer s3.deinit();
+    try s3.load();
+    try testing.expectEqual(stamped, s3.get(a).?.watermark);
+}
+
+test "replay: a placeholder whose add arrives LATER in the file is not a ghost" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    const b = mintId();
+
+    // Out-of-order tolerance is the whole reason ensureNode exists: a union
+    // merge can put an edge above the add it references. That is NOT a ghost —
+    // the add is present, just later — so nothing may be reported here.
+    try writeRawLog(tmp.dir, &.{
+        .{ .dep = .{ .from = a, .to = b, .ts = 300 } },
+        .{ .add = .{ .id = a, .title = "A", .ts = 100 } },
+        .{ .add = .{ .id = b, .title = "B", .ts = 200 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(@as(usize, 0), s.ghost_tasks.items.len);
+    _ = try s.compact(false); // precondition satisfied
+}
+
 // --------------------------------------------------------- unknown-op forward-compat (01KYT2QET)
 
 test "load: a log with only known ops is entirely unaffected (no skipped-op noise)" {
@@ -763,19 +1026,20 @@ test "arcRoots: matches exactly what isArc is true for — declared + arc: tag, 
     try testing.expect(!contains(roots, plain));
 }
 
-test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then personal" {
+test "next: blocked-by-open-prereq hidden; unblocks on done; ordering priority then arc" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const arc = mintId();
     const pre = mintId(); // prereq
     const dep1 = mintId(); // needs pre; arc seq 5
     const dep2 = mintId(); // needs pre; arc seq 1 (higher priority within arc)
-    const lone = mintId(); // no arc, personal priority 10
+    const lone = mintId(); // no arc, personal priority 10 (beats unset = 100)
+    const drift = mintId(); // no arc, priority unset -> ties at 100, sorts last
 
     var s = Store.open(testing.allocator, io, tmp.dir);
     defer s.deinit();
     try s.load();
-    for ([_]tracker.Ulid{ arc, pre, dep1, dep2, lone }) |id|
+    for ([_]tracker.Ulid{ arc, pre, dep1, dep2, lone, drift }) |id|
         try s.append(.{ .add = .{ .id = id } });
     try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
     try s.append(.{ .dep = .{ .from = dep1, .to = pre } });
@@ -794,6 +1058,7 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
         try testing.expect(!contains(n, dep2));
         try testing.expect(contains(n, pre));
         try testing.expect(contains(n, lone));
+        try testing.expect(contains(n, drift));
         try testing.expect(!contains(n, arc)); // undrained root: hidden
     }
 
@@ -807,16 +1072,24 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
         try testing.expect(!contains(n, pre)); // done -> not eligible
         try testing.expect(!contains(n, arc)); // members still open -> still hidden
 
-        // Ordering: dep2 (arc seq 1) before dep1 (arc seq 5); both before the
-        // arc-less tasks (sentinel). Find their indices.
+        // Ordering is (effective priority, arc-seq, id).
         const idx2 = indexOf(n, dep2).?;
         const idx1 = indexOf(n, dep1).?;
-        try testing.expect(idx2 < idx1);
-
-        // arc'd tasks precede arc-less ones.
         const ilone = indexOf(n, lone).?;
-        try testing.expect(idx1 < ilone);
-        try testing.expect(idx2 < ilone);
+        const idrift = indexOf(n, drift).?;
+
+        // `lone` set priority 10; dep1/dep2 never set one, so they rank at the
+        // unset default (100) and an explicitly-raised ARCLESS task now leads
+        // them. This is the fix for 01KZD94QY — the maxInt arcless sentinel used
+        // to bury it below every arc member regardless of priority.
+        try testing.expect(ilone < idx2);
+        try testing.expect(ilone < idx1);
+
+        // Among tasks that TIE on priority, arc-seq still decides, and the
+        // arcless sentinel still sorts arcless last — so the untouched majority
+        // keeps exactly its old order.
+        try testing.expect(idx2 < idx1); // seq 1 before seq 5
+        try testing.expect(idx1 < idrift); // arc'd before arcless at equal priority
     }
 
     // Drain the arc -> the root surfaces exactly once as the close-out prompt.
@@ -834,6 +1107,74 @@ test "next: blocked-by-open-prereq hidden; unblocks on done; ordering arc then p
         defer testing.allocator.free(n);
         try testing.expect(!contains(n, arc));
     }
+}
+
+test "next: an explicit priority moves a task BOTH ways around the unset default" {
+    // 01KZD94QX: stored 0 is "unset", not "strongest". Before the fix, ordering
+    // read the raw field, so every explicit priority (a positive int, the only
+    // thing the CLI or docs suggest) sorted BELOW every untouched task and
+    // `--priority 10` buried the task it was meant to raise.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const raised = mintId(); // priority 10  -> above unset (100)
+    const untouched = mintId(); // priority unset -> 100
+    const sunk = mintId(); // priority 500 -> below unset
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    for ([_]tracker.Ulid{ raised, untouched, sunk }) |id|
+        try s.append(.{ .add = .{ .id = id } });
+    try s.append(.{ .setPriority = .{ .id = raised, .priority = 10 } });
+    try s.append(.{ .setPriority = .{ .id = sunk, .priority = 500 } });
+
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(indexOf(n, raised).? < indexOf(n, untouched).?);
+        try testing.expect(indexOf(n, untouched).? < indexOf(n, sunk).?);
+    }
+
+    // Setting 0 is the documented way back to the default rank: `raised` must
+    // fall in beside the untouched task (id breaks the tie), not to the front.
+    try s.append(.{ .setPriority = .{ .id = raised, .priority = 0 } });
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        const ir = indexOf(n, raised).?;
+        const iu = indexOf(n, untouched).?;
+        try testing.expect(ir < indexOf(n, sunk).?);
+        try testing.expect(iu < indexOf(n, sunk).?);
+        // Tied on priority, so the ULID decides — and both mint in order.
+        try testing.expect(ir < iu);
+    }
+}
+
+test "next: priority outranks arc-seq across arcs" {
+    // 01KZD94QY consequence 2: best_arc_seq is a task's position WITHIN its arc,
+    // not the arc's rank, so with arc-seq leading, a deliberately raised task
+    // deep in one arc could never overtake a default task at the head of another.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const arc_a = mintId();
+    const arc_b = mintId();
+    const head = mintId(); // arc_a seq 0, priority unset
+    const deep = mintId(); // arc_b seq 99, priority -5
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    for ([_]tracker.Ulid{ arc_a, arc_b, head, deep }) |id|
+        try s.append(.{ .add = .{ .id = id } });
+    try s.append(.{ .arcDeclare = .{ .id = arc_a, .declared = true } });
+    try s.append(.{ .arcDeclare = .{ .id = arc_b, .declared = true } });
+    try s.append(.{ .in = .{ .task = head, .arc = arc_a, .seq = 0 } });
+    try s.append(.{ .in = .{ .task = deep, .arc = arc_b, .seq = 99 } });
+    try s.append(.{ .setPriority = .{ .id = deep, .priority = -5 } });
+
+    const n = try s.next(testing.allocator);
+    defer testing.allocator.free(n);
+    try testing.expect(indexOf(n, deep).? < indexOf(n, head).?);
 }
 
 test "next: a dropped prereq does NOT block its dependent" {
@@ -1101,7 +1442,7 @@ test "compact: a standing arc's mark survives snapshot round-trip" {
         try s.append(.{ .add = .{ .id = arc, .title = "Debug harness / observability" } });
         try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
         try s.append(.{ .arcStanding = .{ .id = arc, .standing = true } });
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     var s2 = Store.open(testing.allocator, io, tmp.dir);
@@ -1128,7 +1469,7 @@ test "compact: snapshot+truncate round-trips state via atomic write" {
         try s.append(.{ .add = .{ .id = b, .title = "B" } });
         try s.append(.{ .dep = .{ .from = b, .to = a } });
         try s.append(.{ .setState = .{ .id = a, .state = .done } });
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
     // Re-open: state must fold identically from the snapshot (+ empty log).
     {
@@ -1171,7 +1512,7 @@ test "compact: full round-trip with deps, ins, tags, docrefs, and a dropped task
         try s.append(.{ .setState = .{ .id = t1, .state = .done } });
         try s.append(.{ .setState = .{ .id = dead, .state = .dropped } });
         try s.append(.{ .setPriority = .{ .id = t2, .priority = 3 } });
-        const r = try s.compact();
+        const r = try s.compact(false);
         // 3 live tasks (arc, t1, t2); dead excluded.
         try testing.expectEqual(@as(usize, 3), r.live_tasks);
         // log had 13 events (12 + the arcDeclare this test now requires
@@ -1240,7 +1581,7 @@ test "compact: log truncated + snapshot non-empty; add after compact appends to 
         try s.load();
         try s.append(.{ .add = .{ .id = a, .title = "A" } });
         try s.append(.{ .add = .{ .id = b, .title = "B" } });
-        _ = try s.compact();
+        _ = try s.compact(false);
 
         // After compact: log must be empty (0 events), snapshot non-empty.
         {
@@ -1288,7 +1629,7 @@ test "compact: determinism — two compactions of the same state are byte-identi
         try s.append(.{ .add = .{ .id = a, .title = "A", .body = "" } });
         try s.append(.{ .dep = .{ .from = c, .to = b } });
         try s.append(.{ .dep = .{ .from = b, .to = a } });
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     // Read first snapshot.
@@ -1304,7 +1645,7 @@ test "compact: determinism — two compactions of the same state are byte-identi
         var s = Store.open(testing.allocator, io, tmp.dir);
         defer s.deinit();
         try s.load();
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     const snap2 = blk: {
@@ -1334,7 +1675,7 @@ test "compact: a declared (zero-member) arc's isArc survives snapshot round-trip
         try s.append(.{ .add = .{ .id = dropped_declared } });
         try s.append(.{ .arcDeclare = .{ .id = dropped_declared, .declared = true } });
         try s.append(.{ .setState = .{ .id = dropped_declared, .state = .dropped } });
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     var s2 = Store.open(testing.allocator, io, tmp.dir);
@@ -1361,7 +1702,7 @@ test "compact: dropped task absent post-compact; done task survives and unblocks
         try s.append(.{ .dep = .{ .from = dep, .to = prereq } });
         try s.append(.{ .setState = .{ .id = prereq, .state = .done } });
         try s.append(.{ .setState = .{ .id = abandoned, .state = .dropped } });
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     {
@@ -1400,7 +1741,7 @@ test "compact: archived task is GC'd but still unblocks its dependent pre-compac
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
         try testing.expect(contains(n, dep)); // archived prereq unblocks dep
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     {
@@ -1463,7 +1804,7 @@ test "compact: crash-safety shape — snapshot written + old log = pre-compactio
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
         // Build the snapshot via a throwaway compact + restore the old log.
-        _ = try s.compact(); // this truncates the log too (step 2)
+        _ = try s.compact(false); // this truncates the log too (step 2)
         // Restore the old log so we're in the "crash between step 1 and 2" state.
         var sub = try tmp.dir.openDir(io, ".tracker", .{});
         defer sub.close(io);
@@ -1584,7 +1925,7 @@ test "docPath: survives compaction; emission is deterministic" {
         // Register in reverse alphabetical order to force sorting.
         try s.append(.{ .setDocPath = .{ .doc_id = "beta-doc", .path = expected_beta } });
         try s.append(.{ .setDocPath = .{ .doc_id = "alpha-doc", .path = expected_alpha } });
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     // Re-open: both must still resolve.
@@ -1608,7 +1949,7 @@ test "docPath: survives compaction; emission is deterministic" {
         var s = Store.open(testing.allocator, io, tmp.dir);
         defer s.deinit();
         try s.load();
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     const snap2 = blk: {
@@ -1682,7 +2023,7 @@ test "setTitle/setBody/untag survive compaction" {
         try s.append(.{ .setBody = .{ .id = a, .body = "new body" } });
         try s.append(.{ .untag = .{ .id = a, .tag = "foo" } });
         try s.append(.{ .tag = .{ .id = a, .tag = "bar" } });
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     // Re-open: verify final state.
@@ -1724,7 +2065,7 @@ test "short id: null by default; setShort freezes it; survives compaction verbat
         // This is the exact spot the production bug bit: compact rewrites the
         // whole snapshot via a re-emitted `add` per task — both frozen shorts
         // must survive that rewrite byte-identical.
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     {
@@ -1978,7 +2319,7 @@ test "setDocPath empty-path tombstone: unset survives compact + reload; live ent
         try s.append(.{ .setDocPath = .{ .doc_id = "gone", .path = "" } }); // unset
         try testing.expect(s.docPath("gone") == null);
         try testing.expectEqualStrings("docs/kept.md", s.docPath("kept").?);
-        _ = try s.compact();
+        _ = try s.compact(false);
     }
 
     // Reopen post-compact: the snapshot must carry `kept` and no trace of `gone`

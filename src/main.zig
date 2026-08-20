@@ -67,6 +67,32 @@ pub fn main(init: std.process.Init) !u8 {
     // comment / skipped_unknown_ops — a single new-op line must not brick
     // reads on a not-yet-updated binary). Looping, not just the first, for
     // the same reason as the self-wait loop above.
+    // Every ghost task (an id the fold materialized with no `add` behind it) is
+    // likewise non-fatal at load: warn on EACH one and keep going, so the data
+    // that IS there stays readable. `trk compact` is the one verb that refuses,
+    // because that is the step which makes the loss permanent. Looping, not
+    // just the first, for the same reason as the loops above.
+    for (store.ghost_tasks.items) |id|
+        printErr(
+            io,
+            gpa,
+            "trk: warning: {s} has no `add` event in the log — its title/tags/arcs are " ++
+                "missing, not empty (a union-merge that outlived a compact). Recover the add from " ++
+                "git history of .tracker/log.jsonl before compacting\n",
+            .{&id.text},
+        ) catch {};
+    // Every task whose late-merged events were withheld as provably stale. Not
+    // fatal, and never a silent drop: the events are still in the log, so a
+    // change that really was wanted can be re-applied deliberately.
+    for (store.superseded.items) |sd|
+        printErr(
+            io,
+            gpa,
+            "trk: warning: {s}: {d} log event(s) predate the snapshot's value for this task and were " ++
+                "NOT applied (a pre-compact event union-merged back in). The snapshot's newer state " ++
+                "stands; re-apply deliberately if the change is real\n",
+            .{ &sd.id.text, sd.events },
+        ) catch {};
     for (store.skipped_unknown_ops.items) |s|
         printErr(
             io,
@@ -91,7 +117,18 @@ pub fn main(init: std.process.Init) !u8 {
     // discovery resolves to.
     const read_only = isReadOnly(init.minimal.environ, gpa);
 
-    var c = cli.Cli{ .gpa = gpa, .io = io, .store = &store, .dir = dir, .out = &out, .warn = &warn, .read_only = read_only };
+    var c = cli.Cli{
+        .gpa = gpa,
+        .io = io,
+        .store = &store,
+        .dir = dir,
+        .out = &out,
+        .warn = &warn,
+        .read_only = read_only,
+        // Only ever read when a `--body -` is actually parsed, so an ordinary
+        // command never blocks waiting on a terminal that will not send EOF.
+        .stdin = std.Io.File.stdin(),
+    };
     defer c.prereq_scratch.deinit(gpa);
 
     const result = c.run(args.items);
@@ -122,6 +159,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.NoArc,
             error.UndeclaredArc,
             error.GitLogFailed,
+            error.GhostTasks,
             => {},
             else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),
         }

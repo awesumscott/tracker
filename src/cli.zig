@@ -30,6 +30,7 @@ const Store = tracker.Store;
 const Ulid = tracker.Ulid;
 const State = tracker.State;
 const Task = tracker.Task;
+const model = tracker.model;
 const Io = std.Io;
 
 /// Minimum length of a DYNAMICALLY-computed short id — the legacy/back-compat
@@ -105,6 +106,12 @@ pub const Cli = struct {
     /// main.zig sets this from the `TRK_READONLY` env var; tests can set it
     /// directly on a `Cli` built over a `Fixture`.
     read_only: bool = false,
+    /// The source `--body -` reads from. `null` = no stdin was wired, and
+    /// `--body -` then REFUSES rather than storing a literal "-" (which is what
+    /// it silently did before 01M0EM10X — an agent lost a multi-paragraph body
+    /// to it and only noticed by re-reading). main.zig wires real stdin; tests
+    /// wire a temp file, so the same read path is exercised either way.
+    stdin: ?Io.File = null,
     /// Scratch for `directPrereqs` — must be drained/copied before the next
     /// call. tree recursion copies into a local dupe before recursing, so reuse
     /// is safe. Owned by the Cli; the caller (main/tests) deinits it.
@@ -116,6 +123,57 @@ pub const Cli = struct {
 
     fn write(self: *Cli, s: []const u8) !void {
         try self.out.appendSlice(self.gpa, s);
+    }
+
+    /// Resolve a `--body` value: a literal `-` means "read the whole of stdin",
+    /// the conventional meaning everywhere else. Returns gpa-owned bytes the
+    /// caller must free (the store re-dups into its arena on append), or the
+    /// argument itself borrowed unchanged — `owned` says which.
+    ///
+    /// Exactly ONE trailing newline is trimmed, because `trk show <id> --body`
+    /// adds one when the body lacks it: `trk show <id> --body | trk edit <id>
+    /// --body -` is then byte-stable, and stable on every later round trip.
+    fn bodyArg(self: *Cli, arg: []const u8) Error!struct { text: []const u8, owned: bool } {
+        if (!std.mem.eql(u8, arg, "-")) return .{ .text = arg, .owned = false };
+        const f = self.stdin orelse {
+            try self.write("trk: --body -: no stdin to read (pipe one in, e.g. " ++
+                "`trk show <id> --body | trk edit <id> --body -`)\n");
+            return error.UsageError;
+        };
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.gpa);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = f.readStreaming(self.io, &.{&chunk}) catch |e| switch (e) {
+                error.EndOfStream => break,
+                else => {
+                    try self.write("trk: --body -: could not read stdin\n");
+                    return error.UsageError;
+                },
+            };
+            if (n == 0) break;
+            try buf.appendSlice(self.gpa, chunk[0..n]);
+        }
+        // Nothing on stdin is refused, not applied. Clearing a body is a real
+        // operation, but `--body ""` already says so explicitly; an EMPTY read
+        // here is far more often a pipe that never ran (a failed upstream
+        // command, a forgotten redirect), and applying it would wipe the body
+        // exactly the way this flag's old literal-"-" behavior did.
+        if (buf.items.len == 0) {
+            // No explicit deinit — the `errdefer` above frees `buf` on this
+            // return path (doing both is a double free).
+            try self.write("trk: --body -: stdin was empty — refusing to blank the body " ++
+                "(use --body \"\" if that is what you meant)\n");
+            return error.UsageError;
+        }
+        // One trailing newline (CRLF-aware), not all of them: a body may
+        // legitimately end in blank lines, and `$(...)` already eats those —
+        // this path exists precisely to stop being lossy about body bytes.
+        if (buf.items.len != 0 and buf.items[buf.items.len - 1] == '\n') {
+            buf.items.len -= 1;
+            if (buf.items.len != 0 and buf.items[buf.items.len - 1] == '\r') buf.items.len -= 1;
+        }
+        return .{ .text = try buf.toOwnedSlice(self.gpa), .owned = true };
     }
 
     /// Append `s` as a JSON string literal (quotes + minimal escaping). Used by
@@ -259,8 +317,12 @@ pub const Cli = struct {
         \\  a member (refused with UndeclaredArc otherwise — declare it first with `trk
         \\  arc`), --arc declares THIS new task itself an arc root (even with zero members
         \\  yet, and needs no prior declaration), --doc
-        \\  attaches a design pointer (register the id first with `trk doc set`). Priority:
-        \\  int, lower first. Neither --in nor --arc given -> a stderr warning (never
+        \\  attaches a design pointer (register the id first with `trk doc set`).
+        \\  --priority: int, LOWER SORTS FIRST, and unset ranks 100 — so --priority 10
+        \\  raises a task above untouched ones and --priority 500 sinks it below them.
+        \\  `--priority 0` means unset (back to the default rank), not "strongest".
+        \\  `--body -` reads the body from STDIN (one trailing newline trimmed).
+        \\  Neither --in nor --arc given -> a stderr warning (never
         \\  stdout); escalate to a hard error via .tracker/config.json's add.arcless.
         \\  A `--tag arc:<slug>` is a DEPRECATED way to mark an arc (still honored, but
         \\  warns) — use --arc instead.
@@ -429,9 +491,13 @@ pub const Cli = struct {
         \\  under their dependents; a shared prereq prints once, then "(seen)").
         },
         .{ .name = "compact", .text =
-        \\trk compact
+        \\trk compact [--force]
         \\  Rewrite the snapshot + truncate the log, physically GC'ing archived/dropped
         \\  tasks. Orchestrator-only (rewrites the whole snapshot — the merge flashpoint).
+        \\  REFUSED while any task id appears in the log with no `add` event (a ghost
+        \\  left by a union-merge that outlived its add): compacting bakes the loss in.
+        \\  Recover the add from git history first, or --force past it. Never compact
+        \\  while fan-out worktrees are in flight.
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
@@ -454,13 +520,21 @@ pub const Cli = struct {
         \\  Full detail for one task: body, state, priority, tags, prereqs,
         \\  dependents, arc memberships, and doc pointers. Ids accept any unique prefix.
         \\  --body prints ONLY the raw body bytes (no header, no indent) — the safe
-        \\  read half of an edit round-trip:
-        \\  trk edit <id> --body "$(trk show <id> --body)"
+        \\  read half of an edit round-trip — pipe it back with `--body -`:
+        \\  trk show <id> --body | trk edit <id> --body -
+        \\  (`trk edit <id> --body "$(trk show <id> --body)"` also works, but the
+        \\  shell eats ALL trailing newlines and the arg is length-capped)
         },
         .{ .name = "edit", .text =
         \\trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...]
         \\        [--add-doc <doc_id[#section]> ...] [--priority <n>]
-        \\  Modify an existing task in place. --body replaces the whole body.
+        \\  Modify an existing task in place. --body replaces the whole body;
+        \\  `--body -` reads it from STDIN instead — the write half of a safe
+        \\  round-trip: trk show <id> --body | trk edit <id> --body -
+        \\  (exactly one trailing newline is trimmed, so the round-trip is
+        \\  byte-stable; without a pipe, `--body -` refuses rather than storing "-").
+        \\  --priority: int, LOWER SORTS FIRST, and unset ranks 100 — `--priority 10`
+        \\  raises, `--priority 500` sinks, `--priority 0` restores the default rank.
         \\  `--add-tag arc:<slug>` is a DEPRECATED way to mark an arc (still honored,
         \\  but warns) — use `trk arc <id>` instead.
         \\  e.g.  trk edit 01KX6H --body "revised plan" --add-tag tooling
@@ -538,7 +612,7 @@ pub const Cli = struct {
             \\      (appended to --out/config target under a dated heading, else stdout),
             \\      then flip each to `archived` so it leaves every view (structural
             \\      dedup). --dry-run previews on stdout without archiving.
-            \\  trk compact                  rewrite snapshot + truncate log (drops archived/dropped)
+            \\  trk compact [--force]        rewrite snapshot + truncate log (drops archived/dropped)
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
             \\  trk doc list                 print all registered doc_id -> path mappings
             \\  trk doc resolve <doc_id>     print the path for a doc_id
@@ -862,6 +936,9 @@ pub const Cli = struct {
         }
         const title = args[0];
         var body: []const u8 = "";
+        // Set when `--body -` read stdin into a fresh allocation (see bodyArg).
+        var body_owned = false;
+        defer if (body_owned) self.gpa.free(body);
         var priority: ?i32 = null;
         var in_arc: ?[]const u8 = null;
         var declare_arc = false;
@@ -878,7 +955,9 @@ pub const Cli = struct {
         while (i < args.len) : (i += 1) {
             const arg = args[i];
             if (std.mem.eql(u8, arg, "--body")) {
-                body = try self.flagVal(args, &i, "--body");
+                const b = try self.bodyArg(try self.flagVal(args, &i, "--body"));
+                body = b.text;
+                body_owned = b.owned;
             } else if (std.mem.eql(u8, arg, "--tag")) {
                 try tags.append(self.gpa, try self.flagVal(args, &i, "--tag"));
             } else if (std.mem.eql(u8, arg, "--needs")) {
@@ -1363,14 +1442,37 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- compact
 
-    /// `trk compact` — rewrite the snapshot from current in-memory state and
-    /// truncate the log. Prints a one-line summary on success.
+    /// `trk compact [--force]` — rewrite the snapshot from current in-memory
+    /// state and truncate the log. Prints a one-line summary on success.
+    /// Refused (unless `--force`) while the fold carries ghost tasks — see
+    /// `Store.ghost_tasks`.
     fn cmdCompact(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 0) {
-            try self.write("trk: compact takes no arguments\n");
-            return error.UsageError;
+        var force = false;
+        for (args) |arg| {
+            if (std.mem.eql(u8, arg, "--force")) {
+                force = true;
+            } else {
+                try self.write("trk: usage: trk compact [--force]\n");
+                return error.UsageError;
+            }
         }
-        const result = try self.store.compact();
+        const result = self.store.compact(force) catch |e| switch (e) {
+            error.GhostTasks => {
+                try self.write(
+                    "trk: compact refused: the log carries events for ids with no `add` event —\n" ++
+                        "  compacting now would bake their degraded state (no title, no tags, no arcs)\n" ++
+                        "  into the snapshot and truncate the log the originals are recoverable from:\n",
+                );
+                for (self.store.ghost_tasks.items) |id|
+                    try self.print("    {s}\n", .{&id.text});
+                try self.write(
+                    "  Recover each `add` from git history of .tracker/log.jsonl (earliest add event),\n" ++
+                        "  or re-file the task; then re-run. `trk compact --force` proceeds anyway.\n",
+                );
+                return e;
+            },
+            else => return e,
+        };
         try self.print(
             "compacted: {d} events -> {d} live tasks, log truncated\n",
             .{ result.log_events_before, result.live_tasks },
@@ -1654,16 +1756,22 @@ pub const Cli = struct {
 
     /// `<short-id>  [<arc-seq>/<prio>]  <title>` — `next`/`list` one-liner.
     /// `arc_id` (if given) selects which arc's seq to show; otherwise the best.
+    /// EITHER column prints `-` when unset: no `in` edge for the seq, stored
+    /// `0` for the priority. A literal `0` there used to read as a real rank
+    /// while ordering treated it as unset, so the two disagreed on screen.
     fn printTaskLine(self: *Cli, id: Ulid, arc_id: ?Ulid) !void {
         const t = self.store.get(id).?;
         const seq = self.seqFor(id, arc_id);
         var sb: [ulid.len]u8 = undefined;
         const sid = try self.shortId(id, &sb);
-        if (seq) |s| {
-            try self.print("{s}  [{d}/{d}]  {s}\n", .{ sid, s, t.priority, t.title });
-        } else {
-            try self.print("{s}  [-/{d}]  {s}\n", .{ sid, t.priority, t.title });
-        }
+        var seq_buf: [16]u8 = undefined;
+        var pri_buf: [16]u8 = undefined;
+        const seq_txt = if (seq) |s| try std.fmt.bufPrint(&seq_buf, "{d}", .{s}) else "-";
+        const pri_txt = if (t.priority != 0)
+            try std.fmt.bufPrint(&pri_buf, "{d}", .{t.priority})
+        else
+            "-";
+        try self.print("{s}  [{s}/{s}]  {s}\n", .{ sid, seq_txt, pri_txt, t.title });
     }
 
     /// The arc-seq to display for a task: if `arc_id` is given, that arc's seq;
@@ -2180,7 +2288,7 @@ pub const Cli = struct {
     }
 
     /// Every arc (every id `isArc` is true for — declared, an `in.arc` target,
-    /// or a back-compat `arc:` tag), sorted by (root priority, id). This is
+    /// or a back-compat `arc:` tag), sorted by (effective root priority, id). This is
     /// what earns a task its own "## <title>" render section, INCLUDING a
     /// declared-but-zero-member arc (it renders as a header with no bullets).
     fn collectArcs(self: *Cli) Error![]Ulid {
@@ -2191,7 +2299,9 @@ pub const Cli = struct {
             fn less(c: @This(), x: Ulid, y: Ulid) bool {
                 const tx = c.cli.store.get(x).?;
                 const ty = c.cli.store.get(y).?;
-                if (tx.priority != ty.priority) return tx.priority < ty.priority;
+                const px = model.effectivePriority(tx.priority);
+                const py = model.effectivePriority(ty.priority);
+                if (px != py) return px < py;
                 return x.order(y) == .lt;
             }
         };
@@ -2258,7 +2368,10 @@ pub const Cli = struct {
         try self.print("id:       {s}\n", .{&id.text});
         try self.print("title:    {s}\n", .{t.title});
         try self.print("state:    {s}\n", .{t.state.toString()});
-        try self.print("priority: {d}\n", .{t.priority});
+        if (t.priority != 0)
+            try self.print("priority: {d}\n", .{t.priority})
+        else
+            try self.print("priority: unset (ranks {d})\n", .{model.default_priority});
 
         // Tags
         try self.write("tags:     ");
@@ -2379,6 +2492,9 @@ pub const Cli = struct {
         var new_title: ?[]const u8 = null;
         var new_body: ?[]const u8 = null;
         var priority: ?i32 = null;
+        // Set when `--body -` read stdin into a fresh allocation (see bodyArg).
+        var body_owned = false;
+        defer if (body_owned) self.gpa.free(new_body.?);
         var add_tags: std.ArrayList([]const u8) = .empty;
         defer add_tags.deinit(self.gpa);
         var rm_tags: std.ArrayList([]const u8) = .empty;
@@ -2392,7 +2508,9 @@ pub const Cli = struct {
             if (std.mem.eql(u8, arg, "--title")) {
                 new_title = try self.flagVal(args, &i, "--title");
             } else if (std.mem.eql(u8, arg, "--body")) {
-                new_body = try self.flagVal(args, &i, "--body");
+                const b = try self.bodyArg(try self.flagVal(args, &i, "--body"));
+                new_body = b.text;
+                body_owned = b.owned;
             } else if (std.mem.eql(u8, arg, "--add-doc")) {
                 try add_docs.append(self.gpa, try self.flagVal(args, &i, "--add-doc"));
             } else if (std.mem.eql(u8, arg, "--add-tag")) {

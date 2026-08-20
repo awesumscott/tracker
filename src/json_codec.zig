@@ -17,6 +17,9 @@
 //!   {"op":"dep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"in","task":"<ulid>","arc":"<ulid>","seq":0,"ts":0}
 //!   {"op":"setPriority","id":"<ulid>","priority":0,"ts":0}
+//! An `add` written by `compact` carries one extra key, `"wm"` (the task's
+//! watermark — see `model.Event.add.wm`); the decoder ignores keys it does not
+//! know, so an older binary reads such a snapshot unchanged.
 //!   {"op":"tag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"docref","id":"<ulid>","doc_id":"...","section_id":"..."|null-omitted,"ts":0}
 //!   {"op":"setDocPath","doc_id":"...","path":"docs/design/foo.md","ts":0}
@@ -127,6 +130,12 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             }
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, a.ts);
+            // Only when set (snapshot lines), so every line the APPEND path
+            // writes stays byte-identical to what it wrote before this existed.
+            if (a.wm != 0) {
+                try writeKey(buf, gpa, "wm", &first);
+                try writeInt(buf, gpa, a.wm);
+            }
         },
         .setState => |s| {
             try writeKey(buf, gpa, "id", &first);
@@ -396,6 +405,7 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
                 .tags = try tags.toOwnedSlice(gpa),
                 .short = short,
                 .ts = getIntDefault(obj, "ts", 0),
+                .wm = getIntDefault(obj, "wm", 0),
             } };
         },
         .setState => {

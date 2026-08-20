@@ -97,6 +97,14 @@ pub const SkippedOp = struct {
     op: []const u8,
 };
 
+/// One task whose late-merged log events were withheld as provably stale (see
+/// `Store.superseded` / `Store.supersededBy`).
+pub const Superseded = struct {
+    id: Ulid,
+    /// How many of that task's events were withheld.
+    events: usize,
+};
+
 pub const Store = struct {
     gpa: std.mem.Allocator,
     /// Arena owning all task strings/tags/docrefs/edges — freed wholesale on deinit.
@@ -176,6 +184,42 @@ pub const Store = struct {
     /// ArrayList itself is gpa-owned (freed in `deinit`); each `.op` string
     /// is arena-owned (freed wholesale with the rest of the arena).
     skipped_unknown_ops: std.ArrayList(SkippedOp) = .empty,
+    /// EVERY task id the fold materialized WITHOUT ever seeing an `add` for it
+    /// — a ghost (01M0EJGYH, 2026-08-20). Sorted by id (the task map's
+    /// iteration order is not deterministic, and a warning that reorders
+    /// between runs is unreadable). Empty = none.
+    ///
+    /// `ensureNode` tolerates an event that arrives before its `add`, which a
+    /// union-merged log legitimately produces; the tolerance is only wrong
+    /// once the WHOLE fold is done and no add ever showed up. Measured in the
+    /// Enix tracker: two June-era tasks surfaced with empty titles, no tags and
+    /// no arcs but a full body, because `compact` GC'd their adds and a stale
+    /// worktree then union-merged a lone `setBody` back in — replay rebuilt
+    /// each task from that one event and reported nothing. Recovering the
+    /// titles took digging the original `add` lines out of git history.
+    ///
+    /// Same reporting shape as `self_wait_cycles`: collected by `load`,
+    /// surfaced by main.zig as one stderr warning per id, never fatal on its
+    /// own — the data that IS there stays readable. `compact` is the one verb
+    /// that refuses, because compacting a log in this state is what makes the
+    /// loss permanent. gpa-owned; freed in `deinit`.
+    ghost_tasks: std.ArrayList(Ulid) = .empty,
+    /// EVERY log event `load` withheld because it predates its task's snapshot
+    /// watermark — one entry per affected TASK (not per event; a resurrection
+    /// re-merges whole regions, and a warning per line would be a wall of text
+    /// nobody reads), carrying how many of its events were withheld. Empty =
+    /// none. Never a silent drop: main.zig warns per entry, and the events are
+    /// still in the log for a deliberate re-apply. See `supersededBy`.
+    superseded: std.ArrayList(Superseded) = .empty,
+    /// The newest `ts` folded so far, across every event. `compact` uses the
+    /// per-task `Task.last_ts` rather than this, but a global figure is what
+    /// makes "was anything at all timestamped" answerable.
+    max_event_ts: i64 = 0,
+    /// How many byte-identical duplicate lines the last `load` collapsed in the
+    /// log. Purely informational (`apply` is idempotent, so a duplicate line was
+    /// always a no-op) — it measures the event-bloat a union-merge resurrection
+    /// leaves behind. See `replayFile`.
+    deduped_log_lines: usize = 0,
 
     /// Open a store rooted at `dir`. Does NOT load — call `load` for that, or
     /// `openAndLoad`. `dir` is borrowed; the caller keeps ownership/closes it.
@@ -198,6 +242,8 @@ pub const Store = struct {
         self.declared_arcs.deinit(self.gpa);
         self.standing_arcs.deinit(self.gpa);
         self.self_wait_cycles.deinit(self.gpa);
+        self.ghost_tasks.deinit(self.gpa);
+        self.superseded.deinit(self.gpa);
         self.skipped_unknown_ops.deinit(self.gpa);
         self.arena.deinit();
     }
@@ -223,14 +269,91 @@ pub const Store = struct {
         return gop.value_ptr;
     }
 
+    /// The task id a last-write-wins SCALAR event targets, or null for every
+    /// other op. Only these can REVERT a task by arriving late: an edge, tag or
+    /// docref event is additive (or a tombstone that wins regardless of order),
+    /// so a stale one converges to the same state and must never be withheld —
+    /// withholding it would silently drop a lane's real work. See
+    /// `supersededBy`.
+    fn scalarTarget(ev: Event) ?Ulid {
+        return switch (ev) {
+            .add => |x| x.id,
+            .setState => |x| x.id,
+            .setTitle => |x| x.id,
+            .setBody => |x| x.id,
+            .setPriority => |x| x.id,
+            .setShort => |x| x.id,
+            else => null,
+        };
+    }
+
+    /// Non-null iff this event is provably older than the snapshot's own value
+    /// for the task it targets — i.e. a resurrection, not new work. Returns the
+    /// task id (for reporting).
+    ///
+    /// The judgment rests on the disjoint-writer rule (design.md "merge
+    /// model"): two writers never mutate the SAME task, so for a task the
+    /// snapshot already knows, any log event with a `ts` older than that task's
+    /// watermark cannot be a concurrent edit — it can only be an event a
+    /// `compact` already folded, union-merged back in by a lane whose base
+    /// predates it. `ts == 0` (legacy, no timestamp) is never judged, and a task
+    /// with no watermark (legacy snapshot, or one written before this existed) is
+    /// never judged either — both fall through to the old behavior.
+    ///
+    /// An id the snapshot does NOT know is deliberately not judged: a GC'd task
+    /// and a task that never existed are indistinguishable once compaction has
+    /// erased the former, so an event for an unknown id is applied and — if no
+    /// `add` ever accompanies it — surfaces through `ghost_tasks` instead.
+    fn supersededBy(self: *Store, ev: Event) ?Ulid {
+        const ts = model.eventTs(ev);
+        if (ts == 0) return null;
+        const id = scalarTarget(ev) orelse return null;
+        const t = self.tasks.get(key(id)) orelse return null;
+        if (t.watermark == 0 or ts >= t.watermark) return null;
+        return id;
+    }
+
+    /// Track the newest `ts` seen, globally and per task, so `compact` can stamp
+    /// each task's watermark. Runs for every applied event, replay and append
+    /// alike.
+    fn noteTs(self: *Store, ev: Event) !void {
+        const ts = model.eventTs(ev);
+        if (ts == 0) return;
+        if (ts > self.max_event_ts) self.max_event_ts = ts;
+        const id = switch (ev) {
+            .add => |x| x.id,
+            .setState => |x| x.id,
+            .setTitle => |x| x.id,
+            .setBody => |x| x.id,
+            .setPriority => |x| x.id,
+            .setShort => |x| x.id,
+            .tag => |x| x.id,
+            .untag => |x| x.id,
+            .docref => |x| x.id,
+            .arcDeclare => |x| x.id,
+            .arcStanding => |x| x.id,
+            // An edge event touches two tasks, but the watermark only ever gates
+            // SCALAR ops (see `scalarTarget`), so stamping either endpoint would
+            // raise a bar nothing checks. Left alone deliberately.
+            .dep, .undep, .in, .unin, .setDocPath => return,
+        };
+        const t = try self.ensureNode(id);
+        if (ts > t.last_ts) t.last_ts = ts;
+    }
+
     /// Apply one event to in-memory state. Idempotent where the doc requires:
     /// re-applying `add`/`setState`/`setPriority` for the same id converges to
     /// the same value; a duplicate `dep`/`in`/`tag`/`docref` is de-duplicated so
     /// replaying a log twice is a no-op.
     pub fn apply(self: *Store, ev: Event) !void {
+        try self.noteTs(ev);
         switch (ev) {
             .add => |x| {
                 const t = try self.ensureNode(x.id);
+                t.has_add = true; // no longer a placeholder — see `ghost_tasks`
+                // A snapshot `add` carries the task's watermark; a log `add`
+                // never does (`wm` defaults to 0), so this only ever tightens.
+                if (x.wm > t.watermark) t.watermark = x.wm;
                 // Last add wins for scalar fields (idempotent for a replay; a
                 // genuine re-add with new text is a deliberate overwrite).
                 t.title = try self.a().dupe(u8, x.title);
@@ -429,15 +552,30 @@ pub const Store = struct {
         // `self_wait_cycles` (computed in one pass AFTER replay), so it's
         // cleared here rather than alongside that reset below.
         self.skipped_unknown_ops.clearRetainingCapacity();
-        try self.replayFile(snapshot_name);
-        try self.replayFile(log_name);
+        self.superseded.clearRetainingCapacity();
+        self.deduped_log_lines = 0;
+        try self.replayFile(snapshot_name, false);
+        try self.replayFile(log_name, true);
         try self.checkAcyclic();
+        try self.collectGhostTasks();
         // Reset before recomputing: `load` is safe to call more than once on
         // a live Store (tests do), and the list must not accumulate stale
         // pairs from a prior fold.
         self.self_wait_cycles.clearRetainingCapacity();
         try self.findSelfWaitCycles(&self.self_wait_cycles);
         self.loadConfig();
+    }
+
+    /// After the WHOLE fold: every node that never received an `add` is a ghost
+    /// (see `ghost_tasks`). Sorted by id so the warning order is stable across
+    /// runs — the task map's iteration order is not.
+    fn collectGhostTasks(self: *Store) !void {
+        self.ghost_tasks.clearRetainingCapacity();
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.has_add) try self.ghost_tasks.append(self.gpa, entry.value_ptr.id);
+        }
+        std.sort.pdq(Ulid, self.ghost_tasks.items, {}, Ulid.lessThan);
     }
 
     /// Read `.tracker/config.json` into `self.config`. Best-effort and never
@@ -503,7 +641,42 @@ pub const Store = struct {
         return self.a().dupe(u8, s) catch null;
     }
 
-    fn replayFile(self: *Store, name: []const u8) !void {
+    /// One decoded line, held so the whole file can be ORDERED before any of it
+    /// is applied. `idx` is the original file position, which makes the sort a
+    /// total order — a ts tie replays in file order, and no stable sort is
+    /// needed to get a deterministic fold.
+    const Pending = struct {
+        ev: Event,
+        ts: i64,
+        idx: usize,
+
+        fn less(_: void, x: Pending, y: Pending) bool {
+            if (x.ts != y.ts) return x.ts < y.ts;
+            return x.idx < y.idx;
+        }
+    };
+
+    /// Replay one file. `reorder` = fold it by `ts` (ties in file order) and
+    /// drop byte-identical duplicate lines first, instead of straight file order.
+    ///
+    /// The log gets `reorder`; the snapshot does NOT. `log.jsonl` is union-merged
+    /// by git (`merge=union`), which concatenates two writers' regions in
+    /// whatever order the driver picks — so file order there is not chronological
+    /// order, while every event already carries the `ts` that is. Folding in file
+    /// order let a merge decide which of two `setTitle`s won, and let a lane's
+    /// resurrected pre-compact events land after the state that superseded them
+    /// (01M0EJGYH). `snapshot.jsonl` is a whole-file baseline written only by a
+    /// serialized `compact` and never union-merged, so its file order IS its
+    /// authored order — reordering it would only risk disturbing the canonical
+    /// add-before-edges sequence `serializeState` emits.
+    ///
+    /// This does not make every merge artifact self-healing: an event that a
+    /// compact already folded into the snapshot, then resurrected by a stale
+    /// lane, still applies after the snapshot no matter how old its `ts` is,
+    /// because the snapshot carries no watermark to compare it against. What
+    /// this buys is that the fold no longer depends on the merge driver's line
+    /// order — the same set of events lands in the same state every time.
+    fn replayFile(self: *Store, name: []const u8, reorder: bool) !void {
         var sub = self.dir.openDir(self.io, tracker_subdir, .{}) catch |e| switch (e) {
             error.FileNotFound => return, // no store yet -> empty fold
             else => return e,
@@ -516,16 +689,53 @@ pub const Store = struct {
         };
         defer self.gpa.free(bytes);
 
+        // Held only when reordering; each entry owns codec-dup'd strings until
+        // it is applied and freed below.
+        var pending: std.ArrayList(Pending) = .empty;
+        defer {
+            for (pending.items) |p| freeEvent(self.gpa, p.ev);
+            pending.deinit(self.gpa);
+        }
+        // Byte-identical lines seen so far. Keys borrow `bytes`, which outlives
+        // this set (freed by the defer above it).
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.gpa);
+
         var it = std.mem.splitScalar(u8, bytes, '\n');
+        var idx: usize = 0;
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0) continue;
+            if (reorder) {
+                const gop = try seen.getOrPut(self.gpa, trimmed);
+                if (gop.found_existing) {
+                    // A union-merge resurrection re-concatenates whole regions
+                    // of an already-folded log; the copies are byte-identical
+                    // (same ts included), so collapsing them is a no-op that
+                    // costs nothing and keeps the fold's cost linear in the
+                    // DISTINCT event count.
+                    self.deduped_log_lines += 1;
+                    continue;
+                }
+            }
             const maybe_ev = codec.decode(self.gpa, trimmed);
             if (maybe_ev) |ev| {
-                // Free the codec's gpa-dup'd transient strings after apply
-                // re-dups into the arena.
-                defer freeEvent(self.gpa, ev);
-                try self.apply(ev);
+                if (reorder) {
+                    pending.append(self.gpa, .{
+                        .ev = ev,
+                        .ts = model.eventTs(ev),
+                        .idx = idx,
+                    }) catch |e| {
+                        freeEvent(self.gpa, ev);
+                        return e;
+                    };
+                    idx += 1;
+                } else {
+                    // Free the codec's gpa-dup'd transient strings after apply
+                    // re-dups into the arena.
+                    defer freeEvent(self.gpa, ev);
+                    try self.apply(ev);
+                }
             } else |e| {
                 // An unrecognized op is skip-and-warn by default, not fatal —
                 // see `skipped_unknown_ops`'s doc comment for why. Any OTHER
@@ -537,6 +747,28 @@ pub const Store = struct {
                 return e;
             }
         }
+
+        if (reorder) {
+            std.sort.pdq(Pending, pending.items, {}, Pending.less);
+            for (pending.items) |p| {
+                if (self.supersededBy(p.ev)) |id| {
+                    try self.noteSuperseded(id);
+                    continue;
+                }
+                try self.apply(p.ev);
+            }
+        }
+    }
+
+    /// Record (or bump the count of) a task whose stale event was withheld.
+    fn noteSuperseded(self: *Store, id: Ulid) !void {
+        for (self.superseded.items) |*sd| {
+            if (sd.id.eql(id)) {
+                sd.events += 1;
+                return;
+            }
+        }
+        try self.superseded.append(self.gpa, .{ .id = id, .events = 1 });
     }
 
     /// Handles one line whose `op` is unrecognized (`codec.decode` returned
@@ -931,7 +1163,20 @@ pub const Store = struct {
     ///     on the next load. A done prereq is what makes a dependent eligible —
     ///     losing it corrupts the graph.
     ///   - Edges (`dep`, `in`) involving a dropped endpoint are also excluded.
-    pub fn compact(self: *Store) !CompactResult {
+    /// `force` skips the ghost-task precondition. Without it, a log carrying
+    /// events for ids that have no surviving `add` is REFUSED: compaction is
+    /// exactly the step that turns that shear into permanent loss, because
+    /// `serializeState` writes the ghost's degraded state (empty title, no tags,
+    /// no arcs) into the new baseline and then truncates the log the real `add`
+    /// might still have been recoverable from. Refusing costs a re-run; the
+    /// alternative cost git-history archaeology (01M0EJGYH).
+    pub fn compact(self: *Store, force: bool) !CompactResult {
+        // Recomputed here rather than trusted from `load`: appends since then
+        // (this process's own, or another writer's) can have introduced one, and
+        // a precondition that only holds at load time is not a precondition.
+        try self.collectGhostTasks();
+        if (!force and self.ghost_tasks.items.len != 0) return error.GhostTasks;
+
         // Count log events before truncation.
         const log_events_before = try self.countLogEvents();
 
@@ -1025,6 +1270,12 @@ pub const Store = struct {
                 .body = t.body,
                 .tags = tag_slice,
                 .short = t.short,
+                // The task's watermark: the newest event ts this state
+                // incorporates. Replay uses it to withhold a stale event that a
+                // later union-merge drags back in (01M0EM3G6). Carried forward
+                // rather than recomputed, so a task nothing has touched since an
+                // earlier compact keeps the bar it already had.
+                .wm = @max(t.last_ts, t.watermark),
             } });
             if (t.state != .open)
                 try self.emit(buf, .{ .setState = .{ .id = id, .state = t.state } });
@@ -1499,19 +1750,33 @@ pub const Store = struct {
     // ----------------------------------------------------------------- next
 
     /// The per-task sort key for `next` / a future list view.
-    /// Ordering (issue-tracker.md `next` ruling):
-    ///   1. best (smallest) arc-priority `seq` across all arcs the task is in
-    ///      (a task in NO arc gets the sentinel max → orders after arc'd tasks).
-    ///   2. personal priority (the global `priority` field; lower first).
+    /// Ordering:
+    ///   1. personal priority, EFFECTIVE (`model.effectivePriority`: stored `0`
+    ///      = unset ranks at `default_priority`); lower first.
+    ///   2. best (smallest) arc-priority `seq` across all arcs the task is in
+    ///      (a task in NO arc gets the sentinel max → orders after arc'd tasks
+    ///      OF THE SAME PRIORITY).
     ///   3. id (ULID; stable, time-ascending tiebreak).
+    ///
+    /// Priority leads and arc-seq breaks its ties (2026-08-19, task 01KZD94QY);
+    /// it used to be the reverse, which made priority vestigial — arc-seq is a
+    /// task's position WITHIN its arc, not the arc's rank, so priority only ever
+    /// separated tasks sharing a seq, and the arcless sentinel buried every
+    /// standalone task no matter how extreme its priority (measured: the single
+    /// highest-priority task in the Enix backlog sat at row 131 of 211, unseen
+    /// under any `--limit`). Because unset now ranks at `default_priority`
+    /// rather than at the strongest value, the untouched majority still ties on
+    /// key 1 and falls through to arc-seq — so this reorders exactly the tasks
+    /// someone deliberately prioritised, and nothing else.
     pub const Ranked = struct {
         id: Ulid,
         best_arc_seq: i64,
+        /// Already passed through `model.effectivePriority`.
         priority: i32,
 
         fn less(_: void, x: Ranked, y: Ranked) bool {
-            if (x.best_arc_seq != y.best_arc_seq) return x.best_arc_seq < y.best_arc_seq;
             if (x.priority != y.priority) return x.priority < y.priority;
+            if (x.best_arc_seq != y.best_arc_seq) return x.best_arc_seq < y.best_arc_seq;
             return x.id.order(y.id) == .lt;
         }
     };
@@ -1519,7 +1784,8 @@ pub const Store = struct {
     /// The ready frontier: every `open` task whose every `needs`-target is
     /// satisfied (state `done` or `dropped`), ordered per `Ranked.less`. A task
     /// with no `needs` is trivially ready; a task in no arc still appears
-    /// (sorted after arc'd tasks by the sentinel). An arc ROOT is a container —
+    /// (sorted after arc'd tasks of the SAME priority, by the sentinel). An arc
+    /// ROOT is a container —
     /// its work is its members' — so it is additionally held back until the arc
     /// is drained, then surfaces exactly once as the close-out prompt. A `needs`
     /// edge targeting a root gates on the root's own state (the completion
@@ -1573,7 +1839,11 @@ pub const Store = struct {
                     }
                 }
             }
-            try ranked.append(self.gpa, .{ .id = t.id, .best_arc_seq = best, .priority = t.priority });
+            try ranked.append(self.gpa, .{
+                .id = t.id,
+                .best_arc_seq = best,
+                .priority = model.effectivePriority(t.priority),
+            });
         }
 
         std.sort.pdq(Ranked, ranked.items, {}, Ranked.less);

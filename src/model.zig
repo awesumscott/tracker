@@ -68,6 +68,20 @@ pub const State = enum {
     }
 };
 
+/// The rank an UNSET priority carries in every ordering. Stored `0` is the
+/// "never set" sentinel — `Store.compact` already declines to emit it — so it
+/// must not also be the STRONGEST value, which is what silently buried every
+/// task a user tried to raise (`--priority 10` sorting below 257 untouched
+/// zeroes; task 01KZD94QX). Ranking substitutes this value instead, which needs
+/// no migration: stored data is untouched and an explicit priority now moves a
+/// task in the direction the sign says, both ways.
+pub const default_priority: i32 = 100;
+
+/// Priority as ORDERING sees it. Display and JSON keep the stored value.
+pub fn effectivePriority(stored: i32) i32 {
+    return if (stored == 0) default_priority else stored;
+}
+
 /// A doc-ref: indirect `doc_id` (through a future id->path registry) plus an
 /// optional stable `section_id` anchor for a focused read.
 pub const DocRef = struct {
@@ -78,10 +92,26 @@ pub const DocRef = struct {
 /// An in-memory task node. Strings/lists are owned by the Store's arena.
 pub const Task = struct {
     id: Ulid,
+    /// The `ts` of the newest event folded into this task. Feeds `compact`'s
+    /// per-task watermark (`Event.add.wm`). Not persisted directly.
+    last_ts: i64 = 0,
+    /// The watermark this task arrived with from the snapshot (`Event.add.wm`),
+    /// or `0` when there was none. See that field.
+    watermark: i64 = 0,
+    /// False = this node was materialized by `Store.ensureNode` from an event
+    /// that merely REFERENCES the id (a `dep`/`in`/`setBody`/...), and no `add`
+    /// for it was ever folded. Mid-replay that is normal — a union-merged log
+    /// legitimately interleaves an edge ahead of its `add`. Still false AFTER
+    /// the whole fold, it is a GHOST: the add is gone (compacted away, then the
+    /// surviving events union-merged back in) and the node's title/tags/arcs are
+    /// silently lost while a body survives. `load` collects these into
+    /// `Store.ghost_tasks`; see task 01M0EJGYH.
+    has_add: bool = false,
     title: []const u8 = "",
     body: []const u8 = "",
     state: State = .open,
-    /// Global cross-arc tiebreaker. Lower sorts first. Default 0.
+    /// Global rank, lower first. Stored `0` means UNSET, not "strongest" —
+    /// ordering substitutes `default_priority` for it (see `effectivePriority`).
     priority: i32 = 0,
     tags: std.ArrayList([]const u8) = .empty,
     docrefs: std.ArrayList(DocRef) = .empty,
@@ -178,6 +208,16 @@ pub const Op = enum {
 
 /// One log event — a tagged union over the op kinds. Fields mirror the JSON
 /// schema in store.zig (one JSON object per line, `"op"` discriminator).
+/// The append-time `ts` of any event, without a per-op switch at every call
+/// site. `0` = unknown (a legacy line written before `ts` existed, or a
+/// hand-authored one) — those sort FIRST on replay, which is right for the
+/// legacy case they come from. See `Store.replayFile`.
+pub fn eventTs(ev: Event) i64 {
+    return switch (ev) {
+        inline else => |x| x.ts,
+    };
+}
+
 /// Every variant carries `ts: i64 = 0` — wall-clock ms at append time.
 /// ts=0 means unknown (legacy log lines without a ts field).
 pub const Event = union(Op) {
@@ -195,6 +235,16 @@ pub const Event = union(Op) {
         /// Original creation ms (the ULID also carries it; kept explicit for the
         /// human face and so a re-mint scheme could decouple later). Optional.
         ts: i64 = 0,
+        /// SNAPSHOT ONLY: this task's watermark — the `ts` of the newest event
+        /// `compact` had folded into the state it is writing out. Replay skips
+        /// any later-merged log event for this task whose `ts` predates it: such
+        /// an event is provably older than the snapshot's own value, so applying
+        /// it would revert the task (task 01M0EM3G6). `0` = unknown (a legacy
+        /// snapshot, or a task whose events all predate `ts`), which disables
+        /// the check for that task. Never written by `append` — only by
+        /// `serializeState`, as an extra JSON key an older binary simply
+        /// ignores, so the format stays backward AND forward compatible.
+        wm: i64 = 0,
     },
     setState: struct { id: Ulid, state: State, ts: i64 = 0 },
     dep: struct { from: Ulid, to: Ulid, ts: i64 = 0 },
