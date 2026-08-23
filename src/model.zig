@@ -176,6 +176,14 @@ pub const Op = enum {
     /// (task/arc swapped) is correctable through the tool instead of
     /// permanently uncorrectable structural debris (01KYSYBVK).
     unin,
+    /// Remove a docref from a task (idempotent: no-op if the ref is absent) —
+    /// the inverse of `docref`, mirroring `untag` exactly. Matching is by
+    /// `doc_id` alone: a task's refs to the same doc differ only by section,
+    /// and the removal verb takes the doc id the caller typed, so one
+    /// `undocref` clears every section ref to that doc. Safe for an older
+    /// binary to miss (it would show a stale, already-cosmetic ref), so it
+    /// needs no `breaking` marker — see `json_codec.zig`.
+    undocref,
     /// Declare (or retract) a task as an arc root, independent of whether any
     /// task is `in` it. `declared: true` makes `isArc` true even with zero
     /// members (expresses a real goal with no work filed yet); `declared:
@@ -235,6 +243,7 @@ pub fn eventTaskIds(ev: Event) [2]?Ulid {
         .tag => |x| .{ x.id, null },
         .untag => |x| .{ x.id, null },
         .docref => |x| .{ x.id, null },
+        .undocref => |x| .{ x.id, null },
         .arcDeclare => |x| .{ x.id, null },
         .arcStanding => |x| .{ x.id, null },
         .dep => |x| .{ x.from, x.to },
@@ -296,6 +305,15 @@ pub const Event = union(Op) {
     /// exactly (same tombstone-beats-add fold semantics, same union-merge
     /// convergence, just over `(task, arc)` instead of `(from, to)`).
     unin: struct { task: Ulid, arc: Ulid, ts: i64 = 0 },
+    /// Remove a docref from a task — the inverse of `docref`. No-op if the
+    /// task carries no ref to `doc_id`. Mirrors `untag`'s fold shape (a plain
+    /// list removal, no tombstone map): a docref is a per-TASK attribute, and
+    /// under the disjoint-writer rule two lanes never edit the same task, so
+    /// the only ordering that matters is a single lane's own append order —
+    /// which a union merge preserves within each side. Contrast `undep`/`unin`,
+    /// which DO need tombstone maps because an EDGE is authored from either
+    /// endpoint and so genuinely can be raced.
+    undocref: struct { id: Ulid, doc_id: []const u8, ts: i64 = 0 },
     /// Declare/retract `id` as an arc root. Last-write-wins on fold.
     arcDeclare: struct { id: Ulid, declared: bool, ts: i64 = 0 },
     /// Mark/unmark `id` as a standing arc. See `Op.arcStanding`.

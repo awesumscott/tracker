@@ -28,6 +28,7 @@
 //!   {"op":"untag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"undep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"unin","task":"<ulid>","arc":"<ulid>","ts":0}
+//!   {"op":"undocref","id":"<ulid>","doc_id":"...","ts":0}
 //!   {"op":"arcDeclare","id":"<ulid>","declared":true|false,"ts":0}
 //!   {"op":"arcStanding","id":"<ulid>","standing":true|false,"ts":0}
 //!   {"op":"setShort","id":"<ulid>","short":"...","ts":0}
@@ -222,6 +223,14 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeJsonString(buf, gpa, t.tag);
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, t.ts);
+        },
+        .undocref => |r| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, r.id.slice());
+            try writeKey(buf, gpa, "doc_id", &first);
+            try writeJsonString(buf, gpa, r.doc_id);
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, r.ts);
         },
         .undep => |d| {
             try writeKey(buf, gpa, "from", &first);
@@ -464,6 +473,11 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
         .untag => return .{ .untag = .{
             .id = try getUlid(obj, "id"),
             .tag = try gpa.dupe(u8, try getStr(obj, "tag")),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
+        .undocref => return .{ .undocref = .{
+            .id = try getUlid(obj, "id"),
+            .doc_id = try gpa.dupe(u8, try getStr(obj, "doc_id")),
             .ts = getIntDefault(obj, "ts", 0),
         } },
         .undep => return .{ .undep = .{

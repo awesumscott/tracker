@@ -54,7 +54,7 @@ discovery).
 ## Model in one screen
 
 - **Task** = a node with `id` (a ULID, minted once), `title`, `body`, `state`, `priority`, `tags`, doc-refs.
-- **`A needs B`** — a prerequisite edge, forming a DAG. Cycles are rejected. `trk dep <needer> <prereq>`.
+- **`A needs B`** — a prerequisite edge, forming a DAG. Cycles are rejected. `trk dep <needer> --needs <prereq>`.
 - **`T in X`** — task `T` belongs to arc `X`. An **arc** is a task that's either **declared**
   (`trk arc <id>`, or `trk add --arc` — works even with zero members) or has ≥1 direct `in` member.
   `trk in <task> <arc>`. `trk list --no-arc` lists every task in no arc.

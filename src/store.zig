@@ -109,6 +109,27 @@ pub const Config = struct {
     /// stderr and proceeds; `true` (`"error"`) refuses the add outright. Warn
     /// is the default so a repo with no config behaves exactly as before.
     add_arcless_error: bool = false,
+    /// `archive.decision_markers` — the substrings whose presence in a closing
+    /// task's body makes `trk archive` REFUSE without
+    /// `--allow-buried-decisions`. null → `default_decision_markers`. An empty
+    /// JSON array is honored as "disable the check entirely", which is why this
+    /// is `?[]const []const u8` and not a slice with an empty default: absent
+    /// and empty must mean different things. Arena-owned.
+    decision_markers: ?[]const []const u8 = null,
+};
+
+/// Markers `trk archive` looks for when no `archive.decision_markers` is
+/// configured. Matched case-insensitively as substrings of a body line. These
+/// are the shapes that carry a DECISION rather than work: archiving flips a
+/// task to `archived`, which is hidden from every view, so an open fork living
+/// in an otherwise-finished task's body is graduated out of sight along with it
+/// (task 01M0QK25Q — measured loss, 2026-08-12).
+pub const default_decision_markers: []const []const u8 = &.{
+    "scott-decision",
+    "OPEN QUESTION",
+    "FIX NOTE",
+    "your call",
+    "TODO",
 };
 
 pub const Error = error{
@@ -375,6 +396,7 @@ pub const Store = struct {
             .tag => |x| x.id,
             .untag => |x| x.id,
             .docref => |x| x.id,
+            .undocref => |x| x.id,
             .arcDeclare => |x| x.id,
             .arcStanding => |x| x.id,
             // An edge event touches two tasks, but the watermark only ever gates
@@ -503,6 +525,20 @@ pub const Store = struct {
                     }
                 }
                 if (idx) |i| _ = t.tags.orderedRemove(i);
+            },
+            .undocref => |x| {
+                const t = try self.ensureNode(x.id);
+                // Remove EVERY ref to this doc_id, section or not. The removal
+                // verb takes a doc id (the caller cannot always know which
+                // sections got attached), and a task's refs to one doc differ
+                // only by section — so "drop the ref to this doc" is the whole
+                // operation. Shift-remove back-to-front to keep order stable.
+                var i = t.docrefs.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.eql(u8, t.docrefs.items[i].doc_id, x.doc_id))
+                        _ = t.docrefs.orderedRemove(i);
+                }
             },
             .undep => |x| {
                 // Record the tombstone so a later `dep` for the same edge (in
@@ -649,6 +685,37 @@ pub const Store = struct {
         self.config.render_out = self.readNestedOut(root, "render");
         self.config.archive_out = self.readNestedOut(root, "archive");
         self.config.add_arcless_error = self.readAddArclessError(root);
+        self.config.decision_markers = self.readDecisionMarkers(root);
+    }
+
+    /// Pull `archive.decision_markers` (an array of strings) from the config
+    /// root, arena-dup'd. Returns null — meaning "use the built-in default set"
+    /// — when the section, the key, or its array type is absent. An explicitly
+    /// EMPTY array returns an empty slice, which disables the check; that is a
+    /// deliberate, spellable opt-out and must not collapse into the default.
+    /// Non-string elements are skipped rather than failing the load, matching
+    /// every other reader here (a broken config never blocks a command).
+    fn readDecisionMarkers(self: *Store, root: std.json.ObjectMap) ?[]const []const u8 {
+        const sv = root.get("archive") orelse return null;
+        const so = switch (sv) {
+            .object => |o| o,
+            else => return null,
+        };
+        const av = so.get("decision_markers") orelse return null;
+        const arr = switch (av) {
+            .array => |arr_val| arr_val,
+            else => return null,
+        };
+        var out: std.ArrayList([]const u8) = .empty;
+        for (arr.items) |item| {
+            const str = switch (item) {
+                .string => |x| x,
+                else => continue,
+            };
+            const dup = self.a().dupe(u8, str) catch return null;
+            out.append(self.a(), dup) catch return null;
+        }
+        return out.toOwnedSlice(self.a()) catch null;
     }
 
     /// Pull `add.arcless` (a string, `"warn"` or `"error"`) from the config
@@ -854,6 +921,7 @@ pub const Store = struct {
             .setTitle => |x| gpa.free(x.title),
             .setBody => |x| gpa.free(x.body),
             .untag => |x| gpa.free(x.tag),
+            .undocref => |x| gpa.free(x.doc_id),
             .setShort => |x| gpa.free(x.short),
             else => {},
         }
@@ -1642,6 +1710,11 @@ pub const Store = struct {
                     ts = x.ts;
                     task_id = x.id;
                     break :blk try std.fmt.allocPrint(alloc, "docref: {s}", .{x.doc_id});
+                },
+                .undocref => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "docref: -{s}", .{x.doc_id});
                 },
                 .setDocPath => |x| blk: {
                     ts = x.ts;

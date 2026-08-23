@@ -334,6 +334,11 @@ stable on every later round trip. Two refusals guard the flag rather than guessi
 **stdin empty** both abort with a message and leave the body untouched, because an empty read is far more
 often a pipe whose upstream never ran than an intent to blank a body — `--body ""` still says that
 explicitly. `add` takes the same flag for symmetry (an agent that learns it on `edit` will try it on `add`).
+*Superseded in spelling only* (2026-08-23, see the direction-naming ruling below): on `edit` the flag is now
+`--replace-body`/`--append-body`, and the round trip reads `trk show <id> --body | trk edit <id>
+--replace-body -`. Every semantic above — the one-newline trim, both refusals, `-` meaning stdin — is
+unchanged and applies to both. `add --body` and `show --body` keep their spelling: creation has nothing to
+replace and `show`'s is a READ flag, so neither is a two-direction mutation.
 
 **`trk init` scaffolds a fresh tracker, and is non-destructive by construction.** The storage is lazily
 auto-created on first write, but the *conventions* (a `config.json`, a `TODO.md` with the generated header)
@@ -669,3 +674,63 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   - *Rejected: status quo (hard-fail) + an explicit flag-day process.* Solves nothing for the single-user,
     continuously-updated case this incident actually was — the flag-day discipline is exactly the thing that
     was skipped under real work pressure, which is how the incident happened in the first place.
+
+- **Every mutation names its direction; the destructive one is unspellable by accident** (2026-08-23, tasks
+  `01M0QJ8K4`, `01M0QK1C4`, `01M0QKHWQ`). Three verbs escaped a rule the tool had already adopted four times
+  (`--add-tag`/`--rm-tag`, `dep`/`undep`, `in`/`unin`, `doc set`/`doc unset`): a mutation with two directions
+  must make the caller name the one it wants.
+  - **`--body` REMOVED, replaced by `--replace-body` and `--append-body`.** It was the one flag that implied a
+    direction, and it implied the destructive one. Six body losses over seven weeks traced to the same root
+    cause: with no append verb, "add a note to this task" was a hand-built read-modify-write performed by the
+    CALLER. That is the wrong place for it, and not merely inconvenient — **only trk can read its own body
+    correctly.** The current body is the fold of `snapshot.jsonl` and `log.jsonl`'s `setBody` events, so a body
+    last written before the newest `compact` lives in the snapshot and NOWHERE else; a helper scanning only the
+    log sees an empty body and truncates the task. `--append-body` deletes the reconstruction step entirely.
+  - *Removed, not deprecated,* and this is the load-bearing half. An honor-with-a-warning deprecation performs
+    the replace anyway: the warning scrolls past in an agent's tool output and the body is gone regardless,
+    preserving the exact failure mode for every existing caller. A hard parser error converts each wrong call
+    site into a loud, one-time fix. Contrast the `--add-tag arc:<slug>` deprecation, which is correctly
+    honor-with-warning *because its legacy behaviour is harmless* — the tag still lands, just via the old
+    spelling. Honoring the old spelling IS the bug here; that is what makes the instrument different.
+  - **The byte-identical-write warning is scoped to `--replace-body` only.** A replace that writes the same
+    bytes "succeeded" while adding nothing (2026-08-21: a task read as investigated twice while holding one
+    pass of content, because each pass silently overwrote the last). An append that happens to produce no
+    change is a different and far less interesting event; warning there would be noise.
+  - **`--rm-doc` pairs `--add-doc`.** A typo'd doc-ref was permanent short of hand-editing `.tracker/` — the
+    one operation every consuming runbook forbids. The new `undocref` op mirrors `untag`'s fold shape (a plain
+    list removal, no tombstone map) rather than `undep`/`unin`'s: a docref is a per-TASK attribute, and under
+    the disjoint-writer rule two lanes never edit the same task, so only a single lane's own append order
+    matters — which a union merge preserves within each side. An EDGE needs the tombstone map precisely because
+    it can be authored from either endpoint and so genuinely can be raced. Matching is by `doc_id` alone, so one
+    removal clears every section ref to that doc. *Audited while in there:* with this and the body split landed,
+    no one-directional mutation remains (`setState` is bidirectional by construction, and a scalar like `title`
+    has only one meaningful direction).
+  - **`dep`/`undep` take `<needer> --needs <prereq>`.** Two bare positionals of the same type could be swapped,
+    and the swap produced a VALID edge pointing the wrong way — wrong DAG, wrong ready frontier, no error. The
+    asymmetry IS the mechanism: you cannot swap two things when only one is spellable positionally. *Rejected:
+    both flagged* (`--needer`/`--prereq` — moves the confusion from position to vocabulary rather than removing
+    it), and *an infix keyword* (`trk dep A needs B` — reads best, but is undiscoverable from `--help`
+    conventions and inconsistent with trk's flag-based surface). The bare form hard-errors for the same reason
+    `--body` does. This one is honestly POLISH, not a defect: `dep --help` already named the direction and `dep`
+    already echoed the resulting sentence, which is probably WHY the repeated early reversals stopped — but
+    documentation-as-the-only-guard is exactly what the other two entries are about.
+
+- **`archive` refuses to bury a decision** (2026-08-23, task `01M0QK25Q`). A task body routinely accumulates
+  more than the work: an open fork, a "your call", a FIX NOTE, an OPEN QUESTION. The work can be genuinely
+  finished — the task is legitimately closeable — while the DECISION was never that task's scope. `archived` is
+  a tombstone hidden from every view, so archiving graduates the decision out of sight along with the work (one
+  measured loss, 2026-08-12, recovered only by accident). `archive` is the right place for the check and the
+  only one: it already walks every body it is about to graduate, it is the only actor that sees the whole done
+  queue at that moment, and it is the last actor that can act before the tombstone hides the text.
+  - **It REFUSES without `--allow-buried-decisions`, rather than warning.** Same reasoning as the `--body`
+    removal: a warning inside a bulk archive run scrolls past, and what it failed to stop is permanent. Markers
+    default to `scott-decision`, `OPEN QUESTION`, `FIX NOTE`, `your call`, `TODO`, matched case-insensitively —
+    a body written by a human or an agent will not match a configured casing reliably, so the guard must not
+    depend on shouting. `--dry-run` reports the hits without refusing, because a preview buries nothing.
+  - `archive.decision_markers` in `config.json` overrides the set. An explicitly EMPTY array disables the check
+    and is deliberately distinct from an ABSENT key (which means "use the default set") — an opt-out has to be
+    spellable, and it has to be different from saying nothing.
+  - *Not a bug in the tombstone model.* `archived` hiding from every view is correct and deliberate; this is
+    about what rides along with it. The mitigation it replaces was prose in two runbooks that fired only if the
+    operator remembered — the same shape as the three-runbook `--body` workaround, which kept failing until the
+    primitive changed.

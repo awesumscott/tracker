@@ -125,19 +125,22 @@ pub const Cli = struct {
         try self.out.appendSlice(self.gpa, s);
     }
 
-    /// Resolve a `--body` value: a literal `-` means "read the whole of stdin",
+    /// Resolve a body-flag value: a literal `-` means "read the whole of stdin",
     /// the conventional meaning everywhere else. Returns gpa-owned bytes the
     /// caller must free (the store re-dups into its arena on append), or the
-    /// argument itself borrowed unchanged — `owned` says which.
+    /// argument itself borrowed unchanged — `owned` says which. `flag` is the
+    /// spelling the caller used (`--body` on `add`, `--replace-body` /
+    /// `--append-body` on `edit`) so every diagnostic below names the flag that
+    /// was actually typed.
     ///
     /// Exactly ONE trailing newline is trimmed, because `trk show <id> --body`
     /// adds one when the body lacks it: `trk show <id> --body | trk edit <id>
-    /// --body -` is then byte-stable, and stable on every later round trip.
-    fn bodyArg(self: *Cli, arg: []const u8) Error!struct { text: []const u8, owned: bool } {
+    /// --replace-body -` is then byte-stable, and stable on every later round trip.
+    fn bodyArg(self: *Cli, flag: []const u8, arg: []const u8) Error!struct { text: []const u8, owned: bool } {
         if (!std.mem.eql(u8, arg, "-")) return .{ .text = arg, .owned = false };
         const f = self.stdin orelse {
-            try self.write("trk: --body -: no stdin to read (pipe one in, e.g. " ++
-                "`trk show <id> --body | trk edit <id> --body -`)\n");
+            try self.print("trk: {s} -: no stdin to read (pipe one in, e.g. " ++
+                "`trk show <id> --body | trk edit <id> --replace-body -`)\n", .{flag});
             return error.UsageError;
         };
         var buf: std.ArrayList(u8) = .empty;
@@ -147,7 +150,7 @@ pub const Cli = struct {
             const n = f.readStreaming(self.io, &.{&chunk}) catch |e| switch (e) {
                 error.EndOfStream => break,
                 else => {
-                    try self.write("trk: --body -: could not read stdin\n");
+                    try self.print("trk: {s} -: could not read stdin\n", .{flag});
                     return error.UsageError;
                 },
             };
@@ -155,15 +158,15 @@ pub const Cli = struct {
             try buf.appendSlice(self.gpa, chunk[0..n]);
         }
         // Nothing on stdin is refused, not applied. Clearing a body is a real
-        // operation, but `--body ""` already says so explicitly; an EMPTY read
-        // here is far more often a pipe that never ran (a failed upstream
+        // operation, but `--replace-body ""` already says so explicitly; an EMPTY
+        // read here is far more often a pipe that never ran (a failed upstream
         // command, a forgotten redirect), and applying it would wipe the body
         // exactly the way this flag's old literal-"-" behavior did.
         if (buf.items.len == 0) {
             // No explicit deinit — the `errdefer` above frees `buf` on this
             // return path (doing both is a double free).
-            try self.write("trk: --body -: stdin was empty — refusing to blank the body " ++
-                "(use --body \"\" if that is what you meant)\n");
+            try self.print("trk: {s} -: stdin was empty — refusing to write an empty body " ++
+                "(use `{s} \"\"` if that is what you meant)\n", .{ flag, flag });
             return error.UsageError;
         }
         // One trailing newline (CRLF-aware), not all of them: a body may
@@ -337,10 +340,13 @@ pub const Cli = struct {
         \\        trk add "Ship v2" --arc
         },
         .{ .name = "dep", .text =
-        \\trk dep <needer> <prereq>
-        \\  Make <needer> require prerequisite <prereq> (a `needs` edge). Arg order
-        \\  is needer-THEN-prereq; reversing wires the DAG backwards. Rejected if it
-        \\  would close a cycle. Fix a backwards edge with `trk undep`.
+        \\trk dep <needer> --needs <prereq> [--needs <prereq> ...]
+        \\  Make <needer> require prerequisite <prereq> (a `needs` edge). ONE positional,
+        \\  the prereq(s) flagged: two bare positionals of the same type could be swapped
+        \\  by accident, and the swap produced a VALID edge pointing the wrong way — wrong
+        \\  DAG, wrong ready frontier, no error. The bare `trk dep A B` form is now a hard
+        \\  usage error naming the fix. Rejected if it would close a cycle; undo with
+        \\  `trk undep <needer> --needs <prereq>`.
         \\  `dep`/`in` are NOT interchangeable: `dep` only adds DAG ordering (and, as a
         \\  side effect, reachability-membership if the prereq belongs to an arc) — it
         \\  never by itself makes anything an arc. See `trk in --help`.
@@ -348,12 +354,14 @@ pub const Cli = struct {
         \\  arc: an arc can't finish while an open member waits on it, so a member
         \\  needing its own arc is a permanent self-wait, not an ordinary cycle. A
         \\  prereq in a DIFFERENT arc — or the whole of a different arc — is unaffected.
-        \\  e.g.  trk dep 01KX6H4V 01KX6H48   (init needs config)
+        \\  e.g.  trk dep 01KX6H4V --needs 01KX6H48   (init needs config)
         },
         .{ .name = "undep", .text =
-        \\trk undep <needer> <prereq>
+        \\trk undep <needer> --needs <prereq> [--needs <prereq> ...]
         \\  Remove the <needer> needs <prereq> edge (tombstoned; a no-op if absent).
-        \\  Use to undo a `dep` wired the wrong way.
+        \\  Exact argument shape as `trk dep`, so undoing an edge is the same sentence
+        \\  with one verb changed. The bare two-positional form is a hard usage error.
+        \\  e.g.  trk undep 01KX6H4V --needs 01KX6H48
         },
         .{ .name = "in", .text =
         \\trk in <task> <arc> [--seq <n>]
@@ -512,11 +520,23 @@ pub const Cli = struct {
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
+        \\            [--allow-buried-decisions]
         \\  Graduate DONE tasks to changelog bullets (--out > config archive.out >
         \\  stdout), then flip each to `archived` so it leaves every view (structural
         \\  dedup — re-running finds nothing). A file target is APPENDED to under a
         \\  `## YYYY-MM-DD` run heading, never truncated. --dry-run previews on
         \\  stdout without flipping (and never touches the file).
+        \\  DECISION GUARD: a task body routinely holds more than the work — an open
+        \\  fork, a "your call", a FIX NOTE. The work can be finished while the DECISION
+        \\  is unresolved, and `archived` is hidden from every view, so archiving buries
+        \\  it. archive REFUSES if any closing body carries a marker, listing task id +
+        \\  matched line; split those out as their own tasks, then archive. It refuses
+        \\  rather than warning because a warning in a bulk run scrolls past and the
+        \\  burial is permanent. --allow-buried-decisions proceeds anyway; --dry-run
+        \\  reports the hits without refusing (nothing is buried by a preview).
+        \\  Markers default to: scott-decision, OPEN QUESTION, FIX NOTE, your call, TODO
+        \\  (matched case-insensitively). Override with .tracker/config.json ->
+        \\  archive.decision_markers, a JSON array of strings; [] disables the check.
         },
         .{ .name = "doc", .text =
         \\trk doc set <doc_id> <path>   register/update a doc_id -> repo-relative path
@@ -537,18 +557,34 @@ pub const Cli = struct {
         \\  shell eats ALL trailing newlines and the arg is length-capped)
         },
         .{ .name = "edit", .text =
-        \\trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...]
-        \\        [--add-doc <doc_id[#section]> ...] [--priority <n>]
-        \\  Modify an existing task in place. --body replaces the whole body;
-        \\  `--body -` reads it from STDIN instead — the write half of a safe
-        \\  round-trip: trk show <id> --body | trk edit <id> --body -
-        \\  (exactly one trailing newline is trimmed, so the round-trip is
-        \\  byte-stable; without a pipe, `--body -` refuses rather than storing "-").
+        \\trk edit <id> [--title <s>] [--replace-body <s|->] [--append-body <s|->]
+        \\        [--add-tag <t> ...] [--rm-tag <t> ...]
+        \\        [--add-doc <doc_id[#section]> ...] [--rm-doc <doc_id> ...] [--priority <n>]
+        \\  Modify an existing task in place.
+        \\  BODY EDITS NAME THEIR DIRECTION — there is no `--body`, and passing it is a
+        \\  hard error, not a warning:
+        \\    --replace-body <s>  overwrite the whole body. Warns if the new bytes are
+        \\                        IDENTICAL to the current ones (the write "succeeded"
+        \\                        while adding nothing — a real and repeated failure).
+        \\    --append-body <s>   add to the body, keeping what is there, separated by a
+        \\                        blank line. Reads the current body through trk's own
+        \\                        log+snapshot fold — the half an external
+        \\                        read-modify-write CANNOT do correctly, because a body
+        \\                        last written before the newest `compact` lives only in
+        \\                        snapshot.jsonl and a log-only helper sees it as empty.
+        \\  Either takes `-` to read from STDIN (exactly one trailing newline trimmed, so
+        \\  `trk show <id> --body | trk edit <id> --replace-body -` is byte-stable; without
+        \\  a pipe, or on empty stdin, it refuses rather than blanking the body).
+        \\  --rm-doc removes a doc-ref by doc id — the inverse of --add-doc, and the fix
+        \\  for a typo'd ref. A `#section` suffix is accepted and ignored: one --rm-doc
+        \\  clears every ref to that doc. No-op (and says so) if the ref is absent.
         \\  --priority: int, LOWER SORTS FIRST, and unset ranks 100 — `--priority 10`
         \\  raises, `--priority 500` sinks, `--priority 0` restores the default rank.
         \\  `--add-tag arc:<slug>` is a DEPRECATED way to mark an arc (still honored,
         \\  but warns) — use `trk arc <id>` instead.
-        \\  e.g.  trk edit 01KX6H --body "revised plan" --add-tag tooling
+        \\  e.g.  trk edit 01KX6H --replace-body "revised plan" --add-tag tooling
+        \\        trk edit 01KX6H --append-body "2026-08-23: reproduced on main."
+        \\        trk edit 01KX6H --rm-doc none
         },
         .{ .name = "log", .text =
         \\trk log [<id>] [--limit <n>]
@@ -593,8 +629,12 @@ pub const Cli = struct {
             \\  trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...] [--in <arc> [--seq <n>]] [--arc]
             \\                    [--needs <id> ...] [--priority <n>] [-v]   (prints the new ULID; -v = friendly)
             \\      Neither --in nor --arc -> warns to stderr (escalate via config's add.arcless).
-            \\  trk dep <from> <to>          mark <from> as needing prerequisite <to>
-            \\  trk undep <from> <to>        remove the <from> needs <to> edge (tombstone; no-op if absent)
+            \\  trk dep <needer> --needs <prereq> [--needs <prereq> ...]
+            \\      mark <needer> as needing prerequisite <prereq>. ONE positional, prereqs
+            \\      flagged — two bare positionals could be swapped, and the swap wired a
+            \\      valid edge backwards with no error. `trk dep A B` is now a usage error.
+            \\  trk undep <needer> --needs <prereq> [--needs <prereq> ...]
+            \\      remove the edge (tombstone; no-op if absent). Same shape as `dep`.
             \\  trk in <task> <arc> [--seq <n>]   add task to an arc, task FIRST (NOT the same order as
             \\      `dep`'s arc-needs-task phrasing — see `trk in --help`)
             \\  trk unin <task> <arc>         remove the <task> in <arc> edge (tombstone; no-op if absent;
@@ -620,16 +660,27 @@ pub const Cli = struct {
             \\      Header reports an arc-less drift count every regeneration.
             \\  trk tree <arc-or-task>       the ASCII prereq hierarchy
             \\  trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
+            \\              [--allow-buried-decisions]
             \\      Graduate DONE tasks to the changelog: emit them as markdown bullets
             \\      (appended to --out/config target under a dated heading, else stdout),
             \\      then flip each to `archived` so it leaves every view (structural
             \\      dedup). --dry-run previews on stdout without archiving.
+            \\      REFUSES if a closing body carries a decision marker (scott-decision,
+            \\      OPEN QUESTION, FIX NOTE, your call, TODO — configurable via config's
+            \\      archive.decision_markers): `archived` is hidden from every view, so an
+            \\      unresolved fork in a finished task's body would be buried with it.
+            \\      --allow-buried-decisions overrides; --dry-run reports without refusing.
             \\  trk compact [--force]        rewrite snapshot + truncate log (drops archived/dropped)
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
             \\  trk doc list                 print all registered doc_id -> path mappings
             \\  trk doc resolve <doc_id>     print the path for a doc_id
             \\  trk show <id>                full task detail
-            \\  trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...] [--add-doc <doc_id[#section]> ...] [--priority <n>]
+            \\  trk edit <id> [--title <s>] [--replace-body <s|->] [--append-body <s|->]
+            \\                [--add-tag <t> ...] [--rm-tag <t> ...]
+            \\                [--add-doc <doc_id[#section]> ...] [--rm-doc <doc_id> ...] [--priority <n>]
+            \\      A body edit must NAME its direction; there is no `--body` (hard error).
+            \\      --append-body reads the current body through trk's own log+snapshot fold,
+            \\      which an external read-modify-write cannot do correctly.
             \\  trk log [<id>] [--limit <n>] event history (most-recent-last)
             \\  trk stale                    open tasks cited in a landed commit but never closed
             \\
@@ -996,7 +1047,7 @@ pub const Cli = struct {
         while (i < args.len) : (i += 1) {
             const arg = args[i];
             if (std.mem.eql(u8, arg, "--body")) {
-                const b = try self.bodyArg(try self.flagVal(args, &i, "--body"));
+                const b = try self.bodyArg("--body", try self.flagVal(args, &i, "--body"));
                 body = b.text;
                 body_owned = b.owned;
             } else if (std.mem.eql(u8, arg, "--tag")) {
@@ -1092,13 +1143,63 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- dep
 
+    /// `trk dep <id> --needs <id> [--needs <id> ...]`
+    ///
+    /// ONE positional, the rest flagged. The asymmetry IS the guard: two bare
+    /// positionals of the same type can be swapped by accident, and the swap
+    /// produces a VALID edge pointing the wrong way — wrong DAG, wrong ready
+    /// frontier, no error (task 01M0QKHWQ). You cannot swap two things when
+    /// only one of them is spellable positionally.
     fn cmdDep(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 2) {
-            try self.write("trk: usage: trk dep <from> <to>\n");
-            return error.UsageError;
+        const p = try self.parseNeedsArgs("dep", args);
+        defer self.gpa.free(p.prereqs);
+        const from = p.needer;
+        for (p.prereqs) |to| try self.depOne(from, to);
+    }
+
+    /// The direction-explicit argument shape shared by `dep` and `undep`:
+    /// `<needer> --needs <prereq> [--needs <prereq> ...]`. Repeats are allowed
+    /// for the same reason `trk add --needs` allows them — wiring several
+    /// prerequisites is one thought, not N commands.
+    fn parseNeedsArgs(
+        self: *Cli,
+        verb: []const u8,
+        args: []const []const u8,
+    ) Error!struct { needer: Ulid, prereqs: []Ulid } {
+        if (args.len == 0) {
+            try self.print("trk: usage: trk {s} <id> --needs <id>\n", .{verb});
+            return error.MissingArgument;
         }
-        const from = try self.resolve(args[0]);
-        const to = try self.resolve(args[1]);
+        var prereqs: std.ArrayList(Ulid) = .empty;
+        errdefer prereqs.deinit(self.gpa);
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--needs")) {
+                try prereqs.append(self.gpa, try self.resolve(try self.flagVal(args, &i, "--needs")));
+            } else if (std.mem.startsWith(u8, arg, "--")) {
+                try self.print("trk: unknown flag '{s}'\n", .{arg});
+                return error.UnknownFlag;
+            } else {
+                // The legacy `trk <verb> A B` form. Hard-errored, not accepted:
+                // tolerating it would keep the exact footgun this shape exists
+                // to close, and the fix is one word long.
+                try self.print(
+                    "trk: `trk {s} {s} {s}` — the two-positional form was REMOVED because the argument " ++
+                        "order silently inverted the edge.\n       Name the direction: trk {s} {s} --needs {s}\n",
+                    .{ verb, args[0], arg, verb, args[0], arg },
+                );
+                return error.UsageError;
+            }
+        }
+        if (prereqs.items.len == 0) {
+            try self.print("trk: {s} needs a --needs <id> (trk {s} {s} --needs <id>)\n", .{ verb, verb, args[0] });
+            return error.MissingArgument;
+        }
+        return .{ .needer = try self.resolve(args[0]), .prereqs = try prereqs.toOwnedSlice(self.gpa) };
+    }
+
+    fn depOne(self: *Cli, from: Ulid, to: Ulid) Error!void {
         var fb: [ulid.len]u8 = undefined;
         var tb: [ulid.len]u8 = undefined;
         self.store.append(.{ .dep = .{ .from = from, .to = to } }) catch |e| {
@@ -1124,17 +1225,17 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- undep
 
+    /// `trk undep <id> --needs <id>` — same argument shape as `dep`, so undoing
+    /// an edge is the same sentence with one verb changed.
     fn cmdUndep(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 2) {
-            try self.write("trk: usage: trk undep <from> <to>\n");
-            return error.UsageError;
-        }
-        const from = try self.resolve(args[0]);
-        const to = try self.resolve(args[1]);
-        try self.store.append(.{ .undep = .{ .from = from, .to = to } });
+        const p = try self.parseNeedsArgs("undep", args);
+        defer self.gpa.free(p.prereqs);
         var fb: [ulid.len]u8 = undefined;
         var tb: [ulid.len]u8 = undefined;
-        try self.print("{s} no longer needs {s}\n", .{ try self.shortId(from, &fb), try self.shortId(to, &tb) });
+        for (p.prereqs) |to| {
+            try self.store.append(.{ .undep = .{ .from = p.needer, .to = to } });
+            try self.print("{s} no longer needs {s}\n", .{ try self.shortId(p.needer, &fb), try self.shortId(to, &tb) });
+        }
     }
 
     // ----------------------------------------------------------- in
@@ -1588,6 +1689,7 @@ pub const Cli = struct {
     fn cmdArchive(self: *Cli, args: []const []const u8) Error!void {
         var out_path: ?[]const u8 = null;
         var dry_run = false;
+        var allow_buried = false;
         var arc_filter: ?[]const u8 = null;
         var tag_filter: ?[]const u8 = null;
         var words: std.ArrayList([]const u8) = .empty;
@@ -1598,6 +1700,8 @@ pub const Cli = struct {
                 out_path = try self.flagVal(args, &i, "--out");
             } else if (std.mem.eql(u8, args[i], "--dry-run")) {
                 dry_run = true;
+            } else if (std.mem.eql(u8, args[i], "--allow-buried-decisions")) {
+                allow_buried = true;
             } else if (std.mem.eql(u8, args[i], "--arc")) {
                 arc_filter = try self.flagVal(args, &i, "--arc");
             } else if (std.mem.eql(u8, args[i], "--tag")) {
@@ -1633,6 +1737,15 @@ pub const Cli = struct {
         if (matched.items.len == 0) {
             try self.write("(no done tasks to archive)\n");
             return;
+        }
+
+        // Decision guard. `archive` is the LAST actor that can see these bodies:
+        // one line later every matched task is `archived`, which is hidden from
+        // every view. It is also the only actor that sees the whole done queue at
+        // that moment. So the check belongs here and nowhere else.
+        const guard_mode: BuriedMode = if (dry_run) .preview else if (allow_buried) .override else .refuse;
+        if (try self.reportBuriedDecisions(matched.items, guard_mode) and guard_mode == .refuse) {
+            return error.UsageError;
         }
 
         // Build the changelog-bullet draft.
@@ -1673,6 +1786,88 @@ pub const Cli = struct {
                 try self.print("archived {d} task(s); appended -> {s}\n", .{ matched.items.len, p });
             }
         }
+    }
+
+    /// What the archive run intends to do about a decision-marker hit. Only the
+    /// wording changes here; the caller enforces `.refuse`.
+    const BuriedMode = enum {
+        /// A real run with no override: hits are fatal.
+        refuse,
+        /// `--dry-run` — nothing is buried by a preview, so hits are information.
+        preview,
+        /// `--allow-buried-decisions` — the operator saw them and chose to proceed.
+        override,
+    };
+
+    /// Scan each closing body for decision markers and report every hit as
+    /// `<short-id>  <marker>  <line>`. Returns true iff anything matched.
+    ///
+    /// A real run REFUSES rather than warning, on the same reasoning that ruled
+    /// hard-removal over deprecation for `--body`: a warning inside a bulk
+    /// archive run scrolls past in an agent's tool output, and the thing it
+    /// failed to stop is a permanent burial.
+    fn reportBuriedDecisions(self: *Cli, ids: []const Ulid, mode: BuriedMode) Error!bool {
+        const markers = self.store.config.decision_markers orelse
+            tracker.store.default_decision_markers;
+        if (markers.len == 0) return false; // explicitly disabled via config
+
+        var hits: usize = 0;
+        for (ids) |id| {
+            const t = self.store.get(id).?;
+            if (t.body.len == 0) continue;
+            var sb: [ulid.len]u8 = undefined;
+            const sid = try self.shortId(id, &sb);
+            var lines = std.mem.splitScalar(u8, t.body, '\n');
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len == 0) continue;
+                for (markers) |m| {
+                    if (m.len == 0 or !containsIgnoreCase(line, m)) continue;
+                    if (hits == 0) {
+                        try self.warn.print(self.gpa,
+                            "trk: {s}: task bodies about to be archived carry DECISION markers. " ++
+                                "`archived` is hidden from every view, so these lines are graduated out of sight " ++
+                                "with the work:\n",
+                            .{if (mode == .refuse) "refusing" else "note"});
+                    }
+                    hits += 1;
+                    try self.warn.print(self.gpa, "  {s}  [{s}]  {s}\n", .{ sid, m, line });
+                    break; // one report per line, whichever marker hit first
+                }
+            }
+        }
+        if (hits == 0) return false;
+        if (mode == .preview) {
+            try self.warn.print(self.gpa,
+                "  ({d} line(s); a real run without --allow-buried-decisions would refuse)\n", .{hits});
+        } else if (mode == .override) {
+            try self.warn.print(self.gpa,
+                "  ({d} line(s); archiving anyway per --allow-buried-decisions — these are now hidden " ++
+                    "from every view)\n", .{hits});
+        } else {
+            try self.warn.print(self.gpa,
+                "  Split each decision out as its own task first (`trk add ...`), then archive.\n" ++
+                    "  To archive anyway: trk archive --allow-buried-decisions\n" ++
+                    "  To change what counts: .tracker/config.json -> archive.decision_markers (a JSON array; [] disables)\n",
+                .{});
+        }
+        return true;
+    }
+
+    /// ASCII case-insensitive substring search. The marker set mixes cases
+    /// (`TODO`, `your call`), and a body written by a human or an agent will not
+    /// match the configured casing reliably — matching case-sensitively would
+    /// make the guard depend on shouting.
+    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len > haystack.len) return false;
+        var i: usize = 0;
+        outer: while (i + needle.len <= haystack.len) : (i += 1) {
+            for (needle, 0..) |c, j| {
+                if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) continue :outer;
+            }
+            return true;
+        }
+        return false;
     }
 
     /// One changelog-draft bullet for a graduated task: `- <title> #tags
@@ -2657,26 +2852,41 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- edit
 
-    /// `trk edit <id> [--title <s>] [--body <s>] [--add-tag <t>] [--rm-tag <t>] [--priority <n>]`
+    /// `trk edit <id> [--title <s>] [--replace-body <s>|--append-body <s>]
+    /// [--add-tag <t>] [--rm-tag <t>] [--add-doc <d>] [--rm-doc <d>] [--priority <n>]`
+    ///
+    /// There is deliberately NO `--body`. A body edit has two directions and
+    /// the tool's other paired mutations (`--add-tag`/`--rm-tag`,
+    /// `--add-doc`/`--rm-doc`, `dep`/`undep`) all REFUSE a default, so the
+    /// caller names the direction. `--body` was the one flag that implied one,
+    /// and it implied the DESTRUCTIVE one — it is removed rather than
+    /// deprecated, because an honored-with-a-warning replace still destroys the
+    /// body while the warning scrolls past in an agent's tool output (task
+    /// 01M0QJ8K4, six measured body losses).
     fn cmdEdit(self: *Cli, args: []const []const u8) Error!void {
         if (args.len == 0) {
-            try self.write("trk: usage: trk edit <id> [--title <s>] [--body <s>] [--add-tag <t> ...] [--rm-tag <t> ...] [--priority <n>]\n");
+            try self.write("trk: usage: trk edit <id> [--title <s>] [--replace-body <s>|--append-body <s>]\n" ++
+                "            [--add-tag <t> ...] [--rm-tag <t> ...] [--add-doc <d> ...] [--rm-doc <d> ...] [--priority <n>]\n");
             return error.MissingArgument;
         }
         const id = try self.resolve(args[0]);
 
         var new_title: ?[]const u8 = null;
-        var new_body: ?[]const u8 = null;
+        var body_text: ?[]const u8 = null;
+        var body_append = false;
+        var body_flag: []const u8 = "";
         var priority: ?i32 = null;
-        // Set when `--body -` read stdin into a fresh allocation (see bodyArg).
+        // Set when the body flag's `-` read stdin into a fresh allocation (see bodyArg).
         var body_owned = false;
-        defer if (body_owned) self.gpa.free(new_body.?);
+        defer if (body_owned) self.gpa.free(body_text.?);
         var add_tags: std.ArrayList([]const u8) = .empty;
         defer add_tags.deinit(self.gpa);
         var rm_tags: std.ArrayList([]const u8) = .empty;
         defer rm_tags.deinit(self.gpa);
         var add_docs: std.ArrayList([]const u8) = .empty;
         defer add_docs.deinit(self.gpa);
+        var rm_docs: std.ArrayList([]const u8) = .empty;
+        defer rm_docs.deinit(self.gpa);
 
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
@@ -2684,11 +2894,27 @@ pub const Cli = struct {
             if (std.mem.eql(u8, arg, "--title")) {
                 new_title = try self.flagVal(args, &i, "--title");
             } else if (std.mem.eql(u8, arg, "--body")) {
-                const b = try self.bodyArg(try self.flagVal(args, &i, "--body"));
-                new_body = b.text;
+                // Removed, not deprecated: a hard parser error naming both
+                // replacements is the only migration that repairs a call site
+                // instead of annotating it.
+                try self.write("trk: --body was REMOVED — a body edit must name its direction:\n" ++
+                    "       --replace-body <s|->   overwrite the whole body (what --body used to do)\n" ++
+                    "       --append-body  <s|->   add to it, keeping what is there\n");
+                return error.UnknownFlag;
+            } else if (std.mem.eql(u8, arg, "--replace-body") or std.mem.eql(u8, arg, "--append-body")) {
+                if (body_text != null) {
+                    try self.print("trk: {s} and {s}: pick one direction per edit\n", .{ body_flag, arg });
+                    return error.UsageError;
+                }
+                body_flag = arg;
+                body_append = std.mem.eql(u8, arg, "--append-body");
+                const b = try self.bodyArg(arg, try self.flagVal(args, &i, arg));
+                body_text = b.text;
                 body_owned = b.owned;
             } else if (std.mem.eql(u8, arg, "--add-doc")) {
                 try add_docs.append(self.gpa, try self.flagVal(args, &i, "--add-doc"));
+            } else if (std.mem.eql(u8, arg, "--rm-doc")) {
+                try rm_docs.append(self.gpa, try self.flagVal(args, &i, "--rm-doc"));
             } else if (std.mem.eql(u8, arg, "--add-tag")) {
                 try add_tags.append(self.gpa, try self.flagVal(args, &i, "--add-tag"));
             } else if (std.mem.eql(u8, arg, "--rm-tag")) {
@@ -2702,10 +2928,12 @@ pub const Cli = struct {
         }
 
         // At least one flag required.
-        if (new_title == null and new_body == null and priority == null and
-            add_tags.items.len == 0 and rm_tags.items.len == 0 and add_docs.items.len == 0)
+        if (new_title == null and body_text == null and priority == null and
+            add_tags.items.len == 0 and rm_tags.items.len == 0 and
+            add_docs.items.len == 0 and rm_docs.items.len == 0)
         {
-            try self.write("trk: edit needs at least one flag (--title / --body / --add-tag / --rm-tag / --add-doc / --priority)\n");
+            try self.write("trk: edit needs at least one flag (--title / --replace-body / --append-body / " ++
+                "--add-tag / --rm-tag / --add-doc / --rm-doc / --priority)\n");
             return error.UsageError;
         }
 
@@ -2716,10 +2944,7 @@ pub const Cli = struct {
             try self.store.append(.{ .setTitle = .{ .id = id, .title = nt } });
             try self.print("{s}: title -> {s}\n", .{ sid, nt });
         }
-        if (new_body) |nb| {
-            try self.store.append(.{ .setBody = .{ .id = id, .body = nb } });
-            try self.print("{s}: body updated\n", .{sid});
-        }
+        if (body_text) |nb| try self.applyBodyEdit(id, sid, nb, body_append);
         for (add_tags.items) |tg| {
             try self.store.append(.{ .tag = .{ .id = id, .tag = tg } });
             try self.print("{s}: +#{s}\n", .{ sid, tg });
@@ -2738,6 +2963,79 @@ pub const Cli = struct {
             try self.store.append(.{ .docref = .{ .id = id, .doc_id = ref.doc_id, .section_id = ref.section_id } });
             try self.print("{s}: +doc {s}\n", .{ sid, d });
         }
+        for (rm_docs.items) |d| {
+            // A `#section` suffix is accepted and IGNORED, so the flag round-trips
+            // whatever `--add-doc` was given: one undocref clears every section
+            // ref to that doc (see model.Op.undocref). Reported by doc id so the
+            // output never claims a narrower removal than happened.
+            const ref = splitDocRef(d);
+            const had = self.taskHasDocRef(id, ref.doc_id);
+            try self.store.append(.{ .undocref = .{ .id = id, .doc_id = ref.doc_id } });
+            if (had) {
+                try self.print("{s}: -doc {s}\n", .{ sid, ref.doc_id });
+            } else {
+                // Idempotent like --rm-tag, but say so: a silent success on a
+                // typo'd doc id reads as "removed" when nothing was.
+                try self.print("{s}: -doc {s} (no such ref; no-op)\n", .{ sid, ref.doc_id });
+            }
+        }
+    }
+
+    /// True iff `id` currently carries any docref to `doc_id` (section or not).
+    fn taskHasDocRef(self: *Cli, id: Ulid, doc_id: []const u8) bool {
+        const t = self.store.get(id) orelse return false;
+        for (t.docrefs.items) |dr| {
+            if (std.mem.eql(u8, dr.doc_id, doc_id)) return true;
+        }
+        return false;
+    }
+
+    /// Write a body edit, replace or append. The APPEND half is the reason this
+    /// lives in trk at all: the current body is the fold of `snapshot.jsonl` and
+    /// every `setBody` in `log.jsonl`, so a body last written before the most
+    /// recent `compact` lives ONLY in the snapshot. An external read-modify-write
+    /// helper that scans just the log sees an empty body and truncates the task
+    /// (task 01M0QJ8K4 — measured, twice in one session). Only the tool can read
+    /// its own state correctly.
+    fn applyBodyEdit(self: *Cli, id: Ulid, sid: []const u8, text: []const u8, append: bool) Error!void {
+        const current = if (self.store.get(id)) |t| t.body else "";
+
+        if (!append) {
+            // Byte-identical REPLACE warning, deliberately scoped to this
+            // direction only. The 2026-08-21 case was a hand-built "append"
+            // that overwrote with the same bytes: the write succeeded, added
+            // nothing, and the silence let the task be re-worked twice. An
+            // append that happens to be a no-op is a different, far less
+            // interesting event, so warning there would be noise.
+            if (std.mem.eql(u8, current, text)) {
+                try self.warn.print(
+                    self.gpa,
+                    "trk: warning: {s}: --replace-body wrote a BYTE-IDENTICAL body — nothing changed. " ++
+                        "If you meant to add to it, use --append-body.\n",
+                    .{sid},
+                );
+            }
+            try self.store.append(.{ .setBody = .{ .id = id, .body = text } });
+            try self.print("{s}: body replaced ({d} bytes)\n", .{ sid, text.len });
+            return;
+        }
+
+        // Append: blank line between the old body and the new text, so an
+        // accumulated diagnosis trail stays readable as distinct entries. No
+        // separator when there is nothing to separate from.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        if (current.len > 0) {
+            try buf.appendSlice(self.gpa, current);
+            // Exactly one blank line, whatever trailing newlines the body has.
+            var end = buf.items.len;
+            while (end > 0 and buf.items[end - 1] == '\n') end -= 1;
+            buf.shrinkRetainingCapacity(end);
+            try buf.appendSlice(self.gpa, "\n\n");
+        }
+        try buf.appendSlice(self.gpa, text);
+        try self.store.append(.{ .setBody = .{ .id = id, .body = buf.items } });
+        try self.print("{s}: body appended (+{d} bytes, now {d})\n", .{ sid, text.len, buf.items.len });
     }
 
     // ----------------------------------------------------------- log

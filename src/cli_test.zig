@@ -223,8 +223,8 @@ test "read_only refuses every mutating verb cleanly and mutates nothing" {
     const cases = [_][]const []const u8{
         &.{ "init", "--force" },
         &.{ "add", "T" },
-        &.{ "dep", &a.text, &a.text },
-        &.{ "undep", &a.text, &a.text },
+        &.{ "dep", &a.text, "--needs", &a.text },
+        &.{ "undep", &a.text, "--needs", &a.text },
         &.{ "in", &a.text, &a.text },
         &.{ "unin", &a.text, &a.text },
         &.{ "arc", &a.text },
@@ -1010,8 +1010,8 @@ test "next prints ready tasks; dep cycle rejected cleanly" {
     try testing.expect(std.mem.indexOf(u8, f.out.items, "B") != null);
 
     // dep a->b, then b->a closes a cycle -> clean DependencyCycle.
-    try f.run(&.{ "dep", &a.text, &b.text });
-    const e = f.runExpectErr(&.{ "dep", &b.text, &a.text });
+    try f.run(&.{ "dep", &a.text, "--needs", &b.text });
+    const e = f.runExpectErr(&.{ "dep", &b.text, "--needs", &a.text });
     try testing.expectEqual(cli.CliError.DependencyCycle, e);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "cycle") != null);
 }
@@ -1038,7 +1038,7 @@ test "dep: a task needing its own arc is rejected (self-wait, direct)" {
     try f.run(&.{ "in", &t.text, &arc.text });
 
     // t is a direct member of arc; t needing arc closes the loop.
-    const e = f.runExpectErr(&.{ "dep", &t.text, &arc.text });
+    const e = f.runExpectErr(&.{ "dep", &t.text, "--needs", &arc.text });
     try testing.expectEqual(cli.CliError.DependencyCycle, e);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "wait on itself forever") != null);
 }
@@ -1054,7 +1054,7 @@ test "in: joining an arc a task already (transitively) needs is rejected (self-w
     try f.run(&.{ "arc", &arc.text });
     // t needs the arc BEFORE ever being a member of it — fine on its own,
     // since arc isn't yet a container t belongs to.
-    try f.run(&.{ "dep", &t.text, &arc.text });
+    try f.run(&.{ "dep", &t.text, "--needs", &arc.text });
 
     // Making t a direct member NOW closes the exact same loop from the
     // other side: `dep`/`in` must be mirror-rejected, not just `dep`.
@@ -1082,12 +1082,12 @@ test "dep: a legitimate cross-arc prereq is still accepted (over-rejection guard
 
     // A task in arc X needing a task in an UNRELATED arc Y is normal
     // cross-arc ordering — must NOT be flagged as self-wait.
-    try f.run(&.{ "dep", &tx.text, &ty.text });
+    try f.run(&.{ "dep", &tx.text, "--needs", &ty.text });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "now needs") != null);
 
     // Needing the whole of arc Y wholesale is likewise normal: tx is not a
     // member of Y, so there's no loop to close.
-    try f.run(&.{ "dep", &tx.text, &arc_y.text });
+    try f.run(&.{ "dep", &tx.text, "--needs", &arc_y.text });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "now needs") != null);
 }
 
@@ -1473,7 +1473,7 @@ test "trk compact: a ghost is GC'd and reported by id, not refused" {
     try testing.expectEqual(@as(anyerror, error.UsageError), e);
 }
 
-test "trk edit --body -: reads stdin, round-trips byte-stable, never stores a literal dash" {
+test "trk edit --replace-body -: reads stdin, round-trips byte-stable, never stores a literal dash" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -1491,7 +1491,7 @@ test "trk edit --body -: reads stdin, round-trips byte-stable, never stores a li
     defer in.close(io);
     f.c.stdin = in;
 
-    try f.run(&.{ "edit", &task.text, "--body", "-" });
+    try f.run(&.{ "edit", &task.text, "--replace-body", "-" });
 
     // Exactly one trailing newline trimmed — the one `show --body` added — so
     // the body is what was piped, not a literal "-" (the old silent behavior).
@@ -1508,7 +1508,7 @@ test "trk edit --body -: reads stdin, round-trips byte-stable, never stores a li
     );
 }
 
-test "trk edit --body -: refuses an empty stdin and an unwired one, leaving the body intact" {
+test "trk edit --replace-body -: refuses an empty stdin and an unwired one, leaving the body intact" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -1518,7 +1518,7 @@ test "trk edit --body -: refuses an empty stdin and an unwired one, leaving the 
 
     // No stdin wired at all: refuse rather than store "-".
     {
-        const e = f.runExpectErr(&.{ "edit", &task.text, "--body", "-" });
+        const e = f.runExpectErr(&.{ "edit", &task.text, "--replace-body", "-" });
         try testing.expectEqual(@as(anyerror, error.UsageError), e);
         try testing.expect(std.mem.indexOf(u8, f.out.items, "no stdin to read") != null);
         try testing.expectEqualStrings("precious body", f.store.get(task).?.body);
@@ -1532,14 +1532,14 @@ test "trk edit --body -: refuses an empty stdin and an unwired one, leaving the 
         defer in.close(io);
         f.c.stdin = in;
 
-        const e = f.runExpectErr(&.{ "edit", &task.text, "--body", "-" });
+        const e = f.runExpectErr(&.{ "edit", &task.text, "--replace-body", "-" });
         try testing.expectEqual(@as(anyerror, error.UsageError), e);
         try testing.expect(std.mem.indexOf(u8, f.out.items, "stdin was empty") != null);
         try testing.expectEqualStrings("precious body", f.store.get(task).?.body);
     }
 
-    // `--body ""` remains the explicit way to clear it.
-    try f.run(&.{ "edit", &task.text, "--body", "" });
+    // `--replace-body ""` remains the explicit way to clear it.
+    try f.run(&.{ "edit", &task.text, "--replace-body", "" });
     try testing.expectEqualStrings("", f.store.get(task).?.body);
 }
 
@@ -1569,7 +1569,7 @@ test "trk edit: title/body/add-tag/priority all apply; rm-tag removes" {
     try f.store.append(.{ .add = .{ .id = task, .title = "old title", .body = "old body", .tags = &.{"foo"} } });
 
     // Edit: change title, body, add tag, set priority.
-    try f.run(&.{ "edit", &task.text, "--title", "new title", "--body", "new body", "--add-tag", "bar", "--priority", "5" });
+    try f.run(&.{ "edit", &task.text, "--title", "new title", "--replace-body", "new body", "--add-tag", "bar", "--priority", "5" });
 
     const t = f.store.get(task).?;
     try testing.expectEqualStrings("new title", t.title);
@@ -2050,7 +2050,7 @@ test "undep: removes an existing needs edge" {
     try testing.expect(found);
 
     // undep removes it.
-    try f.run(&.{ "undep", &a.text, &b.text });
+    try f.run(&.{ "undep", &a.text, "--needs", &b.text });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "no longer needs") != null);
 
     var still = false;
@@ -2117,7 +2117,7 @@ test "undep: no-op on a non-existent edge" {
     try f.store.append(.{ .add = .{ .id = a, .title = "A" } });
     try f.store.append(.{ .add = .{ .id = b, .title = "B" } });
     // No dep edge — undep is a no-op, must not error.
-    try f.run(&.{ "undep", &a.text, &b.text });
+    try f.run(&.{ "undep", &a.text, "--needs", &b.text });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "no longer needs") != null);
     try testing.expectEqual(@as(usize, 0), f.store.needs.items.len);
 }
@@ -2303,7 +2303,7 @@ test "show --body prints the raw body verbatim: no header, no indent" {
 
     // The round-trip is lossless: `$(trk show <id> --body)` strips the trailing
     // newline, and re-editing with that value leaves the body unchanged.
-    try f.run(&.{ "edit", &id.text, "--body", body });
+    try f.run(&.{ "edit", &id.text, "--replace-body", body });
     try f.run(&.{ "show", &id.text, "--body" });
     try testing.expectEqualStrings("line one\n  already indented\n\nlast\n", f.out.items);
 }
@@ -2701,4 +2701,325 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
         i = pos + needle.len;
     }
     return n;
+}
+
+// --------------------------------------------- body edits name their direction (01M0QJ8K4)
+
+test "edit --body is REMOVED: a hard error naming both replacements, body untouched" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t", .body = "precious" } });
+
+    // Removal, not deprecation: honoring it with a warning would still destroy
+    // the body while the warning scrolls past in an agent's tool output.
+    const e = f.runExpectErr(&.{ "edit", &t.text, "--body", "clobber" });
+    try testing.expectEqual(@as(anyerror, error.UnknownFlag), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "--replace-body") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "--append-body") != null);
+    try testing.expectEqualStrings("precious", f.store.get(t).?.body);
+}
+
+test "edit --append-body: appends after a blank line, and never separates from an empty body" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const empty = mintId();
+    try f.store.append(.{ .add = .{ .id = empty, .title = "e", .body = "" } });
+    try f.run(&.{ "edit", &empty.text, "--append-body", "first note" });
+    // No leading separator when there was nothing to separate from.
+    try testing.expectEqualStrings("first note", f.store.get(empty).?.body);
+
+    // Second append gets exactly one blank line between entries.
+    try f.run(&.{ "edit", &empty.text, "--append-body", "second note" });
+    try testing.expectEqualStrings("first note\n\nsecond note", f.store.get(empty).?.body);
+
+    // Trailing newlines on the existing body are normalized to exactly one
+    // blank line, not stacked on top of the separator.
+    const messy = mintId();
+    try f.store.append(.{ .add = .{ .id = messy, .title = "m", .body = "line\n\n\n" } });
+    try f.run(&.{ "edit", &messy.text, "--append-body", "added" });
+    try testing.expectEqualStrings("line\n\nadded", f.store.get(messy).?.body);
+}
+
+test "edit --append-body reads a body that lives ONLY in the snapshot (the truncation this verb exists to stop)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t", .body = "original diagnosis" } });
+    try f.store.append(.{ .setState = .{ .id = t, .state = .open } });
+
+    // Compact moves the body into snapshot.jsonl and TRUNCATES the log. An
+    // external helper scanning only log.jsonl for the last setBody now sees
+    // NOTHING and reports "0 existing chars" — which is exactly how a
+    // hand-built read-modify-write destroyed two real task bodies.
+    try f.run(&.{"compact"});
+    const log = try f.tmp.dir.readFileAlloc(io, ".tracker/log.jsonl", alloc, .unlimited);
+    defer alloc.free(log);
+    try testing.expect(std.mem.indexOf(u8, log, "original diagnosis") == null);
+
+    // trk reads its own fold, so the append keeps the pre-compact text.
+    try f.run(&.{ "edit", &t.text, "--append-body", "2026-08-23: reproduced" });
+    try testing.expectEqualStrings(
+        "original diagnosis\n\n2026-08-23: reproduced",
+        f.store.get(t).?.body,
+    );
+
+    // And it survives an on-disk reopen, so the merged text is what was written.
+    var reopened = Store.open(alloc, io, f.tmp.dir);
+    defer reopened.deinit();
+    try reopened.load();
+    try testing.expectEqualStrings(
+        "original diagnosis\n\n2026-08-23: reproduced",
+        reopened.get(t).?.body,
+    );
+}
+
+test "edit --replace-body warns on a byte-identical write; --append-body never does" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t", .body = "same text" } });
+
+    // The 2026-08-21 case: the write "succeeds" and adds nothing, and the
+    // silence is what let the task be re-worked twice.
+    try f.run(&.{ "edit", &t.text, "--replace-body", "same text" });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "BYTE-IDENTICAL") != null);
+
+    // A genuine change is silent.
+    try f.run(&.{ "edit", &t.text, "--replace-body", "different text" });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "BYTE-IDENTICAL") == null);
+
+    // Scoped to --replace-body ONLY: an append that produces no change is a
+    // different and far less interesting event, so warning there is noise.
+    try f.run(&.{ "edit", &t.text, "--append-body", "" });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "BYTE-IDENTICAL") == null);
+}
+
+test "edit: --replace-body and --append-body together is a usage error" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t", .body = "orig" } });
+
+    const e = f.runExpectErr(&.{ "edit", &t.text, "--replace-body", "a", "--append-body", "b" });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expectEqualStrings("orig", f.store.get(t).?.body);
+}
+
+// --------------------------------------------- --rm-doc, the missing inverse (01M0QK1C4)
+
+test "edit --rm-doc: removes a doc-ref, clears every section ref, and says so when absent" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t" } });
+
+    // The originating symptom: a typo'd doc id was permanent short of hand
+    // editing .tracker/, which every consuming runbook forbids.
+    try f.run(&.{ "edit", &t.text, "--add-doc", "design", "--add-doc", "none" });
+    try testing.expectEqual(@as(usize, 2), f.store.get(t).?.docrefs.items.len);
+
+    try f.run(&.{ "edit", &t.text, "--rm-doc", "none" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "-doc none") != null);
+    const refs = f.store.get(t).?.docrefs.items;
+    try testing.expectEqual(@as(usize, 1), refs.len);
+    try testing.expectEqualStrings("design", refs[0].doc_id);
+
+    // Idempotent like --rm-tag, but never silently reports a removal that did
+    // not happen — a silent success on a typo reads as "removed" when nothing was.
+    try f.run(&.{ "edit", &t.text, "--rm-doc", "none" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "no such ref") != null);
+
+    // One --rm-doc clears every section ref to that doc; a `#section` suffix on
+    // the flag is accepted and ignored, so it round-trips an --add-doc value.
+    try f.run(&.{ "edit", &t.text, "--add-doc", "spec#one", "--add-doc", "spec#two" });
+    try testing.expectEqual(@as(usize, 3), f.store.get(t).?.docrefs.items.len);
+    try f.run(&.{ "edit", &t.text, "--rm-doc", "spec#one" });
+    const left = f.store.get(t).?.docrefs.items;
+    try testing.expectEqual(@as(usize, 1), left.len);
+    try testing.expectEqualStrings("design", left[0].doc_id);
+}
+
+test "undocref survives a reopen and a compact (it is a real event, not a display filter)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t" } });
+    try f.run(&.{ "edit", &t.text, "--add-doc", "bad" });
+    try f.run(&.{ "edit", &t.text, "--rm-doc", "bad" });
+
+    {
+        var reopened = Store.open(alloc, io, f.tmp.dir);
+        defer reopened.deinit();
+        try reopened.load();
+        try testing.expectEqual(@as(usize, 0), reopened.get(t).?.docrefs.items.len);
+    }
+
+    // compact GCs the removal for free: serializeState simply never emits a ref
+    // that is no longer there, so the tombstone costs nothing long-term.
+    try f.run(&.{"compact"});
+    var after = Store.open(alloc, io, f.tmp.dir);
+    defer after.deinit();
+    try after.load();
+    try testing.expectEqual(@as(usize, 0), after.get(t).?.docrefs.items.len);
+    const snap = try f.tmp.dir.readFileAlloc(io, ".tracker/snapshot.jsonl", alloc, .unlimited);
+    defer alloc.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "undocref") == null);
+}
+
+// --------------------------------------------- dep/undep name the direction (01M0QKHWQ)
+
+test "dep/undep: the bare two-positional form is a hard error naming the fix" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    const b = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "A" } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "B" } });
+
+    // Tolerating the legacy spelling would keep the exact footgun: two bare
+    // positionals of the same type, whose swap wires a VALID backwards edge.
+    const e = f.runExpectErr(&.{ "dep", &a.text, &b.text });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "--needs") != null);
+    try testing.expectEqual(@as(usize, 0), f.store.needs.items.len);
+
+    const e2 = f.runExpectErr(&.{ "undep", &a.text, &b.text });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e2);
+
+    // A lone positional is a usage error too, not a silent no-op.
+    const e3 = f.runExpectErr(&.{ "dep", &a.text });
+    try testing.expectEqual(@as(anyerror, error.MissingArgument), e3);
+}
+
+test "dep <id> --needs <id>: wires the edge, repeats, and undep undoes it in the same shape" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const needer = mintId();
+    const p1 = mintId();
+    const p2 = mintId();
+    for ([_]Ulid{ needer, p1, p2 }) |id|
+        try f.store.append(.{ .add = .{ .id = id, .title = "t" } });
+
+    // Repeats allowed for the same reason `trk add --needs` allows them.
+    try f.run(&.{ "dep", &needer.text, "--needs", &p1.text, "--needs", &p2.text });
+    try testing.expectEqual(@as(usize, 2), f.store.needs.items.len);
+    for (f.store.needs.items) |e| try testing.expect(e.from.eql(needer));
+
+    // Same sentence, one verb changed.
+    try f.run(&.{ "undep", &needer.text, "--needs", &p1.text });
+    try testing.expectEqual(@as(usize, 1), f.store.needs.items.len);
+    try testing.expect(f.store.needs.items[0].to.eql(p2));
+}
+
+// --------------------------------------------- archive's decision guard (01M0QK25Q)
+
+test "archive REFUSES when a closing body buries a decision, and nothing is archived" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    const b = mintId();
+    try f.store.append(.{ .add = .{
+        .id = a,
+        .title = "shipped it",
+        // The work IS done; the DECISION was never this task's scope.
+        .body = "did the work\nOPEN QUESTION: which cadence do we publish on?\n",
+    } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "clean one", .body = "just work" } });
+    try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = b, .state = .done } });
+
+    const e = f.runExpectErr(&.{"archive"});
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "OPEN QUESTION") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "--allow-buried-decisions") != null);
+
+    // It refuses the RUN, not just the offending task: nothing was buried, and
+    // no partial changelog draft was emitted.
+    try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+    try testing.expectEqual(tracker.State.done, f.store.get(b).?.state);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "- shipped it") == null);
+}
+
+test "archive: --dry-run reports markers without refusing; --allow-buried-decisions proceeds" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "shipped it", .body = "FIX NOTE: rename the flag" } });
+    try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
+
+    // A preview buries nothing, so there is nothing to refuse — it is pure
+    // information, and it still emits the ordinary draft.
+    try f.run(&.{ "archive", "--dry-run" });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "FIX NOTE") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "would refuse") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "- shipped it") != null);
+    try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+
+    // The deliberate override still reports, then archives — and says THAT,
+    // rather than the preview's "a real run would refuse" (it is the real run).
+    try f.run(&.{ "archive", "--allow-buried-decisions" });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "FIX NOTE") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "archiving anyway") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "would refuse") == null);
+    try testing.expectEqual(tracker.State.archived, f.store.get(a).?.state);
+}
+
+test "archive decision markers: case-insensitive, and archive.decision_markers overrides ([] disables)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+
+    const a = mintId();
+    // Lowercase: a body written by a human or an agent will not match the
+    // configured casing reliably, so the guard must not depend on shouting.
+    try f.store.append(.{ .add = .{ .id = a, .title = "x", .body = "leaving this as a todo for now" } });
+    try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{"archive"}));
+
+    // A narrower configured set no longer matches it.
+    try sub.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{ \"archive\": { \"decision_markers\": [\"scott-decision\"] } }",
+        .flags = .{},
+    });
+    f.store.loadConfig();
+    try f.run(&.{ "archive", "--dry-run" });
+    try testing.expectEqual(@as(usize, 0), f.warn.items.len);
+
+    // An explicitly EMPTY array disables the check — distinct from absent,
+    // which means "use the default set".
+    try sub.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{ \"archive\": { \"decision_markers\": [] } }",
+        .flags = .{},
+    });
+    f.store.loadConfig();
+    try f.run(&.{"archive"});
+    try testing.expectEqual(tracker.State.archived, f.store.get(a).?.state);
 }
