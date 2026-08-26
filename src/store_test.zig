@@ -2611,6 +2611,165 @@ test "unin: still needed for a wrong-direction `in` BETWEEN TWO ALREADY-DECLARED
     try testing.expect(contains(members, inner));
 }
 
+// ----- compact round-trip self-verify (01M0YESW6) -----
+
+test "compact: round-trip self-verify passes clean on a normal compact (it actually ran the comparison)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    const b = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = a, .title = "A", .body = "body A" } });
+    try s.append(.{ .add = .{ .id = b, .title = "B", .body = "body B" } });
+    try s.append(.{ .tag = .{ .id = a, .tag = "x" } });
+    try s.append(.{ .dep = .{ .from = b, .to = a } });
+
+    const r = try s.compact();
+    try testing.expectEqual(@as(usize, 2), r.live_tasks);
+    // The positive leg: there WAS live state to compare, and the comparison
+    // found nothing diverged — not a vacuous "nothing to check" pass.
+    try testing.expectEqual(@as(usize, 0), s.diverged_on_verify.items.len);
+
+    var check = Store.open(testing.allocator, io, tmp.dir);
+    defer check.deinit();
+    try check.load();
+    try testing.expectEqualStrings("body A", check.get(a).?.body);
+    try testing.expectEqualStrings("body B", check.get(b).?.body);
+}
+
+test "compact: a legitimate dropped/archived/ghost mix compacts clean -- no false abort" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const live = mintId();
+    const dead = mintId();
+    const grad = mintId();
+    const ghost = mintId(); // referenced but never `add`ed -> a ghost
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = live, .title = "Live" } });
+    try s.append(.{ .add = .{ .id = dead, .title = "Dead" } });
+    try s.append(.{ .add = .{ .id = grad, .title = "Graduated" } });
+    try s.append(.{ .setState = .{ .id = dead, .state = .dropped } });
+    try s.append(.{ .setState = .{ .id = grad, .state = .archived } });
+    try s.append(.{ .setBody = .{ .id = ghost, .body = "orphaned event, no add" } });
+
+    _ = try s.compact();
+    // The GC'd/ghost ids legitimately vanishing must NOT read as a divergence.
+    try testing.expectEqual(@as(usize, 0), s.diverged_on_verify.items.len);
+
+    // `compact` never purges `self.tasks` in place (it only rewrites disk),
+    // so absence is checked against a FRESH reload — the same pattern the
+    // existing "full round-trip ... and a dropped task" test above uses.
+    var check = Store.open(testing.allocator, io, tmp.dir);
+    defer check.deinit();
+    try check.load();
+    try testing.expect(check.get(live) != null);
+    try testing.expect(check.get(dead) == null);
+    try testing.expect(check.get(grad) == null);
+}
+
+test "compact: a sabotaged write is CAUGHT, restores the pre-compact files byte-for-byte, and names only the corrupted id" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const keep = mintId();
+    const hit = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try s.append(.{ .add = .{ .id = keep, .title = "Keep", .body = "keep's real body" } });
+    try s.append(.{ .add = .{ .id = hit, .title = "Hit", .body = "hit's real body" } });
+    _ = try s.compact(); // baseline: both live, snapshot written, log empty
+
+    // A real edit AFTER the baseline compact, so the restore below has
+    // genuine pre-compact log content to prove comes back byte-for-byte
+    // (not just "the log stays empty", which would be a weaker check).
+    try s.append(.{ .tag = .{ .id = keep, .tag = "extra" } });
+
+    var sub_pre = try tmp.dir.openDir(io, ".tracker", .{});
+    const pre_snapshot = try sub_pre.readFileAlloc(io, "snapshot.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(pre_snapshot);
+    const pre_log = try sub_pre.readFileAlloc(io, "log.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(pre_log);
+    sub_pre.close(io);
+    try testing.expect(pre_log.len > 0); // the tag event is really there pre-compact
+
+    // Sabotage: the write path persists a WRONG body for `hit` only; `keep`
+    // stays correct -- two tasks so the comparison must DIFFER between them,
+    // not flag everything (or nothing) uniformly.
+    s.test_sabotage_body = .{ .id = hit, .replacement = "CORRUPTED -- this must never be written" };
+
+    const result = s.compact();
+    try testing.expectError(error.CompactVerifyFailed, result);
+
+    // Names exactly the corrupted id, not the untouched one.
+    try testing.expectEqual(@as(usize, 1), s.diverged_on_verify.items.len);
+    try testing.expect(s.diverged_on_verify.items[0].eql(hit));
+
+    // The pre-compact files were restored byte-for-byte.
+    var sub_post = try tmp.dir.openDir(io, ".tracker", .{});
+    defer sub_post.close(io);
+    const post_snapshot = try sub_post.readFileAlloc(io, "snapshot.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(post_snapshot);
+    const post_log = try sub_post.readFileAlloc(io, "log.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(post_log);
+    try testing.expectEqualStrings(pre_snapshot, post_snapshot);
+    try testing.expectEqualStrings(pre_log, post_log);
+
+    // The real on-disk state, reloaded fresh, still shows `hit`'s TRUE body
+    // -- the sabotage never became visible even transiently to a reader.
+    var check = Store.open(testing.allocator, io, tmp.dir);
+    defer check.deinit();
+    try check.load();
+    try testing.expectEqualStrings("hit's real body", check.get(hit).?.body);
+    try testing.expectEqualStrings("keep's real body", check.get(keep).?.body);
+}
+
+test "compact: pre-compact backup directory retains exactly N runs and evicts oldest first" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    s.config.backup_retain = 2;
+
+    try s.append(.{ .add = .{ .id = a, .title = "A" } });
+    _ = try s.compact(); // 1st compact: `append` already persisted the add to
+    // log.jsonl, so even this FIRST compact has real pre-compact log content
+    // to back up (only `snapshot.jsonl` is genuinely absent this early).
+
+    // Three MORE compacts, each preceded by a genuinely new log line, so
+    // each one has real pre-compact content worth backing up. 1 + 3 = 4
+    // compacts total, each producing one backup run -> eviction must bring
+    // that down to exactly `backup_retain` (2).
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        var tag_buf: [16]u8 = undefined;
+        const tag_name = try std.fmt.bufPrint(&tag_buf, "round{d}", .{i});
+        try s.append(.{ .tag = .{ .id = a, .tag = tag_name } });
+        _ = try s.compact();
+    }
+
+    var sub = try tmp.dir.openDir(io, ".tracker", .{});
+    defer sub.close(io);
+    var backup_dir = try sub.openDir(io, tracker.store.backup_subdir, .{ .iterate = true });
+    defer backup_dir.close(io);
+
+    var count: usize = 0;
+    var it = backup_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .directory) count += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
+}
+
 // ----- helpers -----
 
 fn contains(haystack: []const tracker.Ulid, needle: tracker.Ulid) bool {

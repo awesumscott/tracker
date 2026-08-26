@@ -18,6 +18,7 @@
 //! main.zig against a real cwd. No absolute paths are baked in.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const model = @import("model.zig");
 const ulid = @import("ulid.zig");
@@ -93,6 +94,11 @@ pub const gitattributes_text =
 /// (Unioning it would NOT resurrect anything — nothing replays this file; that
 /// hazard belongs to `log.jsonl`.)
 pub const quarantine_name = "quarantine.jsonl";
+/// Subdirectory (under `.tracker/`) holding `compact`'s pre-rewrite backups,
+/// one run dir per compact (`backupDirName`), bounded by
+/// `Config.backup_retain` (see `Store.compact`, `writeBackup`,
+/// `evictOldBackups`).
+pub const backup_subdir = "backup";
 
 /// Persisted per-repo config (`.tracker/config.json`). Purely optional: a repo
 /// with no config file behaves exactly as before (every field null → callers
@@ -116,7 +122,17 @@ pub const Config = struct {
     /// is `?[]const []const u8` and not a slice with an empty default: absent
     /// and empty must mean different things. Arena-owned.
     decision_markers: ?[]const []const u8 = null,
+    /// `compact.backup_retain` — how many pre-compact backup runs
+    /// `.tracker/backup/` keeps before evicting the oldest (see
+    /// `Store.compact`, `evictOldBackups`). Defaults to
+    /// `default_backup_retain`; a malformed or missing knob never disables
+    /// the safety net it configures.
+    backup_retain: usize = default_backup_retain,
 };
+
+/// Default `compact.backup_retain` (see `Config.backup_retain`) for a repo
+/// with no config file or no `compact` section.
+pub const default_backup_retain: usize = 10;
 
 /// Markers `trk archive` looks for when no `archive.decision_markers` is
 /// configured. Matched case-insensitively as substrings of a body line. These
@@ -286,6 +302,26 @@ pub const Store = struct {
     /// always a no-op) — it measures the event-bloat a union-merge resurrection
     /// leaves behind. See `replayFile`.
     deduped_log_lines: usize = 0,
+    /// Ids whose round-trip fingerprint diverged across `compact`'s own
+    /// rewrite (01M0YESW6 — the last open silent-data-loss class: `compact`
+    /// had no post-write self-check against the pre-state). Populated only
+    /// when `compact` catches a mismatch, restores the pre-compact
+    /// snapshot/log files, and returns `error.CompactVerifyFailed`; empty on
+    /// every successful compact. Cleared at the start of every `compact`
+    /// call. See `compact`, `fingerprintLiveTasks`. gpa-owned; freed in
+    /// `deinit`.
+    diverged_on_verify: std.ArrayList(Ulid) = .empty,
+    /// TEST-ONLY sabotage seam for `compact`'s round-trip self-verify (see
+    /// store_test.zig): when set, `serializeState` writes THIS replacement
+    /// body into the named id's persisted `add` event while leaving the
+    /// in-memory task (and therefore the PRE-compact fingerprint) untouched —
+    /// simulating "the write path silently corrupts a live task's content" so
+    /// a test can prove the verify catches it. Gated on `builtin.is_test`
+    /// (comptime-false in a real build), so the branch that reads it is never
+    /// even compiled into a production binary — this field existing costs a
+    /// few inert bytes there, nothing else.
+    test_sabotage_body: if (builtin.is_test) ?struct { id: Ulid, replacement: []const u8 } else void =
+        if (builtin.is_test) null else {},
 
     /// Open a store rooted at `dir`. Does NOT load — call `load` for that, or
     /// `openAndLoad`. `dir` is borrowed; the caller keeps ownership/closes it.
@@ -311,6 +347,7 @@ pub const Store = struct {
         self.ghost_tasks.deinit(self.gpa);
         self.superseded.deinit(self.gpa);
         self.skipped_unknown_ops.deinit(self.gpa);
+        self.diverged_on_verify.deinit(self.gpa);
         self.arena.deinit();
     }
 
@@ -686,6 +723,26 @@ pub const Store = struct {
         self.config.archive_out = self.readNestedOut(root, "archive");
         self.config.add_arcless_error = self.readAddArclessError(root);
         self.config.decision_markers = self.readDecisionMarkers(root);
+        self.config.backup_retain = self.readBackupRetain(root);
+    }
+
+    /// Pull `compact.backup_retain` (a non-negative integer) from the config
+    /// root. Returns `default_backup_retain` for a missing section/key, a
+    /// non-integer value, or a negative one — a malformed knob must never
+    /// silently disable the pre-compact backup it configures.
+    fn readBackupRetain(_: *Store, root: std.json.ObjectMap) usize {
+        const sv = root.get("compact") orelse return default_backup_retain;
+        const so = switch (sv) {
+            .object => |o| o,
+            else => return default_backup_retain,
+        };
+        const rv = so.get("backup_retain") orelse return default_backup_retain;
+        const n = switch (rv) {
+            .integer => |i| i,
+            else => return default_backup_retain,
+        };
+        if (n < 0) return default_backup_retain;
+        return @intCast(n);
     }
 
     /// Pull `archive.decision_markers` (an array of strings) from the config
@@ -1313,6 +1370,37 @@ pub const Store = struct {
         var sub = try self.dir.createDirPathOpen(self.io, tracker_subdir, .{});
         defer sub.close(self.io);
 
+        // Round-trip self-verify setup (01M0YESW6 — the last open silent-
+        // data-loss class): fingerprint the CURRENT fold — the exact state
+        // `serializeState` below is about to persist — BEFORE any write, so
+        // it can be compared against a FRESH reload of what actually landed
+        // on disk. See the verify block after the writes for the other half.
+        self.diverged_on_verify.clearRetainingCapacity();
+        var pre_fp = try self.fingerprintLiveTasks(self.gpa);
+        defer pre_fp.deinit(self.gpa);
+
+        // Snapshot the ORIGINAL bytes (if any) before anything destructive
+        // happens: `atomicWrite`'s rename discards the old inode's content,
+        // so this in-memory copy is the only way to restore on a failed
+        // verify, and it doubles as the source for the pre-compact backup.
+        const orig_snapshot = sub.readFileAlloc(self.io, snapshot_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => return e,
+        };
+        defer if (orig_snapshot) |b| self.gpa.free(b);
+        const orig_log = sub.readFileAlloc(self.io, log_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => return e,
+        };
+        defer if (orig_log) |b| self.gpa.free(b);
+
+        // Bounded pre-compact backup, taken from the same original bytes,
+        // BEFORE the rewrite. Recovery today is git archaeology across
+        // worktree merges — exactly how the 01KZTV44M loss stayed invisible
+        // for weeks; this gives a same-machine fallback that needs no git
+        // history and no reconstructed worktree at all.
+        try self.writeBackup(sub, orig_snapshot, orig_log);
+
         // Step 0: spool the ghosts' log lines, durable BEFORE anything is
         // rewritten. Nothing this compaction discards is destroyed — a
         // clobbered/mis-resolved snapshot (the one ghost cause where the add
@@ -1331,12 +1419,270 @@ pub const Store = struct {
         // old log intact; crash-safe re-fold described in the doc above.
         try self.atomicWrite(sub, log_name, "");
 
+        // Round-trip self-verify: reload FRESH from exactly what was just
+        // written (never trust `self` for the "after" side — the whole point
+        // is to catch the rewrite itself, or the reload path, corrupting
+        // something) and confirm every task fingerprinted above survives with
+        // an identical fingerprint. A task that was legitimately GC'd
+        // (dropped/archived/ghost) was never in `pre_fp` to begin with — see
+        // `fingerprintLiveTasks` — so this can only fire on a task compact was
+        // contracted to KEEP.
+        const verify_failed = blk: {
+            var check = Store.open(self.gpa, self.io, self.dir);
+            defer check.deinit();
+            check.load() catch {
+                // An unreadable post-write state is itself the worst-case
+                // divergence — treat it as a full failure rather than
+                // silently skipping the check.
+                break :blk true;
+            };
+            var post_fp = check.fingerprintLiveTasks(self.gpa) catch break :blk true;
+            defer post_fp.deinit(self.gpa);
+
+            var it = pre_fp.iterator();
+            while (it.next()) |entry| {
+                const post_val = post_fp.get(entry.key_ptr.*);
+                if (post_val == null or post_val.? != entry.value_ptr.*) {
+                    self.diverged_on_verify.append(self.gpa, .{ .text = entry.key_ptr.* }) catch {};
+                }
+            }
+            break :blk self.diverged_on_verify.items.len != 0;
+        };
+
+        if (verify_failed) {
+            std.sort.pdq(Ulid, self.diverged_on_verify.items, {}, Ulid.lessThan);
+            // Restore the pre-compact files exactly, so a failed compact
+            // leaves no trace of the rewrite — a first-ever compact (no
+            // prior snapshot/log) restores to "absent" rather than leaving a
+            // corrupt file where none existed.
+            if (orig_snapshot) |b| try self.atomicWrite(sub, snapshot_name, b) else sub.deleteFile(self.io, snapshot_name) catch {};
+            if (orig_log) |b| try self.atomicWrite(sub, log_name, b) else sub.deleteFile(self.io, log_name) catch {};
+            return error.CompactVerifyFailed;
+        }
+
         return .{
             .live_tasks = live,
             .log_events_before = log_events_before,
             .ghosts = self.ghost_tasks.items.len,
             .quarantined_lines = quarantined,
         };
+    }
+
+    /// Directory name for one pre-compact backup run, under
+    /// `.tracker/backup/`: the millisecond epoch, zero-padded to a fixed
+    /// width so lexicographic order agrees with chronological order (see
+    /// `evictOldBackups`, which relies on that for eviction-oldest-first).
+    fn backupDirName(self: *Store, buf: []u8) []const u8 {
+        const ts: i64 = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        // Unsigned before formatting: `{d:0>20}` on a SIGNED integer reserves
+        // a sign column and zero-pads around it, printing a literal `+` for
+        // every positive timestamp (the exact footgun `22b02f7` already
+        // fixed once for a different formatted timestamp in this repo). A
+        // wall-clock ms epoch is never negative, so the cast is lossless.
+        const ts_u: u64 = @intCast(ts);
+        return std.fmt.bufPrint(buf, "{d:0>20}", .{ts_u}) catch unreachable;
+    }
+
+    /// Copy the pre-compact `snapshot.jsonl`/`log.jsonl` bytes (whichever
+    /// existed) into a fresh `.tracker/backup/<ts>/` run dir BEFORE compact
+    /// does anything destructive, then evict down to
+    /// `config.backup_retain`. A no-op on the very first compact (nothing to
+    /// protect yet — no prior snapshot AND no prior log).
+    fn writeBackup(self: *Store, sub: Io.Dir, orig_snapshot: ?[]const u8, orig_log: ?[]const u8) !void {
+        if (orig_snapshot == null and orig_log == null) return;
+
+        // `.iterate = true`: `evictOldBackups` below scans this dir's entries,
+        // which requires the handle to have been opened with iteration
+        // capability (a handle opened without it fails the scan with BADF,
+        // not an empty listing).
+        var backup_root = try sub.createDirPathOpen(self.io, backup_subdir, .{ .open_options = .{ .iterate = true } });
+        defer backup_root.close(self.io);
+
+        var name_buf: [20]u8 = undefined;
+        const name = self.backupDirName(&name_buf);
+
+        // Collision-avoid: two compacts landing in the same millisecond (a
+        // fast host-unit test loop can do this; real usage is orchestrator-
+        // paced and rare) get a numeric suffix rather than one clobbering the
+        // other's backup.
+        var final_name_buf: [40]u8 = undefined;
+        var final_name: []const u8 = name;
+        var suffix: usize = 0;
+        while (true) {
+            const exists = existsBlk: {
+                var d = backup_root.openDir(self.io, final_name, .{}) catch |e| switch (e) {
+                    error.FileNotFound => break :existsBlk false,
+                    else => return e,
+                };
+                d.close(self.io);
+                break :existsBlk true;
+            };
+            if (!exists) break;
+            suffix += 1;
+            final_name = std.fmt.bufPrint(&final_name_buf, "{s}-{d}", .{ name, suffix }) catch unreachable;
+        }
+
+        var run_dir = try backup_root.createDirPathOpen(self.io, final_name, .{});
+        defer run_dir.close(self.io);
+
+        if (orig_snapshot) |b| try self.atomicWrite(run_dir, snapshot_name, b);
+        if (orig_log) |b| try self.atomicWrite(run_dir, log_name, b);
+
+        try self.evictOldBackups(backup_root);
+    }
+
+    /// Evict `.tracker/backup/` run dirs beyond `config.backup_retain`,
+    /// oldest first. Run-dir names are zero-padded millisecond timestamps
+    /// (`backupDirName`), so a plain lexicographic sort is chronological.
+    fn evictOldBackups(self: *Store, backup_root: Io.Dir) !void {
+        const retain = self.config.backup_retain;
+
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |n| self.gpa.free(n);
+            names.deinit(self.gpa);
+        }
+
+        var it = backup_root.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            try names.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+        }
+        std.sort.pdq([]const u8, names.items, {}, lessThanStr);
+
+        if (names.items.len <= retain) return;
+        const n_to_evict = names.items.len - retain;
+        for (names.items[0..n_to_evict]) |old| {
+            try backup_root.deleteTree(self.io, old);
+        }
+    }
+
+    /// A whole-task content fingerprint used by `compact`'s round-trip
+    /// self-verify. Built from the SAME canonicalization `serializeState`
+    /// uses to persist a task — title/body/tags/short/state/priority/
+    /// docrefs/arc-declared/arc-standing, plus this id's OWN `needs`/`in`
+    /// edges with a collectable endpoint excluded exactly as
+    /// `serializeState` excludes it — so two fingerprints matching means
+    /// "compact would write identical bytes for this id", and a mismatch
+    /// names precisely the id whose persisted content changed underneath the
+    /// rewrite. A single hash rather than a struct of hashes: the equality
+    /// check this feeds is plain `u64 == u64`.
+    fn taskFingerprint(
+        self: *Store,
+        buf: *std.ArrayList(u8),
+        gc_set: *const std.AutoHashMapUnmanaged(Key, void),
+        id: Ulid,
+        t: Task,
+    ) !u64 {
+        buf.clearRetainingCapacity();
+        try buf.print(self.gpa, "title\x00{s}\x00body\x00{s}\x00state\x00{s}\x00priority\x00{d}\x00short\x00{s}\x00declared\x00{}\x00standing\x00{}\x00", .{
+            t.title,
+            t.body,
+            @tagName(t.state),
+            t.priority,
+            t.short orelse "\x01",
+            self.declared_arcs.contains(key(id)),
+            self.standing_arcs.contains(key(id)),
+        });
+
+        // Tags: sorted, order-independent (a re-fold may reorder them).
+        {
+            const tags = try self.gpa.dupe([]const u8, t.tags.items);
+            defer self.gpa.free(tags);
+            std.sort.pdq([]const u8, tags, {}, lessThanStr);
+            try buf.appendSlice(self.gpa, "tags\x00");
+            for (tags) |tg| try buf.print(self.gpa, "{s}\x00", .{tg});
+        }
+
+        // Docrefs: sorted by (doc_id, section_id), order-independent.
+        {
+            const drs = try self.gpa.dupe(model.DocRef, t.docrefs.items);
+            defer self.gpa.free(drs);
+            std.sort.pdq(model.DocRef, drs, {}, docrefLessThan);
+            try buf.appendSlice(self.gpa, "docrefs\x00");
+            for (drs) |dr| try buf.print(self.gpa, "{s}\x00{s}\x00", .{ dr.doc_id, dr.section_id orelse "\x01" });
+        }
+
+        // `needs` edges OWNED by this id (from == id), skipping a collectable
+        // endpoint exactly as `serializeState` does — an edge compact is
+        // contracted to drop must never register as a divergence.
+        {
+            var tos: std.ArrayList(Ulid) = .empty;
+            defer tos.deinit(self.gpa);
+            for (self.needs.items) |e| {
+                if (!e.from.eql(id)) continue;
+                if (gc_set.contains(key(e.from)) or gc_set.contains(key(e.to))) continue;
+                try tos.append(self.gpa, e.to);
+            }
+            std.sort.pdq(Ulid, tos.items, {}, Ulid.lessThan);
+            try buf.appendSlice(self.gpa, "needs\x00");
+            for (tos.items) |to| try buf.print(self.gpa, "{s}\x00", .{&to.text});
+        }
+
+        // `in` edges OWNED by this id (task == id), same collectable-endpoint
+        // exclusion, carrying `seq` (an edge attribute, not just membership).
+        {
+            var ins_here: std.ArrayList(In) = .empty;
+            defer ins_here.deinit(self.gpa);
+            for (self.ins.items) |e| {
+                if (!e.task.eql(id)) continue;
+                if (gc_set.contains(key(e.task)) or gc_set.contains(key(e.arc))) continue;
+                try ins_here.append(self.gpa, e);
+            }
+            std.sort.pdq(In, ins_here.items, {}, inLessThan);
+            try buf.appendSlice(self.gpa, "in\x00");
+            for (ins_here.items) |e| try buf.print(self.gpa, "{s}\x00{d}\x00", .{ &e.arc.text, e.seq });
+        }
+
+        return std.hash.Wyhash.hash(0, buf.items);
+    }
+
+    fn docrefLessThan(_: void, lhs: model.DocRef, rhs: model.DocRef) bool {
+        const c = std.mem.order(u8, lhs.doc_id, rhs.doc_id);
+        if (c != .eq) return c == .lt;
+        const ls = lhs.section_id orelse "";
+        const rs = rhs.section_id orelse "";
+        return std.mem.lessThan(u8, ls, rs);
+    }
+
+    /// Build the id->collectable set (dropped/archived/ghost) for the
+    /// CURRENT in-memory fold — the same GC classification `serializeState`
+    /// computes inline, factored out so the fingerprint's edge exclusion can
+    /// apply the identical rule without re-deriving it.
+    fn buildGcSet(self: *Store, alloc: std.mem.Allocator) !std.AutoHashMapUnmanaged(Key, void) {
+        var gc_set: std.AutoHashMapUnmanaged(Key, void) = .empty;
+        errdefer gc_set.deinit(alloc);
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            if (isCollectable(entry.value_ptr.*)) try gc_set.put(alloc, entry.key_ptr.*, {});
+        }
+        return gc_set;
+    }
+
+    /// Fingerprint every LIVE (non-collectable) task in the CURRENT in-memory
+    /// fold, keyed by id. Used both before `compact` rewrites anything
+    /// (against `self`, already loaded) and after (against a freshly
+    /// reloaded `Store` reading exactly what was just written) — see
+    /// `compact`. A dropped/archived/ghost task is never a key in the
+    /// returned map, which is what makes "diff the two maps" automatically
+    /// exclude legitimate GC from the comparison.
+    fn fingerprintLiveTasks(self: *Store, alloc: std.mem.Allocator) !std.AutoHashMapUnmanaged(Key, u64) {
+        var gc_set = try self.buildGcSet(alloc);
+        defer gc_set.deinit(alloc);
+
+        var out: std.AutoHashMapUnmanaged(Key, u64) = .empty;
+        errdefer out.deinit(alloc);
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            if (isCollectable(entry.value_ptr.*)) continue;
+            const fp = try self.taskFingerprint(&buf, &gc_set, entry.value_ptr.id, entry.value_ptr.*);
+            try out.put(alloc, entry.key_ptr.*, fp);
+        }
+        return out;
     }
 
     /// Move every log line that references a ghost id into `quarantine.jsonl`
@@ -1482,10 +1828,19 @@ pub const Store = struct {
             // instability bug: a compact must never let a task's frozen short
             // silently regress to a shorter/different dynamically-computed
             // value just because the live id set shrank.
+            // TEST-ONLY sabotage seam (see `test_sabotage_body`'s doc): comptime-
+            // eliminated in a non-test build, so `persisted_body` is always
+            // `t.body` there.
+            const persisted_body = if (builtin.is_test) blk: {
+                if (self.test_sabotage_body) |s| {
+                    if (s.id.eql(id)) break :blk s.replacement;
+                }
+                break :blk t.body;
+            } else t.body;
             try self.emit(buf, .{ .add = .{
                 .id = id,
                 .title = t.title,
-                .body = t.body,
+                .body = persisted_body,
                 .tags = tag_slice,
                 .short = t.short,
                 // The task's watermark: the newest event ts this state

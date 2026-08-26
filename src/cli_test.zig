@@ -1266,6 +1266,36 @@ test "trk compact: prints summary line, rejects extra args" {
     try testing.expectEqual(error.UsageError, e);
 }
 
+test "trk compact: a sabotaged write is REFUSED, names the diverged id on stdout, and restores the files" {
+    var f = try Fixture.init(testing.allocator);
+    defer f.deinit();
+
+    const keep_id = mintId();
+    const hit_id = mintId();
+    try f.store.append(.{ .add = .{ .id = keep_id, .title = "Keep", .body = "keep's real body" } });
+    try f.store.append(.{ .add = .{ .id = hit_id, .title = "Hit", .body = "hit's real body" } });
+
+    try f.run(&.{"compact"}); // baseline compact: both survive, files established
+
+    // Sabotage the NEXT compact's write for "Hit" only.
+    f.store.test_sabotage_body = .{ .id = hit_id, .replacement = "CORRUPTED" };
+
+    const e = f.runExpectErr(&.{"compact"});
+    try testing.expectEqual(error.CompactVerifyFailed, e);
+
+    // The CLI's own message (stdout) names the diverged id and says the
+    // files were restored — not just a bare error name.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "REFUSED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "RESTORED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, &hit_id.text) != null);
+
+    // The real on-disk state (reloaded fresh) still shows Hit's TRUE body.
+    var check = Store.open(testing.allocator, io, f.tmp.dir);
+    defer check.deinit();
+    try check.load();
+    try testing.expectEqualStrings("hit's real body", check.get(hit_id).?.body);
+}
+
 // ----------------------------------------------------------- doc subcommand (Wave 4)
 
 test "trk doc set/list/resolve: basic registry operations" {

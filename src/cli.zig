@@ -1594,7 +1594,25 @@ pub const Cli = struct {
             try self.write("trk: usage: trk compact\n");
             return error.UsageError;
         }
-        const result = try self.store.compact();
+        const result = self.store.compact() catch |e| {
+            if (e == error.CompactVerifyFailed) {
+                try self.print(
+                    "trk: compact REFUSED — round-trip self-verify found {d} diverged id(s) after the " ++
+                        "rewrite. The pre-compact snapshot.jsonl/log.jsonl were RESTORED byte-for-byte; " ++
+                        "nothing was lost:\n",
+                    .{self.store.diverged_on_verify.items.len},
+                );
+                for (self.store.diverged_on_verify.items) |id|
+                    try self.print("    {s}\n", .{&id.text});
+                try self.write(
+                    "  This should never happen — it means compact's own rewrite (or the reload that\n" ++
+                        "  checks it) produced a different result for a live task than the state it started\n" ++
+                        "  from. Inspect each id above (`trk show <id>` / `trk log <id>`) before re-running\n" ++
+                        "  compact; a copy of the pre-compact files also lives under .tracker/backup/.\n",
+                );
+            }
+            return e;
+        };
         // `compact` re-scans `ghost_tasks` itself, so the list read below is the
         // set it actually GC'd, not a stale load-time one.
         try self.warnUnpinnedAttrs();

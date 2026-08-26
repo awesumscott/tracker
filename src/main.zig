@@ -160,6 +160,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.NoArc,
             error.UndeclaredArc,
             error.GitLogFailed,
+            error.CompactVerifyFailed,
             => {},
             else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),
         }

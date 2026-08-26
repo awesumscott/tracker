@@ -605,6 +605,51 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   un-graduated changelog queue, so dropping it would silently corrupt the graph. (Crash-safe: the snapshot
   is renamed durably *before* the log is truncated; every event is idempotent on re-fold, so the inter-step
   window loses nothing — a dropped/archived task may transiently reappear until the next compact.)
+- **Compaction round-trip self-verify + bounded backup** (01M0YESW6, 2026-08-26) — the last open member of
+  the silent-data-loss family this doc already documents two instances of (the ghost/tombstone shear above,
+  and `01M0EM3G6`'s watermark fix). Before this, `compact` had no check that its own rewrite preserved what
+  it started with: `01KZTV44M`'s 2026-08-19 body correction vanished across a compact/merge window with no
+  conflict reported (the Enix tracker's `finding-20260820074254`), root-caused here (see below) to a
+  transitional gap in the watermark fix itself, not a defect the verify below would have caught — which is
+  exactly why a SEPARATE, unconditional check earns its place alongside it rather than superseding it.
+  - **The verify.** `compact` fingerprints every LIVE (non-collectable) task's `(title, body, tags, short,
+    state, priority, docrefs, arc-declared, arc-standing, its OWN needs/in edges)` — the same
+    canonicalization `serializeState` persists, hashed to one `u64` per id (`taskFingerprint`) — BEFORE
+    touching any file. After the snapshot+log rewrite, it reloads a FRESH `Store` from exactly what was just
+    written (never trusting the in-memory `self` for the "after" side) and re-fingerprints. Any live id
+    whose fingerprint changed, or that vanished entirely, is collected into `Store.diverged_on_verify`; the
+    ORIGINAL snapshot/log bytes (captured before the rewrite) are restored byte-for-byte via the same
+    atomic write-temp-then-rename `compact` already uses, and `compact` returns `error.CompactVerifyFailed`
+    naming every diverged id — `trk compact`'s CLI wrapper prints them and points at `.tracker/backup/`.
+    A `dropped`/`archived`/ghost id is never a key in either fingerprint map (`fingerprintLiveTasks` skips
+    exactly what `isCollectable` does), so legitimate GC can never read as a divergence — only a live task
+    compact was contracted to KEEP can trigger this.
+  - **The backup.** Before the rewrite, `compact` also copies the pre-compact `snapshot.jsonl`/`log.jsonl`
+    (whichever existed) into `.tracker/backup/<ms-epoch>/`, then evicts down to `config.backup_retain`
+    (default 10; `compact.backup_retain` in `config.json`). This is orthogonal to the verify above — the
+    verify's restore only fires ON a caught divergence; the backup exists so a human has a same-machine,
+    no-git-archaeology recovery path even for a loss this mechanism does NOT catch (a bad merge whose
+    corrupted state a *later* compact then faithfully re-persists, which is what actually happened to
+    `01KZTV44M` — see below).
+  - **Root cause of `01KZTV44M`'s loss, isolated (not merely narrowed) from the Enix tracker's own git
+    history:** the correction (commit `eb677cb1`) landed on a worktree branched BEFORE a compact
+    (`2155deea`) had already run on main; union-merging that stale branch back in later (the `adc8f879`
+    merge, whose own message already read "log re-bloated by the pre-compact-base merge") resurrected the
+    branch's entire pre-compact log tail for that task — including a run that ENDED one `setBody` short of
+    the correction (an even-staler sibling worktree off the same base). A second compact (`83a37d85`, run
+    at 21:22 on 2026-08-19) folded that resurrected log and wrote a fresh snapshot — using the trk binary
+    from BEFORE `01M0EM3G6`'s watermark fix (which landed in THIS repo at `7977e9d`, 00:03 the following
+    night), so the `add` event it wrote for that task carried no watermark. A LATER union-merge then
+    resurrected the even-staler sibling's log tail again; because the snapshot's `add` had watermark `0`,
+    `supersededBy`'s protection never engaged for this id (`t.watermark == 0` short-circuits to "never
+    judged" — see the watermark bullet above), so the stale tail's `setBody` silently replayed last and
+    reverted the body. This is a one-time transitional gap — a compact that ran with the OLD binary,
+    upgraded mid-session, whose OWN output never got retroactively re-stamped — not a standing hole in the
+    watermark mechanism itself: every compact from `d870f9d4` onward (the first run under the fixed binary,
+    which re-stamped every task's watermark) closes it going forward. It is a DIFFERENT failure shape from
+    what the verify above catches (that compact's fold was internally faithful to the corrupted state it was
+    handed; nothing about ITS OWN rewrite was unfaithful), which is why root-causing this incident and
+    building the verify are two separate deliverables, not one.
 - **Short-id stability — frozen at mint time, never recomputed.** `Cli.shortId` originally computed "the
   shortest CURRENTLY-unambiguous prefix" fresh on every call, against the live id set — a pure function of
   that set, so it moved whenever the set moved. Measured in production: a `compact` GC'd the dropped/
