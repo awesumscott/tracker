@@ -692,6 +692,45 @@ test "render: a multi-line body folds into a <details>; a short one-liner stays 
     try testing.expectEqual(@as(usize, 1), countOccurrences(b.items, "</details>"));
 }
 
+test "render: an ARC ROOT's own body renders under its ## heading, undented" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The defect this pins (2026-08-26): an arc renders as a `## title (id)`
+    // section rather than a bullet, so it never reached renderTaskBullet -- the
+    // only place that had ever printed a body -- and its body was dropped
+    // silently. Measured then: 37 of 304 open tasks with a substantive body had
+    // that body appear NOWHERE in the projection, and the sampled ones were all
+    // arc roots. Those are precisely the tasks whose body states a goal's
+    // RATIONALE, so the omission hit the highest-value prose in the file.
+    const arc = mintId();
+    const member = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Bodied arc", .body = "why this arc exists\n\nand the forces on it\n" } });
+    try f.store.append(.{ .add = .{ .id = member, .title = "Member task" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    // The arc's body follows its heading and is NOT indented: a `##` section's
+    // prose is document-level, so the 2-space list-item continuation prefix
+    // would be meaningless at best and an indented code block at worst.
+    const at = std.mem.indexOf(u8, b.items, "## Bodied arc") orelse return error.NoArcHeading;
+    const tail = b.items[at..];
+    try testing.expect(std.mem.indexOf(u8, tail, "<details><summary>why this arc exists</summary>") != null);
+    try testing.expect(std.mem.indexOf(u8, tail, "\nwhy this arc exists\n") != null);
+    try testing.expect(std.mem.indexOf(u8, tail, "\nand the forces on it\n") != null);
+    // Undented: the body must NOT arrive with a bullet's continuation indent.
+    try testing.expect(std.mem.indexOf(u8, tail, "\n  why this arc exists") == null);
+    // The member still renders after the arc's body, not before it.
+    const body_at = std.mem.indexOf(u8, tail, "why this arc exists").?;
+    const member_at = std.mem.indexOf(u8, tail, "Member task").?;
+    try testing.expect(body_at < member_at);
+}
+
 test "render: the <summary> teaser is cut at a word boundary and HTML-escaped" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);

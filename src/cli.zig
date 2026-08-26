@@ -2282,7 +2282,15 @@ pub const Cli = struct {
             try buf.print(gpa, "## {s}", .{arc_t.title});
             var asb: [ulid.len]u8 = undefined;
             const arc_short = try self.shortId(arc, &asb);
-            try buf.print(gpa, "  ({s})\n\n", .{arc_short});
+            try buf.print(gpa, "  ({s})\n", .{arc_short});
+            // The arc's OWN body — the goal's rationale, and the prose most
+            // worth reading in the section it heads. It was dropped entirely
+            // until 2026-08-26: an arc renders as a heading rather than a
+            // bullet, so it never reached `renderTaskBullet`, the only place
+            // that had ever printed a body. No list-item indent, since a `##`
+            // section's prose is document-level.
+            try self.renderBody(buf, arc_t.body, "");
+            try buf.print(gpa, "\n", .{});
 
             // Members in next/seq order: take next() order filtered to members,
             // then append any non-ready members (sorted by seq, id) so done/
@@ -2391,67 +2399,70 @@ pub const Cli = struct {
         }
         try buf.print(gpa, "\n", .{});
 
-        const body = std.mem.trimEnd(u8, t.body, "\n");
-        if (body.len != 0) {
-            try buf.print(gpa, "\n", .{});
-            // A body long enough to hide is wrapped in a `<details>` disclosure
-            // so the projection reads as an outline of TITLES on GitHub (and any
-            // HTML-rendering viewer), with the prose one click away. The raw
-            // bytes are unchanged for the plain-text/agent reader — `cat
-            // TODO.md` still shows every body in full, which is why the body is
-            // NOT dropped or elided, only folded. A short single-line body is
-            // left inline: a disclosure whose summary IS the whole body hides
-            // nothing and just adds two lines of markup.
-            const collapse = !fitsInlineBody(body);
-            if (collapse) {
-                // On one line: `<details>` opens an HTML block that ends at the
-                // next blank line, and the blank line after it is what puts the
-                // body back into MARKDOWN parsing (indented into the list item)
-                // rather than raw HTML — the same load-bearing blank line as
-                // above, one level in.
-                try buf.print(gpa, "  <details><summary>", .{});
-                try self.writeBodySummary(buf, body);
-                try buf.print(gpa, "</summary>\n\n", .{});
-            }
-            var it = std.mem.splitScalar(u8, body, '\n');
-            while (it.next()) |line| {
-                if (line.len == 0) {
-                    try buf.print(gpa, "\n", .{});
+        try self.renderBody(buf, t.body, "  ");
+    }
+
+    /// Render a task-or-arc BODY beneath its heading/bullet. `indent` is the
+    /// list-item continuation prefix ("  " under a bullet, "" under a `##`
+    /// section heading, where the body is document-level prose and indenting it
+    /// two spaces would be meaningless at best and a code block at worst).
+    ///
+    /// Factored out of `renderTaskBullet` (2026-08-26) because an ARC ROOT never
+    /// went through that function at all: an arc renders as a `## title (id)`
+    /// section and its own body was simply dropped. Measured at the time: 37 of
+    /// 304 open tasks with a substantive body had that body appear NOWHERE in
+    /// the projection, and the sampled ones were all arc roots — which are
+    /// exactly the tasks whose body states a goal's rationale, so the omission
+    /// hit the highest-value prose in the file.
+    fn renderBody(self: *Cli, buf: *std.ArrayList(u8), body_raw: []const u8, indent: []const u8) Error!void {
+        const gpa = self.gpa;
+        const body = std.mem.trimEnd(u8, body_raw, "\n");
+        if (body.len == 0) return;
+        try buf.print(gpa, "\n", .{});
+        // A body long enough to hide is wrapped in a `<details>` disclosure so
+        // the projection reads as an outline of TITLES on GitHub (and any
+        // HTML-rendering viewer), with the prose one click away. The raw bytes
+        // are unchanged for the plain-text/agent reader — `cat TODO.md` still
+        // shows every body in full, which is why the body is NOT dropped or
+        // elided, only folded. A short single-line body is left inline: a
+        // disclosure whose summary IS the whole body hides nothing.
+        const collapse = !fitsInlineBody(body);
+        if (collapse) {
+            // On one line: `<details>` opens an HTML block that ends at the next
+            // blank line, and the blank line after it is what puts the body back
+            // into MARKDOWN parsing rather than raw HTML.
+            try buf.print(gpa, "{s}<details><summary>", .{indent});
+            try self.writeBodySummary(buf, body);
+            try buf.print(gpa, "</summary>\n\n", .{});
+        }
+        var it = std.mem.splitScalar(u8, body, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) {
+                try buf.print(gpa, "\n", .{});
+            } else {
+                try buf.print(gpa, "{s}", .{indent});
+                // Neutralize a line-leading construct that would hijack the
+                // DOCUMENT's own heading structure. Bodies are informally
+                // markdown by convention and that stays true for everything
+                // else — a leading `-` bullet list still renders as a list;
+                // only heading-shaped lines are escaped. Leading whitespace is
+                // skipped before testing: CommonMark allows up to 3 leading
+                // spaces on an ATX heading, and inside a list item several MORE
+                // still parse as a heading rather than an indented code block.
+                const lead = leadingWhitespaceLen(line);
+                const rest = line[lead..];
+                if (isHeadingHazard(rest)) {
+                    try buf.print(gpa, "{s}\\{s}\n", .{ line[0..lead], rest });
                 } else {
-                    try buf.print(gpa, "  ", .{});
-                    // Neutralize a line-leading construct that would hijack the
-                    // DOCUMENT's own heading structure (identical bug class to
-                    // the seq-bracket fix above: field text landing in markdown
-                    // without neutralizing markdown-significant syntax). Bodies
-                    // are informally markdown by convention and that stays true
-                    // for everything else — a leading `-` bullet list still
-                    // renders as a list; only heading-shaped lines are escaped.
-                    // Leading whitespace is skipped before testing: CommonMark
-                    // allows up to 3 leading spaces on an ATX heading, and once
-                    // this text sits inside the bullet's own indent + list-item
-                    // continuation context, several MORE spaces of raw indent
-                    // still parse as a heading rather than an indented code
-                    // block — trying to model that column arithmetic is not
-                    // worth it, so ANY amount of leading whitespace is hazard-
-                    // checked past. The backslash is inserted right before the
-                    // hazard character itself (after the preserved leading
-                    // whitespace), not at the front of the line, so the line
-                    // still reads naturally as plain, correctly-indented text.
-                    const lead = leadingWhitespaceLen(line);
-                    const rest = line[lead..];
-                    if (isHeadingHazard(rest)) {
-                        try buf.print(gpa, "{s}\\{s}\n", .{ line[0..lead], rest });
-                    } else {
-                        try buf.print(gpa, "{s}\n", .{line});
-                    }
+                    try buf.print(gpa, "{s}\n", .{line});
                 }
             }
-            // Blank line before the close: `</details>` must start its own HTML
-            // block, and it keeps the bullet's 2-space indent so the disclosure
-            // stays INSIDE the list item instead of terminating it.
-            if (collapse) try buf.print(gpa, "\n  </details>\n", .{});
-            try buf.print(gpa, "\n", .{});
         }
+        // Blank line before the close: `</details>` must start its own HTML
+        // block, and it keeps the caller's indent so a bullet's disclosure stays
+        // INSIDE the list item instead of terminating it.
+        if (collapse) try buf.print(gpa, "\n{s}</details>\n", .{indent});
+        try buf.print(gpa, "\n", .{});
     }
 
     /// Byte cap on the `<summary>` teaser. Long enough to carry a real sentence
