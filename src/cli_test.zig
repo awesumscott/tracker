@@ -731,6 +731,59 @@ test "render: an ARC ROOT's own body renders under its ## heading, undented" {
     try testing.expect(body_at < member_at);
 }
 
+test "render: an arc with zero renderable members is visibly marked, not a bare empty heading" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The recurring shape this pins (2026-08-27, 01M0ZC286): an arc whose only
+    // member is done/dropped/archived (finished but the arc root never closed),
+    // or that never had a slice filed at all, renders as `## title (id)` with
+    // nothing under it -- indistinguishable from an omission. Two arcs here:
+    // `empty` genuinely has no members at all; `finished` has one member, but
+    // it is archived so nothing is left to render.
+    const empty = mintId();
+    const finished = mintId();
+    const done_member = mintId();
+    const populated = mintId();
+    const open_member = mintId();
+    try f.store.append(.{ .add = .{ .id = empty, .title = "Empty arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = empty, .declared = true } });
+
+    try f.store.append(.{ .add = .{ .id = finished, .title = "Finished arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = finished, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = done_member, .title = "Done member" } });
+    try f.store.append(.{ .in = .{ .task = done_member, .arc = finished, .seq = 0 } });
+    try f.store.append(.{ .setState = .{ .id = done_member, .state = .archived } });
+
+    try f.store.append(.{ .add = .{ .id = populated, .title = "Populated arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = populated, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = open_member, .title = "Open member" } });
+    try f.store.append(.{ .in = .{ .task = open_member, .arc = populated, .seq = 0 } });
+
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(alloc);
+    try f.c.renderMarkdown(&b);
+
+    const marker = "*(no open members under this arc)*";
+    const empty_at = std.mem.indexOf(u8, b.items, "## Empty arc").?;
+    const finished_at = std.mem.indexOf(u8, b.items, "## Finished arc").?;
+    const populated_at = std.mem.indexOf(u8, b.items, "## Populated arc").?;
+
+    // Both zero-renderable-member arcs carry the marker between their own
+    // heading and the NEXT one.
+    const empty_section = b.items[empty_at..finished_at];
+    const finished_section = b.items[finished_at..populated_at];
+    try testing.expect(std.mem.indexOf(u8, empty_section, marker) != null);
+    try testing.expect(std.mem.indexOf(u8, finished_section, marker) != null);
+
+    // The populated arc has a real member, so no marker, and the member's
+    // title still renders.
+    const populated_section = b.items[populated_at..];
+    try testing.expect(std.mem.indexOf(u8, populated_section, marker) == null);
+    try testing.expect(std.mem.indexOf(u8, populated_section, "Open member") != null);
+}
+
 test "render: the <summary> teaser is cut at a word boundary and HTML-escaped" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);

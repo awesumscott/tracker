@@ -2292,15 +2292,22 @@ pub const Cli = struct {
             try self.renderBody(buf, arc_t.body, "");
             try buf.print(gpa, "\n", .{});
 
-            // Members in next/seq order: take next() order filtered to members,
-            // then append any non-ready members (sorted by seq, id) so done/
-            // blocked tasks still appear. Simpler + deterministic: sort all
-            // members by (seq-in-this-arc, id).
+            // Members ordered by (seq-in-this-arc, id) — direct `in` members
+            // carry an explicit seq, a reachability-only member (a shared
+            // prereq) sorts after them. Deterministic; see orderMembers.
             const members = try self.store.membersOf(gpa, arc);
             defer gpa.free(members);
             const ordered = try self.orderMembers(arc, members);
             defer gpa.free(ordered);
 
+            // An arc with no renderable member left is a real, recurring shape
+            // (2026-08-27, 01M0ZC286): work finished but the arc root never
+            // closed, or a goal whose slices were never filed. Rendering a bare
+            // `## title (id)` with nothing under it reads as "here is live work"
+            // when there is none — so track whether anything actually printed
+            // and, if not, say so explicitly instead of leaving a heading that
+            // looks like an omission.
+            var has_bullet = false;
             for (ordered) |id| {
                 // TODO = only not-yet-built work: show open/blocked, never the
                 // finished/abandoned states (done graduates to the CHANGELOG via
@@ -2322,6 +2329,10 @@ pub const Cli = struct {
                     .plain;
                 try self.renderTaskBullet(buf, id, arc, listing);
                 try printed.put(gpa, id.text, {});
+                has_bullet = true;
+            }
+            if (!has_bullet) {
+                try buf.print(gpa, "*(no open members under this arc)*\n", .{});
             }
             try buf.print(gpa, "\n", .{});
         }
