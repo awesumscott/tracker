@@ -1840,7 +1840,7 @@ pub const Cli = struct {
                 const line = std.mem.trim(u8, raw, " \t\r");
                 if (line.len == 0) continue;
                 for (markers) |m| {
-                    if (m.len == 0 or !containsIgnoreCase(line, m)) continue;
+                    if (m.len == 0 or !containsMarker(line, m)) continue;
                     if (hits == 0) {
                         try self.warn.print(self.gpa,
                             "trk: {s}: task bodies about to be archived carry DECISION markers. " ++
@@ -1872,18 +1872,48 @@ pub const Cli = struct {
         return true;
     }
 
-    /// ASCII case-insensitive substring search. The marker set mixes cases
-    /// (`TODO`, `your call`), and a body written by a human or an agent will not
-    /// match the configured casing reliably — matching case-sensitively would
-    /// make the guard depend on shouting.
-    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    /// True if the occurrence at `haystack[start..end]` sits where a filename
+    /// or path component would, rather than where a marker word would.
+    /// Measured 2026-08-27 (task 01M12D4EV): the `TODO` marker fires on the
+    /// literal string `docs/TODO.md`, which every task discussing the render
+    /// projection contains in prose — 6 of 9 marker hits in one sweep, 0 of
+    /// them a real buried decision. A pure alphanumeric word-boundary check
+    /// does NOT fix this: `/` and `.` are already non-alphanumeric, so `TODO`
+    /// inside `docs/TODO.md` already sits on a "word boundary" by that
+    /// definition and would still match. What actually distinguishes the two
+    /// is path/filename SHAPE, not word-ness:
+    ///   - preceded by `/`      -- a path component (`docs/TODO.md`, `path/TODO`)
+    ///   - followed by `.<letter>` -- a file extension (`TODO.md`, `TODO.zig`)
+    /// A marker used AS a marker is prose: it is never glued to a path
+    /// separator, and when it precedes a `.` that `.` ends a sentence, so the
+    /// next character is whitespace or the end of the line -- never another
+    /// letter, which is what an extension looks like. So this filter can only
+    /// ever SUPPRESS a match at a path/filename-shaped position; it adds no
+    /// path through which a genuine marker written as prose goes unseen.
+    fn isFilenamePosition(haystack: []const u8, start: usize, end: usize) bool {
+        if (start > 0 and haystack[start - 1] == '/') return true;
+        if (end < haystack.len and haystack[end] == '.' and
+            end + 1 < haystack.len and std.ascii.isAlphabetic(haystack[end + 1])) return true;
+        return false;
+    }
+
+    /// ASCII case-insensitive substring search for a decision marker, skipping
+    /// any occurrence that `isFilenamePosition` identifies as a path/filename
+    /// component rather than a marker word. The marker set mixes cases
+    /// (`TODO`, `your call`), and a body written by a human or an agent will
+    /// not match the configured casing reliably — matching case-sensitively
+    /// would make the guard depend on shouting. A line can contain the needle
+    /// more than once (e.g. both a path mention and a real marker use), so a
+    /// filename-shaped occurrence does not short-circuit the scan — it keeps
+    /// looking for one that isn't.
+    fn containsMarker(haystack: []const u8, needle: []const u8) bool {
         if (needle.len > haystack.len) return false;
         var i: usize = 0;
         outer: while (i + needle.len <= haystack.len) : (i += 1) {
             for (needle, 0..) |c, j| {
                 if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) continue :outer;
             }
-            return true;
+            if (!isFilenamePosition(haystack, i, i + needle.len)) return true;
         }
         return false;
     }

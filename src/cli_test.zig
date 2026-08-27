@@ -3145,3 +3145,45 @@ test "archive decision markers: case-insensitive, and archive.decision_markers o
     try f.run(&.{"archive"});
     try testing.expectEqual(tracker.State.archived, f.store.get(a).?.state);
 }
+
+test "archive: TODO marker does not fire on docs/TODO.md, TODO.md, or path/TODO filename mentions" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Measured 2026-08-27 (01M12D4EV): 6 of 9 marker hits in one real sweep
+    // were exactly this -- a task discussing the render projection, not a
+    // buried decision. Every "TODO" occurrence below is glued to a `/` or a
+    // `.<letter>` extension, so none of them should read as the marker.
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "x", .body =
+        "docs/TODO.md is the projection Scott reads. See also TODO.md and path/TODO for the same file." } });
+    try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
+
+    try f.run(&.{ "archive", "--dry-run" });
+    try testing.expectEqual(@as(usize, 0), f.warn.items.len);
+}
+
+test "archive: TODO marker still refuses a genuine buried TODO, even sharing a line with docs/TODO.md" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Direction B of the same fix: suppressing the filename false-positive
+    // must not also suppress the real thing the guard exists for.
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "x", .body = "TODO: decide approach A or B" } });
+    try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{"archive"}));
+
+    // A line can carry BOTH a filename mention and a real marker word -- the
+    // filename-shaped occurrence must not short-circuit the scan away from
+    // the genuine one later in the same line.
+    var f2 = try Fixture.init(alloc);
+    defer f2.deinit();
+    const b = mintId();
+    try f2.store.append(.{ .add = .{ .id = b, .title = "y", .body =
+        "the docs/TODO.md render bug leaves a TODO here to decide" } });
+    try f2.store.append(.{ .setState = .{ .id = b, .state = .done } });
+    try testing.expectEqual(@as(anyerror, error.UsageError), f2.runExpectErr(&.{"archive"}));
+}
