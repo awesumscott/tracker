@@ -52,7 +52,7 @@ test "findRoot: walks up several levels to find .tracker, ancestor is owned" {
 
 // Note: a "no .tracker and no worktree boundary ANYWHERE up to max_depth"
 // case can't be tested deterministically against `testing.tmpDir` -- it roots
-// under the real process cwd (this repo, `/mnt/c/dev/zig/trk`, which walking
+// under the real process cwd (this repo, `~/dev/zig/trk`, which walking
 // up would legitimately reach and find ITS OWN dev `.tracker` a few levels
 // above `.zig-cache/tmp/<rand>/` -- correctly, since that's the exact
 // "runs from any subdirectory of a project" behavior for a plain,

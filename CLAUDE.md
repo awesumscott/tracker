@@ -17,7 +17,7 @@ zig build -Dtarget=x86_64-windows-gnu   # cross-compile check (must stay clean; 
 
 There is no test-filter option wired in build.zig; `zig build test` runs everything (it's fast). Library tests aggregate through the `test {}` block in `src/tracker.zig` — a new test file must be `_ = @import(...)`'d there (or wired in build.zig like cli_test.zig) or it silently won't run.
 
-WSL note: this repo lives on `/mnt/c`. For parallel/worktree builds route `ZIG_LOCAL_CACHE_DIR` to `$HOME/.cache/...` (Windows file-locking can wedge an in-tree `.zig-cache`), and before trusting a run of `zig-out/bin/trk`, check the binary's mtime — a build immediately after a failed build can report success while installing a stale artifact.
+WSL note: this repo lives on ext4 at `~/dev/zig/trk` (moved off the `/mnt/c` DrvFs mount 2026-08-26, sibling to the Enix checkout that consumes it, so `../trk` resolves from there). Build bare into the in-tree `.zig-cache` — do NOT route `ZIG_LOCAL_CACHE_DIR` elsewhere. The trap that rule existed for (Windows file-locking wedging the cache so a build reports success while installing a stale artifact) was a DrvFs property and went away with the move.
 
 ## Architecture
 
