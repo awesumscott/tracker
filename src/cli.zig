@@ -520,7 +520,7 @@ pub const Cli = struct {
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
-        \\            [--allow-buried-decisions] [--allow-buried-decisions-for <id> ...]
+        \\            [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>]...
         \\  Graduate DONE tasks to changelog bullets (--out > config archive.out >
         \\  stdout), then flip each to `archived` so it leaves every view (structural
         \\  dedup — re-running finds nothing). A file target is APPENDED to under a
@@ -530,15 +530,22 @@ pub const Cli = struct {
         \\  fork, a "your call", a FIX NOTE. The work can be finished while the DECISION
         \\  is unresolved, and `archived` is hidden from every view, so archiving buries
         \\  it. archive REFUSES if any closing body carries a marker, listing task id +
-        \\  matched line; split those out as their own tasks, then archive. It refuses
-        \\  rather than warning because a warning in a bulk run scrolls past and the
-        \\  burial is permanent. --dry-run reports the hits without refusing (nothing is
-        \\  buried by a preview).
-        \\  Two overrides, different blast radius: --allow-buried-decisions-for <id>
-        \\  (repeatable) exempts ONLY that task's hits, so one task whose body
-        \\  legitimately discusses the guard's own marker vocabulary (e.g. a task
-        \\  ABOUT this very check) does not force you to wave through every other hit
-        \\  in the same run. --allow-buried-decisions (bare) overrides the WHOLE run —
+        \\  matched line (labeled marker-shaped or prose-shaped — reporting only, it
+        \\  does not change what's fatal); split those out as their own tasks, then
+        \\  archive. It refuses rather than warning because a warning in a bulk run
+        \\  scrolls past and the burial is permanent. --dry-run reports the hits without
+        \\  refusing (nothing is buried by a preview).
+        \\  Two overrides, different blast radius: --allow-buried-decisions-for <id>:<n>
+        \\  (repeat the FLAG to name more than one — a bare id-shaped token after it is
+        \\  a hard error, not a second value) exempts ONLY that task's hits, and ONLY
+        \\  while it still carries EXACTLY <n> of them: naming the count is an
+        \\  assertion, so a marker line added to that task AFTER you named <n> makes the
+        \\  count stop matching and the exemption stops applying — it does not silently
+        \\  ride along. This is how one task whose body legitimately discusses the
+        \\  guard's own marker vocabulary (e.g. a task ABOUT this very check) can be
+        \\  exempted without forcing you to wave through every other hit in the same
+        \\  run, and without that exemption quietly covering a LATER decision appended
+        \\  to the same task. --allow-buried-decisions (bare) overrides the WHOLE run —
         \\  use it only once you have looked at every hit, since a false positive on
         \\  one task otherwise pressures you into bypassing the guard for a real one
         \\  hiding in the same batch.
@@ -668,7 +675,7 @@ pub const Cli = struct {
             \\      Header reports an arc-less drift count every regeneration.
             \\  trk tree <arc-or-task>       the ASCII prereq hierarchy
             \\  trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
-            \\              [--allow-buried-decisions] [--allow-buried-decisions-for <id> ...]
+            \\              [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>]...
             \\      Graduate DONE tasks to the changelog: emit them as markdown bullets
             \\      (appended to --out/config target under a dated heading, else stdout),
             \\      then flip each to `archived` so it leaves every view (structural
@@ -677,7 +684,8 @@ pub const Cli = struct {
             \\      OPEN QUESTION, FIX NOTE, your call, TODO — configurable via config's
             \\      archive.decision_markers): `archived` is hidden from every view, so an
             \\      unresolved fork in a finished task's body would be buried with it.
-            \\      --allow-buried-decisions-for <id> exempts just that task's hits (repeatable);
+            \\      --allow-buried-decisions-for <id>:<n> exempts just that task's hits, and only
+            \\      while it still carries exactly <n> of them (repeat the flag for more than one);
             \\      --allow-buried-decisions overrides the WHOLE run; --dry-run reports without refusing.
             \\  trk compact [--force]        rewrite snapshot + truncate log (drops archived/dropped)
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
@@ -1743,6 +1751,24 @@ pub const Cli = struct {
                 try self.print("trk: unknown flag '{s}'\n", .{args[i]});
                 return error.UnknownFlag;
             } else {
+                // A bare id-shaped token here can ONLY be a mistake (finding 7,
+                // 01M12ZG5ER): the synopsis renders `--allow-buried-decisions-for
+                // <id> ...` as if a second bare id extended the SAME flag, but the
+                // parser takes exactly one value per flag and silently folds any
+                // further bare token into the title/body/tag search filter
+                // instead — exempting only the first id and quietly narrowing the
+                // archive set to (almost always) zero matches, with no error at
+                // all. A search term that happens to be id-shaped is not a real
+                // use case worth keeping alive at that cost.
+                if (looksIdShaped(args[i])) {
+                    try self.print(
+                        "trk: '{s}' looks like a task id, not a search word. If you meant to " ++
+                            "exempt another task from the decision guard, repeat the flag: " ++
+                            "--allow-buried-decisions-for {s}:<n>\n",
+                        .{ args[i], args[i] },
+                    );
+                    return error.UsageError;
+                }
                 try words.append(self.gpa, args[i]);
             }
         }
@@ -1770,14 +1796,27 @@ pub const Cli = struct {
             return;
         }
 
-        // Per-task escape (01M12ZG5ER): --allow-buried-decisions-for <id> exempts
-        // ONLY the named task's hits, so one known-clean task's noise does not
-        // pressure the operator into --allow-buried-decisions, which waves
-        // through the WHOLE run. Resolved same as --arc: a bad id is a hard
+        // Per-task escape (01M12ZG5ER, tightened by finding 4): each
+        // --allow-buried-decisions-for value is `<id>:<n>`, exempting ONLY the
+        // named task's hits, and ONLY if it still carries EXACTLY `n` of them —
+        // see AllowFor and reportBuriedDecisions for why the count is an
+        // assertion, not a label. Resolved same as --arc: a bad id is a hard
         // error, not a silent no-op.
-        var allow_for: std.ArrayList(Ulid) = .empty;
+        var allow_for: std.ArrayList(AllowFor) = .empty;
         defer allow_for.deinit(self.gpa);
-        for (allow_for_raw.items) |raw| try allow_for.append(self.gpa, try self.resolve(raw));
+        for (allow_for_raw.items) |raw| {
+            const sep = std.mem.lastIndexOfScalar(u8, raw, ':') orelse {
+                try self.print(
+                    "trk: --allow-buried-decisions-for needs '<id>:<n>' (the task's expected " ++
+                        "hit count), got '{s}'\n",
+                    .{raw},
+                );
+                return error.UsageError;
+            };
+            const id = try self.resolve(raw[0..sep]);
+            const n = try self.parseUsize(raw[sep + 1 ..]);
+            try allow_for.append(self.gpa, .{ .id = id, .count = n });
+        }
 
         // Decision guard. `archive` is the LAST actor that can see these bodies:
         // one line later every matched task is `archived`, which is hidden from
@@ -1839,75 +1878,139 @@ pub const Cli = struct {
         override,
     };
 
+    /// One `--allow-buried-decisions-for <id>:<n>` value: exempt `id`, but only
+    /// while it carries EXACTLY `n` marker hits. See `reportBuriedDecisions`.
+    const AllowFor = struct { id: Ulid, count: usize };
+
     /// Scan each closing body for decision markers and report every hit as
-    /// `<short-id>  <marker>  <line>`. Returns true iff the run should be
-    /// BLOCKED (the caller's cue to return `error.UsageError`) — never merely
-    /// "anything matched", since `exempt` can make a hit non-fatal.
+    /// `<short-id>  [<marker>] (<shape>)  <line>`. Returns true iff the run
+    /// should be BLOCKED (the caller's cue to return `error.UsageError`) —
+    /// never merely "anything matched", since `exempt` can make a hit non-fatal.
     ///
-    /// `exempt` is the id list from `--allow-buried-decisions-for` (01M12ZG5ER):
-    /// a hit on one of these ids is still REPORTED (transparency — the operator
-    /// should see what they exempted) but does not block the run. This is the
-    /// per-task escape that removes the all-or-nothing pressure
-    /// `--allow-buried-decisions` (whole-run override, `mode == .override`)
-    /// creates: one task whose body legitimately discusses the guard's own
-    /// marker vocabulary (a meta-task like 01M12D4EV) should not force the
-    /// operator to wave through every OTHER hit in the same done queue, which
-    /// is exactly how a genuine buried fork gets missed later. A per-task
-    /// escape has no false-negative risk of its own — it still requires the
-    /// operator to name the exact id, having seen its hit lines — unlike a
-    /// content heuristic, which for THIS false-positive shape (a task
-    /// discussing markers in plain prose, not glued to any filename-like
-    /// syntax) has no reliable syntactic signal to key off; see 01M12ZG5ER's
-    /// closing note.
+    /// `exempt` is the `<id>:<n>` list from `--allow-buried-decisions-for`
+    /// (01M12ZG5ER, tightened by finding 4 on 2026-08-27): a hit on one of
+    /// these ids is still REPORTED (transparency — the operator should see
+    /// what they exempted) and is non-fatal ONLY while that task's ACTUAL hit
+    /// count still equals the declared `n`. This is the per-task escape that
+    /// removes the all-or-nothing pressure `--allow-buried-decisions`
+    /// (whole-run override, `mode == .override`) creates: one task whose body
+    /// legitimately discusses the guard's own marker vocabulary (a meta-task
+    /// like 01M12D4EV) should not force the operator to wave through every
+    /// OTHER hit in the same done queue, which is exactly how a genuine buried
+    /// fork gets missed later.
+    ///
+    /// The count is an ASSERTION, not a label (the `enixedit` `count`
+    /// convention): a bare per-task exemption with no count would exempt EVERY
+    /// marker line the task ever grows, including one appended AFTER the
+    /// operator looked and exempted it — the exact scroll-past failure the
+    /// guard exists to prevent, one level down, because the operator can no
+    /// longer distinguish "the 15 lines I already saw" from "the 16th, added
+    /// since". Naming the count forces a re-look: a new hit changes the actual
+    /// count, the declared `n` no longer matches, and the exemption stops
+    /// applying to that task — every one of its hits reverts to fatal under
+    /// `.refuse`, printed with a mismatch note rather than the exempted tag.
+    ///
+    /// This is deliberately NOT solved by sharpening the content heuristic
+    /// (`isFilenamePosition`'s filename/path shape check): the meta body's
+    /// markers sit in a comma list glued to no path syntax, so no reliable
+    /// syntactic signal distinguishes it from a genuine marker written with a
+    /// slightly different shape (an em dash instead of a colon, say) — and a
+    /// false negative there is a silent, permanent burial, while a false
+    /// positive is only an annoyance. That asymmetry is why the count
+    /// assertion — not a smarter heuristic — is the fix; the heuristic still
+    /// contributes a REPORTING-only refinement (see `isMarkerShaped`) that
+    /// labels each hit `marker-shaped` (colon-glued to content, the genuine
+    /// shape) vs `prose-shaped` (the meta-discussion shape), which does not
+    /// change fatality but makes a newly-added 16th hit stand out among 15
+    /// already-seen prose-shaped ones.
     ///
     /// A real run REFUSES rather than warning, on the same reasoning that ruled
     /// hard-removal over deprecation for `--body`: a warning inside a bulk
     /// archive run scrolls past in an agent's tool output, and the thing it
     /// failed to stop is a permanent burial.
-    fn reportBuriedDecisions(self: *Cli, ids: []const Ulid, mode: BuriedMode, exempt: []const Ulid) Error!bool {
+    fn reportBuriedDecisions(self: *Cli, ids: []const Ulid, mode: BuriedMode, exempt: []const AllowFor) Error!bool {
         const markers = self.store.config.decision_markers orelse
             tracker.store.default_decision_markers;
         if (markers.len == 0) return false; // explicitly disabled via config
 
+        const Hit = struct { marker: []const u8, line: []const u8 };
+
         var hits: usize = 0;
         var fatal: usize = 0; // hits NOT covered by mode/exempt -- these block a refuse run
+        var mismatched_tasks: usize = 0; // exempted ids whose declared count no longer matches
         for (ids) |id| {
             const t = self.store.get(id).?;
             if (t.body.len == 0) continue;
-            // .override (--allow-buried-decisions, bare) already waves through
-            // the whole run, so every id is exempt under it; per-task exemption
-            // only has teeth under .refuse/.preview.
-            const is_exempt = mode == .override or containsId(exempt, id);
-            var sb: [ulid.len]u8 = undefined;
-            const sid = try self.shortId(id, &sb);
+
+            // Collect this task's hits FIRST, so the count assertion is judged
+            // against its real, current total -- not the count the operator
+            // declared, which may now be stale.
+            var task_hits: std.ArrayList(Hit) = .empty;
+            defer task_hits.deinit(self.gpa);
             var lines = std.mem.splitScalar(u8, t.body, '\n');
             while (lines.next()) |raw| {
                 const line = std.mem.trim(u8, raw, " \t\r");
                 if (line.len == 0) continue;
                 for (markers) |m| {
                     if (m.len == 0 or !containsMarker(line, m)) continue;
-                    if (hits == 0) {
-                        try self.warn.print(self.gpa,
-                            "trk: {s}: task bodies about to be archived carry DECISION markers. " ++
-                                "`archived` is hidden from every view, so these lines are graduated out of sight " ++
-                                "with the work:\n",
-                            .{if (mode == .refuse) "refusing" else "note"});
-                    }
-                    hits += 1;
-                    if (!is_exempt) fatal += 1;
-                    try self.warn.print(self.gpa, "  {s}  [{s}]  {s}{s}\n", .{
-                        sid,
-                        m,
-                        line,
-                        if (is_exempt and mode != .override) "  (exempted: --allow-buried-decisions-for)" else "",
-                    });
+                    try task_hits.append(self.gpa, .{ .marker = m, .line = line });
                     break; // one report per line, whichever marker hit first
                 }
             }
+            if (task_hits.items.len == 0) continue;
+
+            var declared: ?usize = null;
+            for (exempt) |e| {
+                if (e.id.eql(id)) {
+                    declared = e.count;
+                    break;
+                }
+            }
+            const count_matches = declared != null and declared.? == task_hits.items.len;
+            // .override (--allow-buried-decisions, bare) already waves through
+            // the whole run, so every id is exempt under it; per-task exemption
+            // only has teeth under .refuse/.preview, and only while the count
+            // still matches what was declared.
+            const is_exempt = mode == .override or count_matches;
+            const count_named_but_stale = declared != null and !count_matches;
+            if (count_named_but_stale) mismatched_tasks += 1;
+
+            var sb: [ulid.len]u8 = undefined;
+            const sid = try self.shortId(id, &sb);
+            for (task_hits.items) |h| {
+                if (hits == 0) {
+                    try self.warn.print(self.gpa,
+                        "trk: {s}: task bodies about to be archived carry DECISION markers. " ++
+                            "`archived` is hidden from every view, so these lines are graduated out of sight " ++
+                            "with the work:\n",
+                        .{if (mode == .refuse) "refusing" else "note"});
+                }
+                hits += 1;
+                if (!is_exempt) fatal += 1;
+                const shape = if (isMarkerShaped(h.line, h.marker)) "marker-shaped" else "prose-shaped";
+                const tag = if (is_exempt and mode != .override)
+                    "  (exempted: --allow-buried-decisions-for)"
+                else if (count_named_but_stale)
+                    "  (--allow-buried-decisions-for count no longer matches -- exemption does NOT apply)"
+                else
+                    "";
+                try self.warn.print(self.gpa, "  {s}  [{s}] ({s})  {s}{s}\n", .{ sid, h.marker, shape, h.line, tag });
+            }
         }
         if (hits == 0) return false;
+        if (mismatched_tasks > 0) {
+            try self.warn.print(self.gpa,
+                "  {d} task(s) named via --allow-buried-decisions-for no longer carry the declared " ++
+                    "hit count -- a marker line was added or removed since that count was named, so " ++
+                    "the exemption does not apply; re-check and re-declare with the current count.\n",
+                .{mismatched_tasks});
+        }
         if (mode == .preview) {
-            if (fatal < hits) {
+            if (fatal == 0) {
+                try self.warn.print(self.gpa,
+                    "  ({d} line(s), all exempted via --allow-buried-decisions-for -- a real run " ++
+                        "would archive anyway)\n", .{hits});
+            } else if (fatal < hits) {
                 try self.warn.print(self.gpa,
                     "  ({d} line(s), {d} exempted via --allow-buried-decisions-for; a real run would " ++
                         "still refuse the remaining {d})\n", .{ hits, hits - fatal, fatal });
@@ -1925,7 +2028,7 @@ pub const Cli = struct {
         } else {
             try self.warn.print(self.gpa,
                 "  Split each decision out as its own task first (`trk add ...`), then archive.\n" ++
-                    "  To archive just the exempted task(s) anyway: trk archive --allow-buried-decisions-for <id>\n" ++
+                    "  To archive just the exempted task(s) anyway: trk archive --allow-buried-decisions-for <id>:<n>\n" ++
                     "  To archive everything anyway: trk archive --allow-buried-decisions\n" ++
                     "  To change what counts: .tracker/config.json -> archive.decision_markers (a JSON array; [] disables)\n",
                 .{});
@@ -1958,25 +2061,74 @@ pub const Cli = struct {
         return false;
     }
 
-    /// ASCII case-insensitive substring search for a decision marker, skipping
-    /// any occurrence that `isFilenamePosition` identifies as a path/filename
-    /// component rather than a marker word. The marker set mixes cases
-    /// (`TODO`, `your call`), and a body written by a human or an agent will
-    /// not match the configured casing reliably — matching case-sensitively
-    /// would make the guard depend on shouting. A line can contain the needle
-    /// more than once (e.g. both a path mention and a real marker use), so a
+    /// End index (exclusive) of the first occurrence of `needle` in `haystack`
+    /// (ASCII case-insensitive) that `isFilenamePosition` does NOT identify as
+    /// a path/filename component, or `null` if there is none. Shared by
+    /// `containsMarker` (fatality) and `isMarkerShaped` (reporting shape) so
+    /// both judge the SAME occurrence. A line can contain the needle more than
+    /// once (e.g. both a path mention and a real marker use), so a
     /// filename-shaped occurrence does not short-circuit the scan — it keeps
     /// looking for one that isn't.
-    fn containsMarker(haystack: []const u8, needle: []const u8) bool {
-        if (needle.len > haystack.len) return false;
+    fn markerMatchEnd(haystack: []const u8, needle: []const u8) ?usize {
+        if (needle.len > haystack.len) return null;
         var i: usize = 0;
         outer: while (i + needle.len <= haystack.len) : (i += 1) {
             for (needle, 0..) |c, j| {
                 if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) continue :outer;
             }
-            if (!isFilenamePosition(haystack, i, i + needle.len)) return true;
+            if (!isFilenamePosition(haystack, i, i + needle.len)) return i + needle.len;
         }
-        return false;
+        return null;
+    }
+
+    /// ASCII case-insensitive substring search for a decision marker, skipping
+    /// any occurrence that `isFilenamePosition` identifies as a path/filename
+    /// component rather than a marker word. The marker set mixes cases
+    /// (`TODO`, `your call`), and a body written by a human or an agent will
+    /// not match the configured casing reliably — matching case-sensitively
+    /// would make the guard depend on shouting.
+    fn containsMarker(haystack: []const u8, needle: []const u8) bool {
+        return markerMatchEnd(haystack, needle) != null;
+    }
+
+    /// REPORTING-only classification (does not affect fatality — see
+    /// `reportBuriedDecisions`'s doc comment for why the count assertion, not
+    /// this heuristic, is what the guard's correctness rests on): a genuine
+    /// marker use is glued to its content by a colon (`OPEN QUESTION: which
+    /// cadence…`); a marker WORD merely discussed in running prose (a comma
+    /// list, a sentence describing the guard itself, e.g. 01M12D4EV's "a
+    /// scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker.")
+    /// is not. This label exists to make a genuinely new hit stand out among a
+    /// batch of already-seen prose-shaped noise — directly mitigating finding
+    /// 4's failure shape — not to suppress or promote anything.
+    fn isMarkerShaped(line: []const u8, marker: []const u8) bool {
+        const end = markerMatchEnd(line, marker) orelse return false;
+        var j = end;
+        while (j < line.len and line[j] == ' ') : (j += 1) {}
+        if (j >= line.len or line[j] != ':') return false;
+        j += 1;
+        while (j < line.len and line[j] == ' ') : (j += 1) {}
+        return j < line.len;
+    }
+
+    /// Heuristic (finding 7, 01M12ZG5ER's flag surface): does `s` plausibly
+    /// look like a ULID or a frozen/dynamic short-id (Crockford base32,
+    /// case-insensitive, no I/L/O/U, length in a short-id's plausible range)?
+    /// Used only to refuse a bare positional in `archive`'s arg list that would
+    /// otherwise silently fall through to the title/body/tag search filter —
+    /// the one place this fires for real is a second id typed after
+    /// `--allow-buried-decisions-for` without repeating the flag, which
+    /// otherwise exempts only the first id and narrows the archive set to a
+    /// search term that (almost always) matches nothing, with no error at all.
+    fn looksIdShaped(s: []const u8) bool {
+        if (s.len < min_short_mint or s.len > ulid.len) return false;
+        for (s) |c| {
+            const u = std.ascii.toUpper(c);
+            const is_digit = u >= '0' and u <= '9';
+            const is_letter = u >= 'A' and u <= 'Z' and u != 'I' and u != 'L' and u != 'O' and u != 'U';
+            if (!is_digit and !is_letter) return false;
+        }
+        return true;
     }
 
     /// One changelog-draft bullet for a graduated task: `- <title> #tags
