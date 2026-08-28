@@ -801,15 +801,28 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     never glued to a path separator, and a `.` after it ends a sentence (whitespace or EOL follows), never
     another letter. This can only ever SUPPRESS a filename-shaped occurrence; a line carrying both a filename
     mention and a genuine marker still refuses, because the scan keeps looking past the filename-shaped hit.
-  - **A per-task escape, `--allow-buried-decisions-for <id> ...`** (2026-08-27, task `01M12ZG5ER`). The filename
-    fix does not touch the other false-positive shape: a task whose body DISCUSSES the guard's own marker
-    vocabulary as its subject (a task ABOUT this very check, like `01M12D4EV` itself) has no filename-like syntax
-    to key off — the markers sit in plain prose, with no reliable syntactic tell apart from a real one. Content
-    heuristics for that shape were rejected: whatever pattern would catch "a body about markers" risks
-    suppressing a real marker phrased similarly, which is exactly the failure the guard exists to prevent. So the
-    fix is procedural rather than semantic: `--allow-buried-decisions-for` exempts only the named task's hits,
-    leaving every other hit in the same run fatal under `--refuse`. This removes the actual danger
-    `--allow-buried-decisions` (whole-run override) creates — one false positive pressuring the operator into
-    waving through the entire done queue, exactly when it is largest (a session-ender) — without weakening the
-    guard for anything not explicitly named. The two escapes compose: `--allow-buried-decisions-for` only has
-    teeth under `--refuse`/`--dry-run`; `--allow-buried-decisions` (bare) still overrides everything, unchanged.
+  - **A per-task escape, `--allow-buried-decisions-for <id>:<n>`** (2026-08-27, task `01M12ZG5ER`; the count
+    assertion added 2026-08-28, an independent review of the first shape). The filename fix does not touch the
+    other false-positive shape: a task whose body DISCUSSES the guard's own marker vocabulary as its subject (a
+    task ABOUT this very check, like `01M12D4EV` itself) has no filename-like syntax to key off — the markers sit
+    in plain prose, with no reliable syntactic tell apart from a real one. Content heuristics for that shape were
+    rejected: whatever pattern would catch "a body about markers" risks suppressing a real marker phrased
+    similarly, which is exactly the failure the guard exists to prevent (the false-negative cost — permanent
+    burial — dominates the false-positive cost — an extra flag). So the fix is procedural rather than semantic:
+    `--allow-buried-decisions-for` exempts only the named task's hits, leaving every other hit in the same run
+    fatal under `--refuse`. This removes the actual danger `--allow-buried-decisions` (whole-run override)
+    creates — one false positive pressuring the operator into waving through the entire done queue, exactly when
+    it is largest (a session-ender) — without weakening the guard for anything not explicitly named.
+    **The exemption is per-TASK, not per-LINE** — a bare `--allow-buried-decisions-for <id>` (the first shape
+    shipped) makes EVERY marker line in that task non-fatal forever, including one appended to the SAME task
+    after the operator looked and exempted it: the exact scroll-past-and-bury failure the guard exists to
+    prevent, reintroduced one level down. So the value now names the task's expected hit count —
+    `<id>:<n>` — and the guard only treats it as exempt while the task's ACTUAL current hit count still equals
+    `n`; a marker line added or removed since `n` was named makes the exemption stop applying, and every hit on
+    that task reverts to fatal. The count is an assertion (the `enixedit` `count` convention), not a label —
+    re-declaring the current count after a genuine re-look is the cost of keeping the escape's teeth. Reporting
+    (not fatality) also labels each hit `marker-shaped` (colon-glued to content, e.g. `OPEN QUESTION: which
+    way?`) or `prose-shaped` (a marker word merely discussed, e.g. a comma list) so a newly-added hit stands out
+    among a batch of already-seen prose-shaped ones. The two escapes compose: `--allow-buried-decisions-for` only
+    has teeth under `--refuse`/`--dry-run`; `--allow-buried-decisions` (bare) still overrides everything,
+    unchanged.
