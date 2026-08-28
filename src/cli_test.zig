@@ -3187,3 +3187,80 @@ test "archive: TODO marker still refuses a genuine buried TODO, even sharing a l
     try f2.store.append(.{ .setState = .{ .id = b, .state = .done } });
     try testing.expectEqual(@as(anyerror, error.UsageError), f2.runExpectErr(&.{"archive"}));
 }
+
+test "archive: --allow-buried-decisions-for exempts only the named task; another task's genuine marker still refuses the run" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Shaped after the real 2026-08-27 corpus (01M12ZG5ER): a task whose body
+    // discusses the guard's own marker vocabulary as its SUBJECT (no fork of
+    // its own), alongside a genuinely unresolved one in a different task.
+    const meta = mintId();
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body =
+        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
+    const real = mintId();
+    try f.store.append(.{ .add = .{ .id = real, .title = "real", .body =
+        "shipped the fix\nOPEN QUESTION: which cadence do we publish on?\n" } });
+    try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = real, .state = .done } });
+
+    var mb: [ulid.len]u8 = undefined;
+    var rb: [ulid.len]u8 = undefined;
+    const meta_s = try f.c.shortId(meta, &mb);
+    const real_s = try f.c.shortId(real, &rb);
+
+    // EXCLUDES correctly: exempting only `meta` still refuses, because `real`'s
+    // hit is not covered -- the per-task escape must not become a whole-run
+    // override in disguise.
+    {
+        const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", meta_s });
+        try testing.expectEqual(@as(anyerror, error.UsageError), e);
+        try testing.expect(std.mem.indexOf(u8, f.warn.items, "(exempted: --allow-buried-decisions-for)") != null);
+        try testing.expectEqual(tracker.State.done, f.store.get(meta).?.state);
+        try testing.expectEqual(tracker.State.done, f.store.get(real).?.state);
+    }
+
+    // INCLUDES correctly: naming BOTH ids lets the run through, and both
+    // archive.
+    {
+        try f.run(&.{ "archive", "--allow-buried-decisions-for", meta_s, "--allow-buried-decisions-for", real_s });
+        try testing.expectEqual(tracker.State.archived, f.store.get(meta).?.state);
+        try testing.expectEqual(tracker.State.archived, f.store.get(real).?.state);
+    }
+}
+
+test "archive --dry-run: --allow-buried-decisions-for is informational only, and never refuses" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const meta = mintId();
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = "discusses the TODO marker" } });
+    const real = mintId();
+    try f.store.append(.{ .add = .{ .id = real, .title = "real", .body = "OPEN QUESTION: which way?" } });
+    try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = real, .state = .done } });
+
+    var mb: [ulid.len]u8 = undefined;
+    const meta_s = try f.c.shortId(meta, &mb);
+
+    try f.run(&.{ "archive", "--dry-run", "--allow-buried-decisions-for", meta_s });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "exempted via --allow-buried-decisions-for; a real run would still refuse the remaining 1") != null);
+    try testing.expectEqual(tracker.State.done, f.store.get(meta).?.state);
+    try testing.expectEqual(tracker.State.done, f.store.get(real).?.state);
+}
+
+test "archive --allow-buried-decisions-for: a bad id is a hard error, not a silent no-op" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "x", .body = "OPEN QUESTION: unresolved" } });
+    try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
+
+    const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", "01ZZZZZZZZZZZZZZZZZZZZZZZZ" });
+    try testing.expectEqual(@as(anyerror, error.NoSuchId), e);
+    try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+}

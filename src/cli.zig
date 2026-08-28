@@ -520,7 +520,7 @@ pub const Cli = struct {
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
-        \\            [--allow-buried-decisions]
+        \\            [--allow-buried-decisions] [--allow-buried-decisions-for <id> ...]
         \\  Graduate DONE tasks to changelog bullets (--out > config archive.out >
         \\  stdout), then flip each to `archived` so it leaves every view (structural
         \\  dedup — re-running finds nothing). A file target is APPENDED to under a
@@ -532,8 +532,16 @@ pub const Cli = struct {
         \\  it. archive REFUSES if any closing body carries a marker, listing task id +
         \\  matched line; split those out as their own tasks, then archive. It refuses
         \\  rather than warning because a warning in a bulk run scrolls past and the
-        \\  burial is permanent. --allow-buried-decisions proceeds anyway; --dry-run
-        \\  reports the hits without refusing (nothing is buried by a preview).
+        \\  burial is permanent. --dry-run reports the hits without refusing (nothing is
+        \\  buried by a preview).
+        \\  Two overrides, different blast radius: --allow-buried-decisions-for <id>
+        \\  (repeatable) exempts ONLY that task's hits, so one task whose body
+        \\  legitimately discusses the guard's own marker vocabulary (e.g. a task
+        \\  ABOUT this very check) does not force you to wave through every other hit
+        \\  in the same run. --allow-buried-decisions (bare) overrides the WHOLE run —
+        \\  use it only once you have looked at every hit, since a false positive on
+        \\  one task otherwise pressures you into bypassing the guard for a real one
+        \\  hiding in the same batch.
         \\  Markers default to: scott-decision, OPEN QUESTION, FIX NOTE, your call, TODO
         \\  (matched case-insensitively). Override with .tracker/config.json ->
         \\  archive.decision_markers, a JSON array of strings; [] disables the check.
@@ -660,7 +668,7 @@ pub const Cli = struct {
             \\      Header reports an arc-less drift count every regeneration.
             \\  trk tree <arc-or-task>       the ASCII prereq hierarchy
             \\  trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
-            \\              [--allow-buried-decisions]
+            \\              [--allow-buried-decisions] [--allow-buried-decisions-for <id> ...]
             \\      Graduate DONE tasks to the changelog: emit them as markdown bullets
             \\      (appended to --out/config target under a dated heading, else stdout),
             \\      then flip each to `archived` so it leaves every view (structural
@@ -669,7 +677,8 @@ pub const Cli = struct {
             \\      OPEN QUESTION, FIX NOTE, your call, TODO — configurable via config's
             \\      archive.decision_markers): `archived` is hidden from every view, so an
             \\      unresolved fork in a finished task's body would be buried with it.
-            \\      --allow-buried-decisions overrides; --dry-run reports without refusing.
+            \\      --allow-buried-decisions-for <id> exempts just that task's hits (repeatable);
+            \\      --allow-buried-decisions overrides the WHOLE run; --dry-run reports without refusing.
             \\  trk compact [--force]        rewrite snapshot + truncate log (drops archived/dropped)
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
             \\  trk doc list                 print all registered doc_id -> path mappings
@@ -1708,6 +1717,8 @@ pub const Cli = struct {
         var out_path: ?[]const u8 = null;
         var dry_run = false;
         var allow_buried = false;
+        var allow_for_raw: std.ArrayList([]const u8) = .empty;
+        defer allow_for_raw.deinit(self.gpa);
         var arc_filter: ?[]const u8 = null;
         var tag_filter: ?[]const u8 = null;
         var words: std.ArrayList([]const u8) = .empty;
@@ -1720,6 +1731,8 @@ pub const Cli = struct {
                 dry_run = true;
             } else if (std.mem.eql(u8, args[i], "--allow-buried-decisions")) {
                 allow_buried = true;
+            } else if (std.mem.eql(u8, args[i], "--allow-buried-decisions-for")) {
+                try allow_for_raw.append(self.gpa, try self.flagVal(args, &i, "--allow-buried-decisions-for"));
             } else if (std.mem.eql(u8, args[i], "--arc")) {
                 arc_filter = try self.flagVal(args, &i, "--arc");
             } else if (std.mem.eql(u8, args[i], "--tag")) {
@@ -1757,12 +1770,21 @@ pub const Cli = struct {
             return;
         }
 
+        // Per-task escape (01M12ZG5ER): --allow-buried-decisions-for <id> exempts
+        // ONLY the named task's hits, so one known-clean task's noise does not
+        // pressure the operator into --allow-buried-decisions, which waves
+        // through the WHOLE run. Resolved same as --arc: a bad id is a hard
+        // error, not a silent no-op.
+        var allow_for: std.ArrayList(Ulid) = .empty;
+        defer allow_for.deinit(self.gpa);
+        for (allow_for_raw.items) |raw| try allow_for.append(self.gpa, try self.resolve(raw));
+
         // Decision guard. `archive` is the LAST actor that can see these bodies:
         // one line later every matched task is `archived`, which is hidden from
         // every view. It is also the only actor that sees the whole done queue at
         // that moment. So the check belongs here and nowhere else.
         const guard_mode: BuriedMode = if (dry_run) .preview else if (allow_buried) .override else .refuse;
-        if (try self.reportBuriedDecisions(matched.items, guard_mode) and guard_mode == .refuse) {
+        if (try self.reportBuriedDecisions(matched.items, guard_mode, allow_for.items)) {
             return error.UsageError;
         }
 
@@ -1818,21 +1840,44 @@ pub const Cli = struct {
     };
 
     /// Scan each closing body for decision markers and report every hit as
-    /// `<short-id>  <marker>  <line>`. Returns true iff anything matched.
+    /// `<short-id>  <marker>  <line>`. Returns true iff the run should be
+    /// BLOCKED (the caller's cue to return `error.UsageError`) — never merely
+    /// "anything matched", since `exempt` can make a hit non-fatal.
+    ///
+    /// `exempt` is the id list from `--allow-buried-decisions-for` (01M12ZG5ER):
+    /// a hit on one of these ids is still REPORTED (transparency — the operator
+    /// should see what they exempted) but does not block the run. This is the
+    /// per-task escape that removes the all-or-nothing pressure
+    /// `--allow-buried-decisions` (whole-run override, `mode == .override`)
+    /// creates: one task whose body legitimately discusses the guard's own
+    /// marker vocabulary (a meta-task like 01M12D4EV) should not force the
+    /// operator to wave through every OTHER hit in the same done queue, which
+    /// is exactly how a genuine buried fork gets missed later. A per-task
+    /// escape has no false-negative risk of its own — it still requires the
+    /// operator to name the exact id, having seen its hit lines — unlike a
+    /// content heuristic, which for THIS false-positive shape (a task
+    /// discussing markers in plain prose, not glued to any filename-like
+    /// syntax) has no reliable syntactic signal to key off; see 01M12ZG5ER's
+    /// closing note.
     ///
     /// A real run REFUSES rather than warning, on the same reasoning that ruled
     /// hard-removal over deprecation for `--body`: a warning inside a bulk
     /// archive run scrolls past in an agent's tool output, and the thing it
     /// failed to stop is a permanent burial.
-    fn reportBuriedDecisions(self: *Cli, ids: []const Ulid, mode: BuriedMode) Error!bool {
+    fn reportBuriedDecisions(self: *Cli, ids: []const Ulid, mode: BuriedMode, exempt: []const Ulid) Error!bool {
         const markers = self.store.config.decision_markers orelse
             tracker.store.default_decision_markers;
         if (markers.len == 0) return false; // explicitly disabled via config
 
         var hits: usize = 0;
+        var fatal: usize = 0; // hits NOT covered by mode/exempt -- these block a refuse run
         for (ids) |id| {
             const t = self.store.get(id).?;
             if (t.body.len == 0) continue;
+            // .override (--allow-buried-decisions, bare) already waves through
+            // the whole run, so every id is exempt under it; per-task exemption
+            // only has teeth under .refuse/.preview.
+            const is_exempt = mode == .override or containsId(exempt, id);
             var sb: [ulid.len]u8 = undefined;
             const sid = try self.shortId(id, &sb);
             var lines = std.mem.splitScalar(u8, t.body, '\n');
@@ -1849,27 +1894,43 @@ pub const Cli = struct {
                             .{if (mode == .refuse) "refusing" else "note"});
                     }
                     hits += 1;
-                    try self.warn.print(self.gpa, "  {s}  [{s}]  {s}\n", .{ sid, m, line });
+                    if (!is_exempt) fatal += 1;
+                    try self.warn.print(self.gpa, "  {s}  [{s}]  {s}{s}\n", .{
+                        sid,
+                        m,
+                        line,
+                        if (is_exempt and mode != .override) "  (exempted: --allow-buried-decisions-for)" else "",
+                    });
                     break; // one report per line, whichever marker hit first
                 }
             }
         }
         if (hits == 0) return false;
         if (mode == .preview) {
-            try self.warn.print(self.gpa,
-                "  ({d} line(s); a real run without --allow-buried-decisions would refuse)\n", .{hits});
+            if (fatal < hits) {
+                try self.warn.print(self.gpa,
+                    "  ({d} line(s), {d} exempted via --allow-buried-decisions-for; a real run would " ++
+                        "still refuse the remaining {d})\n", .{ hits, hits - fatal, fatal });
+            } else {
+                try self.warn.print(self.gpa,
+                    "  ({d} line(s); a real run without --allow-buried-decisions would refuse)\n", .{hits});
+            }
         } else if (mode == .override) {
             try self.warn.print(self.gpa,
                 "  ({d} line(s); archiving anyway per --allow-buried-decisions — these are now hidden " ++
                     "from every view)\n", .{hits});
+        } else if (fatal == 0) {
+            try self.warn.print(self.gpa,
+                "  ({d} line(s), all exempted via --allow-buried-decisions-for — archiving anyway)\n", .{hits});
         } else {
             try self.warn.print(self.gpa,
                 "  Split each decision out as its own task first (`trk add ...`), then archive.\n" ++
-                    "  To archive anyway: trk archive --allow-buried-decisions\n" ++
+                    "  To archive just the exempted task(s) anyway: trk archive --allow-buried-decisions-for <id>\n" ++
+                    "  To archive everything anyway: trk archive --allow-buried-decisions\n" ++
                     "  To change what counts: .tracker/config.json -> archive.decision_markers (a JSON array; [] disables)\n",
                 .{});
         }
-        return true;
+        return mode == .refuse and fatal > 0;
     }
 
     /// True if the occurrence at `haystack[start..end]` sits where a filename

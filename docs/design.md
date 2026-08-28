@@ -311,6 +311,18 @@ because a disclosure whose summary *is* the whole body hides nothing and only ad
 HTML, not markdown, so it is entity-escaped (`&`, `<`) and cut at a word/UTF-8 boundary — the same class of
 care as the heading-hazard escaping applied to body lines, which still runs inside the disclosure.
 
+**An arc heading with zero renderable members is marked, not left bare** (2026-08-27, task `01M0ZC286J`).
+Scott reported several arcs in `TODO.md` with no tasks under their `## <title> (id)` heading, reading as "here
+is a goal" with nothing behind it. Measured: render was faithful to the tracker (`trk list --arc <id>` agreed
+exactly) — the emptiness has two distinct real causes (all member work already `archived`, or a goal whose
+slices were never carved) that render cannot and should not try to tell apart, since it can only observe
+presence/absence of renderable members, not which cause produced the absence; that distinction needs a human
+judgment about whether the goal was actually met, which is orchestrator/Scott's call, not a mechanical
+reconcile. So the fix stays render-side and cause-agnostic: an arc heading now tracks whether it printed any
+bullet under it, and if not, emits `*(no open members under this arc)*` right after the heading (or the arc's
+own body, if it has one) — visible noise instead of invisible noise, either way pointing at the same next
+step (close the arc, or carve its slices).
+
 **The render/archive destination is persisted, not re-specified per call** (`.tracker/config.json`, added
 2026-07-10). Where `trk render` writes was previously a mandatory `--out docs/TODO.md` on every invocation —
 a ritual that also invited "forgot where it renders" drift. An optional `config.json` (`{"render":{"out":…},
@@ -779,3 +791,25 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     about what rides along with it. The mitigation it replaces was prose in two runbooks that fired only if the
     operator remembered — the same shape as the three-runbook `--body` workaround, which kept failing until the
     primitive changed.
+  - **The `TODO` marker fired on a filename, not a word** (2026-08-27, task `01M12D4EV`). The scan was a raw
+    case-insensitive substring match, so the letters `TODO` inside `docs/TODO.md` (a file every task discussing
+    the render projection mentions in prose) tripped the guard — 6 of 9 hits in one real sweep, 0 of them a
+    buried decision. A pure word-boundary check does not fix this: `/` and `.` are already non-word characters,
+    so `TODO` in `docs/TODO.md` already sits on a word boundary. What actually distinguishes the two is
+    path/filename SHAPE: `isFilenamePosition` (`cli.zig`) skips an occurrence immediately preceded by `/` (a
+    path component) or immediately followed by `.<letter>` (a file extension) — a marker used AS a marker is
+    never glued to a path separator, and a `.` after it ends a sentence (whitespace or EOL follows), never
+    another letter. This can only ever SUPPRESS a filename-shaped occurrence; a line carrying both a filename
+    mention and a genuine marker still refuses, because the scan keeps looking past the filename-shaped hit.
+  - **A per-task escape, `--allow-buried-decisions-for <id> ...`** (2026-08-27, task `01M12ZG5ER`). The filename
+    fix does not touch the other false-positive shape: a task whose body DISCUSSES the guard's own marker
+    vocabulary as its subject (a task ABOUT this very check, like `01M12D4EV` itself) has no filename-like syntax
+    to key off — the markers sit in plain prose, with no reliable syntactic tell apart from a real one. Content
+    heuristics for that shape were rejected: whatever pattern would catch "a body about markers" risks
+    suppressing a real marker phrased similarly, which is exactly the failure the guard exists to prevent. So the
+    fix is procedural rather than semantic: `--allow-buried-decisions-for` exempts only the named task's hits,
+    leaving every other hit in the same run fatal under `--refuse`. This removes the actual danger
+    `--allow-buried-decisions` (whole-run override) creates — one false positive pressuring the operator into
+    waving through the entire done queue, exactly when it is largest (a session-ender) — without weakening the
+    guard for anything not explicitly named. The two escapes compose: `--allow-buried-decisions-for` only has
+    teeth under `--refuse`/`--dry-run`; `--allow-buried-decisions` (bare) still overrides everything, unchanged.
