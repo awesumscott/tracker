@@ -801,8 +801,9 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     never glued to a path separator, and a `.` after it ends a sentence (whitespace or EOL follows), never
     another letter. This can only ever SUPPRESS a filename-shaped occurrence; a line carrying both a filename
     mention and a genuine marker still refuses, because the scan keeps looking past the filename-shaped hit.
-  - **A per-task escape, `--allow-buried-decisions-for <id>:<n>`** (2026-08-27, task `01M12ZG5ER`; the count
-    assertion added 2026-08-28, an independent review of the first shape). The filename fix does not touch the
+  - **A per-task escape, `--allow-buried-decisions-for <id>:<n>:<digest>`** (2026-08-27, task `01M12ZG5ER`; the
+    count assertion added 2026-08-28 and promoted to a hit-SET assertion 2026-08-31, `01M13JXWN` — each an
+    independent review of the shape before it). The filename fix does not touch the
     other false-positive shape: a task whose body DISCUSSES the guard's own marker vocabulary as its subject (a
     task ABOUT this very check, like `01M12D4EV` itself) has no filename-like syntax to key off — the markers sit
     in plain prose, with no reliable syntactic tell apart from a real one. Content heuristics for that shape were
@@ -816,13 +817,37 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     **The exemption is per-TASK, not per-LINE** — a bare `--allow-buried-decisions-for <id>` (the first shape
     shipped) makes EVERY marker line in that task non-fatal forever, including one appended to the SAME task
     after the operator looked and exempted it: the exact scroll-past-and-bury failure the guard exists to
-    prevent, reintroduced one level down. So the value now names the task's expected hit count —
-    `<id>:<n>` — and the guard only treats it as exempt while the task's ACTUAL current hit count still equals
-    `n`; a marker line added or removed since `n` was named makes the exemption stop applying, and every hit on
-    that task reverts to fatal. The count is an assertion (the `enixedit` `count` convention), not a label —
-    re-declaring the current count after a genuine re-look is the cost of keeping the escape's teeth. Reporting
+    prevent, reintroduced one level down. So the value names what the operator actually asserted by exempting
+    the task — **the hit SET they read**, not merely how many lines it had: `<id>:<n>:<digest>`, where the digest
+    is FNV-1a/32 over the matched lines in body order. The guard treats it as exempt only while BOTH still match.
+    **A cardinality assertion is not the honest invariant** (`01M13JXWN`): a count-preserving edit — delete one
+    prose-shaped mention of `TODO`, append a real `OPEN QUESTION: …` — leaves the count untouched while
+    replacing the very thing that was reviewed, so the stale exemption still applies and the genuine fork is
+    archived out of sight. That is the same scroll-past-and-bury failure, one level further down again. Counting
+    more finely (marker-shaped vs prose-shaped sub-counts) only moves the seam, since a marker-shaped line
+    swapped for another defeats that too; identity is the check that closes it, so identity is what is asserted.
+    The count is kept alongside the digest purely for legibility — `15 → 16` is a diagnosis, a hash mismatch is
+    only a verdict — and the two cannot disagree dangerously because both must match. The declaration is an
+    assertion (the `enixedit` `count` convention), not a label, and it is never hand-computed: **the guard's own
+    report prints the paste-ready `<id>:<n>:<digest>` under each unexempted task's hits**, so re-reading and
+    re-declaring after a body change is one paste, which is the cost of keeping the escape's teeth. Reordering
+    the hit lines without changing any of them also drops the exemption — a false positive, and the intended
+    direction of the trade (a spurious refusal costs one re-look; a missed change is permanent). Reporting
     (not fatality) also labels each hit `marker-shaped` (colon-glued to content, e.g. `OPEN QUESTION: which
     way?`) or `prose-shaped` (a marker word merely discussed, e.g. a comma list) so a newly-added hit stands out
     among a batch of already-seen prose-shaped ones. The two escapes compose: `--allow-buried-decisions-for` only
     has teeth under `--refuse`/`--dry-run`; `--allow-buried-decisions` (bare) still overrides everything,
     unchanged.
+  - **A bare id-shaped positional in `archive`'s arg list is a hard error**, because the parser takes exactly one
+    value per flag: a second id typed after `--allow-buried-decisions-for` without repeating the flag exempts
+    only the first and silently becomes a title/body/tag search term, narrowing the archive set with no error at
+    all. **What counts as "id-shaped" is settled structurally, not by degree** (`01M13JXWS`): Crockford base32
+    excludes only `I/L/O/U`, so an alphabet-plus-length test alone matches ordinary English words of 9+ letters
+    — `statement`, `namespace`, `webserver`, `watermark`, `regressed`, `parameters`, `assessment`, `management`
+    — and made `trk archive statement` a hard failure on archive's *only* search surface. A trk id is a ULID or
+    a prefix of one, and a ULID's leading character encodes the top 5 bits of a 48-bit millisecond timestamp
+    (`0` for every id mintable before roughly year 3084), so `looksIdShaped` requires a leading DIGIT: no English
+    word passes, every real id does. With that gate the hard error stays proportionate and is kept. Demoting it
+    — "treat an id-shaped token that resolves to no task as a search term" — was rejected: a mistyped id is the
+    likeliest remaining case, and that rule turns it back into a silent zero-match archive run, which is the
+    failure the error was added to close.

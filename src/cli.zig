@@ -520,7 +520,7 @@ pub const Cli = struct {
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
-        \\            [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>]...
+        \\            [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>:<digest>]...
         \\  Graduate DONE tasks to changelog bullets (--out > config archive.out >
         \\  stdout), then flip each to `archived` so it leaves every view (structural
         \\  dedup — re-running finds nothing). A file target is APPENDED to under a
@@ -535,13 +535,17 @@ pub const Cli = struct {
         \\  archive. It refuses rather than warning because a warning in a bulk run
         \\  scrolls past and the burial is permanent. --dry-run reports the hits without
         \\  refusing (nothing is buried by a preview).
-        \\  Two overrides, different blast radius: --allow-buried-decisions-for <id>:<n>
-        \\  (repeat the FLAG to name more than one — a bare id-shaped token after it is
-        \\  a hard error, not a second value) exempts ONLY that task's hits, and ONLY
-        \\  while it still carries EXACTLY <n> of them: naming the count is an
-        \\  assertion, so a marker line added to that task AFTER you named <n> makes the
-        \\  count stop matching and the exemption stops applying — it does not silently
-        \\  ride along. This is how one task whose body legitimately discusses the
+        \\  Two overrides, different blast radius: --allow-buried-decisions-for
+        \\  <id>:<n>:<digest> (repeat the FLAG to name more than one — a bare id-shaped
+        \\  token after it is a hard error, not a second value) exempts ONLY that task's
+        \\  hits, and ONLY while it still carries EXACTLY those <n> lines, unchanged.
+        \\  Naming <n>:<digest> is an assertion about the hit set you READ: a marker
+        \\  line added, removed, or swapped in that task afterwards stops it matching
+        \\  and the exemption stops applying — it does not silently ride along, and a
+        \\  count-preserving swap does not sneak past. You never compute the value
+        \\  yourself: the guard's own report prints the ready-to-paste
+        \\  <id>:<n>:<digest> under each task's hits. This is how one task whose body
+        \\  legitimately discusses the
         \\  guard's own marker vocabulary (e.g. a task ABOUT this very check) can be
         \\  exempted without forcing you to wave through every other hit in the same
         \\  run, and without that exemption quietly covering a LATER decision appended
@@ -675,7 +679,7 @@ pub const Cli = struct {
             \\      Header reports an arc-less drift count every regeneration.
             \\  trk tree <arc-or-task>       the ASCII prereq hierarchy
             \\  trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
-            \\              [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>]...
+            \\              [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>:<digest>]...
             \\      Graduate DONE tasks to the changelog: emit them as markdown bullets
             \\      (appended to --out/config target under a dated heading, else stdout),
             \\      then flip each to `archived` so it leaves every view (structural
@@ -684,8 +688,9 @@ pub const Cli = struct {
             \\      OPEN QUESTION, FIX NOTE, your call, TODO — configurable via config's
             \\      archive.decision_markers): `archived` is hidden from every view, so an
             \\      unresolved fork in a finished task's body would be buried with it.
-            \\      --allow-buried-decisions-for <id>:<n> exempts just that task's hits, and only
-            \\      while it still carries exactly <n> of them (repeat the flag for more than one);
+            \\      --allow-buried-decisions-for <id>:<n>:<digest> exempts just that task's hits, and
+            \\      only while it still carries exactly those <n> lines unchanged — the guard's report
+            \\      prints the value to paste (repeat the flag for more than one);
             \\      --allow-buried-decisions overrides the WHOLE run; --dry-run reports without refusing.
             \\  trk compact [--force]        rewrite snapshot + truncate log (drops archived/dropped)
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
@@ -1764,7 +1769,8 @@ pub const Cli = struct {
                     try self.print(
                         "trk: '{s}' looks like a task id, not a search word. If you meant to " ++
                             "exempt another task from the decision guard, repeat the flag: " ++
-                            "--allow-buried-decisions-for {s}:<n>\n",
+                            "--allow-buried-decisions-for {s}:<n>:<digest> (a bare `trk archive` " ++
+                            "prints the exact value for each task it refuses on)\n",
                         .{ args[i], args[i] },
                     );
                     return error.UsageError;
@@ -1796,26 +1802,36 @@ pub const Cli = struct {
             return;
         }
 
-        // Per-task escape (01M12ZG5ER, tightened by finding 4): each
-        // --allow-buried-decisions-for value is `<id>:<n>`, exempting ONLY the
-        // named task's hits, and ONLY if it still carries EXACTLY `n` of them —
-        // see AllowFor and reportBuriedDecisions for why the count is an
-        // assertion, not a label. Resolved same as --arc: a bad id is a hard
-        // error, not a silent no-op.
+        // Per-task escape (01M12ZG5ER, tightened by finding 4 and again by
+        // 01M13JXWN): each --allow-buried-decisions-for value is
+        // `<id>:<n>:<digest>`, exempting ONLY the named task's hits, and ONLY
+        // while that task still carries EXACTLY those `n` lines, unchanged —
+        // see AllowFor/hitDigest/reportBuriedDecisions for why the assertion is
+        // the hit set's identity and not merely its size. An id never contains
+        // a colon, so the FIRST colon ends it and the remainder is `<n>:<hex>`.
+        // Resolved same as --arc: a bad id is a hard error, not a silent no-op.
         var allow_for: std.ArrayList(AllowFor) = .empty;
         defer allow_for.deinit(self.gpa);
         for (allow_for_raw.items) |raw| {
-            const sep = std.mem.lastIndexOfScalar(u8, raw, ':') orelse {
-                try self.print(
-                    "trk: --allow-buried-decisions-for needs '<id>:<n>' (the task's expected " ++
-                        "hit count), got '{s}'\n",
-                    .{raw},
-                );
+            const bad_value = "trk: --allow-buried-decisions-for needs '<id>:<n>:<digest>' " ++
+                "(the task's expected hit count and hit-set digest, printed by the guard's own " ++
+                "report), got '{s}'\n";
+            const sep = std.mem.indexOfScalar(u8, raw, ':') orelse {
+                try self.print(bad_value, .{raw});
+                return error.UsageError;
+            };
+            const rest = raw[sep + 1 ..];
+            const sep2 = std.mem.indexOfScalar(u8, rest, ':') orelse {
+                try self.print(bad_value, .{raw});
                 return error.UsageError;
             };
             const id = try self.resolve(raw[0..sep]);
-            const n = try self.parseUsize(raw[sep + 1 ..]);
-            try allow_for.append(self.gpa, .{ .id = id, .count = n });
+            const n = try self.parseUsize(rest[0..sep2]);
+            const digest = std.fmt.parseInt(u32, rest[sep2 + 1 ..], 16) catch {
+                try self.print(bad_value, .{raw});
+                return error.UsageError;
+            };
+            try allow_for.append(self.gpa, .{ .id = id, .count = n, .digest = digest });
         }
 
         // Decision guard. `archive` is the LAST actor that can see these bodies:
@@ -1878,20 +1894,60 @@ pub const Cli = struct {
         override,
     };
 
-    /// One `--allow-buried-decisions-for <id>:<n>` value: exempt `id`, but only
-    /// while it carries EXACTLY `n` marker hits. See `reportBuriedDecisions`.
-    const AllowFor = struct { id: Ulid, count: usize };
+    /// One `--allow-buried-decisions-for <id>:<n>:<digest>` value: exempt `id`,
+    /// but only while it carries EXACTLY `n` marker hits AND those hits are
+    /// still the SAME LINES the operator looked at, identified by `digest`
+    /// (`hitDigest` over the matched lines). See `reportBuriedDecisions`.
+    const AllowFor = struct { id: Ulid, count: usize, digest: u32 };
+
+    /// Content identity of a task's decision-marker hit set: FNV-1a/32 over the
+    /// matched lines in body order, each terminated by a newline. Rendered as 8
+    /// lowercase hex characters in the `--allow-buried-decisions-for` value.
+    ///
+    /// This is the invariant the per-task escape actually needs, and a COUNT is
+    /// not it (01M13JXWN). A cardinality assertion answers "did the number of
+    /// hits change?", but what the operator asserted by naming an exemption is
+    /// "I read THESE lines and none of them is a live fork" — and a
+    /// count-preserving edit (delete one prose-shaped mention of `TODO`, append
+    /// a real `OPEN QUESTION: ship the count or the digest?`) leaves the count
+    /// at 15 while replacing the very thing that was reviewed. The exemption
+    /// then still applies and the genuine fork is archived out of sight: the
+    /// same scroll-past-and-bury failure the guard exists to prevent, one level
+    /// further down. Counting more finely (marker-shaped vs prose-shaped
+    /// sub-counts) only moves the seam — a marker-shaped line swapped for
+    /// another marker-shaped line defeats that too. Identity is the honest
+    /// check, so identity is what is asserted.
+    ///
+    /// The count is kept ALONGSIDE the digest even though the digest subsumes
+    /// it: they cannot disagree in a dangerous direction (both must match), and
+    /// `15 -> 16` is a diagnosis a human can read where a hash mismatch is only
+    /// a verdict.
+    ///
+    /// Reordering the hit lines without changing any of them changes the digest
+    /// and drops the exemption. That is a false positive, and the intended
+    /// direction of the trade: a spurious refusal costs one re-look, a missed
+    /// change is a permanent burial.
+    pub fn hitDigest(lines: []const []const u8) u32 {
+        var h = std.hash.Fnv1a_32.init();
+        for (lines) |l| {
+            h.update(l);
+            h.update("\n");
+        }
+        return h.final();
+    }
 
     /// Scan each closing body for decision markers and report every hit as
     /// `<short-id>  [<marker>] (<shape>)  <line>`. Returns true iff the run
     /// should be BLOCKED (the caller's cue to return `error.UsageError`) —
     /// never merely "anything matched", since `exempt` can make a hit non-fatal.
     ///
-    /// `exempt` is the `<id>:<n>` list from `--allow-buried-decisions-for`
-    /// (01M12ZG5ER, tightened by finding 4 on 2026-08-27): a hit on one of
+    /// `exempt` is the `<id>:<n>:<digest>` list from
+    /// `--allow-buried-decisions-for` (01M12ZG5ER, tightened by finding 4 on
+    /// 2026-08-27 and again by 01M13JXWN on 2026-08-31): a hit on one of
     /// these ids is still REPORTED (transparency — the operator should see
     /// what they exempted) and is non-fatal ONLY while that task's ACTUAL hit
-    /// count still equals the declared `n`. This is the per-task escape that
+    /// count still equals the declared `n` AND its actual hit CONTENT still
+    /// hashes to the declared `digest`. This is the per-task escape that
     /// removes the all-or-nothing pressure `--allow-buried-decisions`
     /// (whole-run override, `mode == .override`) creates: one task whose body
     /// legitimately discusses the guard's own marker vocabulary (a meta-task
@@ -1899,16 +1955,23 @@ pub const Cli = struct {
     /// OTHER hit in the same done queue, which is exactly how a genuine buried
     /// fork gets missed later.
     ///
-    /// The count is an ASSERTION, not a label (the `enixedit` `count`
-    /// convention): a bare per-task exemption with no count would exempt EVERY
-    /// marker line the task ever grows, including one appended AFTER the
+    /// The exemption value is an ASSERTION, not a label (the `enixedit` `count`
+    /// convention): a bare per-task exemption with no assertion would exempt
+    /// EVERY marker line the task ever grows, including one appended AFTER the
     /// operator looked and exempted it — the exact scroll-past failure the
     /// guard exists to prevent, one level down, because the operator can no
     /// longer distinguish "the 15 lines I already saw" from "the 16th, added
-    /// since". Naming the count forces a re-look: a new hit changes the actual
-    /// count, the declared `n` no longer matches, and the exemption stops
-    /// applying to that task — every one of its hits reverts to fatal under
-    /// `.refuse`, printed with a mismatch note rather than the exempted tag.
+    /// since". Naming the hit set forces a re-look: any change to it — a hit
+    /// added, removed, OR swapped for a different one at the same cardinality —
+    /// makes the declaration stop matching, and the exemption stops applying to
+    /// that task; every one of its hits reverts to fatal under `.refuse`,
+    /// printed with a mismatch note rather than the exempted tag. What is
+    /// asserted is the hit set's IDENTITY (`hitDigest`), not merely its size;
+    /// see `hitDigest` for why a count alone was not enough.
+    ///
+    /// The declaration is discoverable, never hand-counted: every non-exempt
+    /// task in the report prints the exact ready-to-paste
+    /// `<short-id>:<n>:<digest>` for its current hits.
     ///
     /// This is deliberately NOT solved by sharpening the content heuristic
     /// (`isFilenamePosition`'s filename/path shape check): the meta body's
@@ -1916,7 +1979,7 @@ pub const Cli = struct {
     /// syntactic signal distinguishes it from a genuine marker written with a
     /// slightly different shape (an em dash instead of a colon, say) — and a
     /// false negative there is a silent, permanent burial, while a false
-    /// positive is only an annoyance. That asymmetry is why the count
+    /// positive is only an annoyance. That asymmetry is why the hit-set
     /// assertion — not a smarter heuristic — is the fix; the heuristic still
     /// contributes a REPORTING-only refinement (see `isMarkerShaped`) that
     /// labels each hit `marker-shaped` (colon-glued to content, the genuine
@@ -1959,21 +2022,35 @@ pub const Cli = struct {
             }
             if (task_hits.items.len == 0) continue;
 
-            var declared: ?usize = null;
+            // Content identity of THIS task's current hit set, judged against
+            // the declaration. Built from the same `task_hits` the fatality
+            // loop below iterates, so the digest can never describe a
+            // different set of lines than the one being reported.
+            var hit_lines: std.ArrayList([]const u8) = .empty;
+            defer hit_lines.deinit(self.gpa);
+            for (task_hits.items) |h| try hit_lines.append(self.gpa, h.line);
+            const actual_digest = hitDigest(hit_lines.items);
+
+            var declared: ?AllowFor = null;
             for (exempt) |e| {
                 if (e.id.eql(id)) {
-                    declared = e.count;
+                    declared = e;
                     break;
                 }
             }
-            const count_matches = declared != null and declared.? == task_hits.items.len;
+            const count_matches = declared != null and declared.?.count == task_hits.items.len;
+            const digest_matches = declared != null and declared.?.digest == actual_digest;
             // .override (--allow-buried-decisions, bare) already waves through
             // the whole run, so every id is exempt under it; per-task exemption
-            // only has teeth under .refuse/.preview, and only while the count
-            // still matches what was declared.
-            const is_exempt = mode == .override or count_matches;
-            const count_named_but_stale = declared != null and !count_matches;
-            if (count_named_but_stale) mismatched_tasks += 1;
+            // only has teeth under .refuse/.preview, and only while BOTH the
+            // count and the hit-set digest still match what was declared.
+            const is_exempt = mode == .override or (count_matches and digest_matches);
+            const named_but_stale = declared != null and !(count_matches and digest_matches);
+            // The count-preserving swap (01M13JXWN) is the case a pure count
+            // assertion missed, so it says so by name rather than reporting a
+            // generic mismatch the operator would read as "I miscounted".
+            const swapped_at_same_count = named_but_stale and count_matches;
+            if (named_but_stale) mismatched_tasks += 1;
 
             var sb: [ulid.len]u8 = undefined;
             const sid = try self.shortId(id, &sb);
@@ -1990,19 +2067,33 @@ pub const Cli = struct {
                 const shape = if (isMarkerShaped(h.line, h.marker)) "marker-shaped" else "prose-shaped";
                 const tag = if (is_exempt and mode != .override)
                     "  (exempted: --allow-buried-decisions-for)"
-                else if (count_named_but_stale)
+                else if (swapped_at_same_count)
+                    "  (--allow-buried-decisions-for: same hit COUNT, different hit CONTENT -- a line was swapped since that digest was named; exemption does NOT apply)"
+                else if (named_but_stale)
                     "  (--allow-buried-decisions-for count no longer matches -- exemption does NOT apply)"
                 else
                     "";
                 try self.warn.print(self.gpa, "  {s}  [{s}] ({s})  {s}{s}\n", .{ sid, h.marker, shape, h.line, tag });
+            }
+            // Make the declaration discoverable: the operator must never have
+            // to hand-count lines or hand-hash them. Printed for every task
+            // whose hits are not already covered, in both .refuse and .preview
+            // (under .override nothing is being asserted, so it is noise).
+            if (!is_exempt and mode != .override) {
+                try self.warn.print(self.gpa,
+                    "      -> after reading the {d} line(s) above, exempt this task with: " ++
+                        "--allow-buried-decisions-for {s}:{d}:{x:0>8}\n",
+                    .{ task_hits.items.len, sid, task_hits.items.len, actual_digest },
+                );
             }
         }
         if (hits == 0) return false;
         if (mismatched_tasks > 0) {
             try self.warn.print(self.gpa,
                 "  {d} task(s) named via --allow-buried-decisions-for no longer carry the declared " ++
-                    "hit count -- a marker line was added or removed since that count was named, so " ++
-                    "the exemption does not apply; re-check and re-declare with the current count.\n",
+                    "hit set -- a marker line was added, removed, or SWAPPED since that " ++
+                    "<n>:<digest> was named, so the exemption does not apply; re-read the lines and " ++
+                    "re-declare with the value printed above.\n",
                 .{mismatched_tasks});
         }
         if (mode == .preview) {
@@ -2028,7 +2119,7 @@ pub const Cli = struct {
         } else {
             try self.warn.print(self.gpa,
                 "  Split each decision out as its own task first (`trk add ...`), then archive.\n" ++
-                    "  To archive just the exempted task(s) anyway: trk archive --allow-buried-decisions-for <id>:<n>\n" ++
+                    "  To archive just the exempted task(s) anyway: trk archive --allow-buried-decisions-for <id>:<n>:<digest> (each printed above)\n" ++
                     "  To archive everything anyway: trk archive --allow-buried-decisions\n" ++
                     "  To change what counts: .tracker/config.json -> archive.decision_markers (a JSON array; [] disables)\n",
                 .{});
@@ -2120,8 +2211,29 @@ pub const Cli = struct {
     /// `--allow-buried-decisions-for` without repeating the flag, which
     /// otherwise exempts only the first id and narrows the archive set to a
     /// search term that (almost always) matches nothing, with no error at all.
+    ///
+    /// The Crockford-alphabet test ALONE is far too loose to hang a hard error
+    /// on (01M13JXWS): the alphabet's only exclusions are I/L/O/U, so ordinary
+    /// English words of 9+ letters routinely satisfy it — `statement`,
+    /// `namespace`, `webserver`, `watermark`, `regressed`, `parameters`,
+    /// `assessment`, `management` were all rejected, which made `trk archive
+    /// statement` a hard failure on archive's ONLY search surface. The leading
+    /// character settles it structurally rather than by degree: a trk id is a
+    /// ULID or a prefix of one, and a ULID's first character encodes the top 5
+    /// bits of a 48-bit millisecond timestamp — `0` for every id mintable
+    /// before roughly the year 3084 — so a real id ALWAYS starts with a digit
+    /// and no English word ever does.
+    ///
+    /// With that gate in place the hard error stays the right response, and
+    /// deliberately so: a digit-leading Crockford token of 9+ characters in
+    /// archive's positional slot is a misplaced or mistyped id essentially
+    /// every time. Demoting it to "just treat an unresolvable one as a search
+    /// term" was considered and rejected — a TYPO'd id is the likeliest
+    /// remaining case, and that rule would turn it back into a silent
+    /// zero-match archive run, which is the exact failure the error closed.
     fn looksIdShaped(s: []const u8) bool {
         if (s.len < min_short_mint or s.len > ulid.len) return false;
+        if (!std.ascii.isDigit(s[0])) return false;
         for (s) |c| {
             const u = std.ascii.toUpper(c);
             const is_digit = u >= '0' and u <= '9';

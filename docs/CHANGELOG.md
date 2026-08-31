@@ -5,6 +5,47 @@ under a `## YYYY-MM-DD` run heading (config `archive.out` — unset today, so a 
 to stdout; this file is hand-started because a landing needed recording before that config existed).
 Forward-looking work is `docs/TODO.md` (generated); design rationale lives in `docs/design.md`.
 
+## 2026-08-31
+
+**The decision-guard escape's count assertion was defeated by a count-PRESERVING body edit
+(01M13JXWN): delete one prose-shaped mention of `TODO`, append a real `OPEN QUESTION: …`, and the
+count stays 15 — so the stale exemption still applies and the genuine fork is archived and buried.
+Fixed by asserting the hit SET's identity rather than its size: the value is now
+`--allow-buried-decisions-for <id>:<n>:<digest>`, where `digest` is FNV-1a/32 over the matched lines
+in body order, and the exemption applies only while both still match.** A count answers "did the
+number of hits change?"; what the operator asserted by exempting a task is "I read THESE lines and
+none is a live fork", and those are different claims — which is why counting more finely
+(marker-shaped vs prose-shaped sub-counts, the cheaper option the task also floated) was rejected: it
+only moves the seam, since a marker-shaped line swapped for another defeats it too. The count is kept
+alongside the digest for legibility (`15 → 16` is a diagnosis; a hash mismatch is only a verdict) and
+the two cannot disagree dangerously, since both must match. **The digest is never hand-computed: the
+guard's report now prints the paste-ready `<id>:<n>:<digest>` under each unexempted task's hits**, so
+re-declaring after a body change is one paste — strictly less work than the old shape, which made the
+operator count marker lines by hand. The pre-existing `<id>:<n>` syntax is a hard error rather than a
+quiet downgrade to the weaker guarantee, and a swap at the same count reports itself by name ("same
+hit COUNT, different hit CONTENT") so it does not read as a miscount.
+
+**`looksIdShaped` hard-errored on ordinary English search words (01M13JXWS).** Crockford base32
+excludes only `I/L/O/U`, so an alphabet-plus-length test matches `statement`, `namespace`,
+`webserver`, `watermark`, `regressed`, `parameters`, `assessment`, `management` — every one of them
+failed `trk archive <word>` on archive's only search surface. A ULID's leading character encodes the
+top 5 bits of a 48-bit millisecond timestamp, so every mintable id starts with a digit and no English
+word does: `looksIdShaped` now requires a leading digit. The hard error itself is kept and stays the
+right response once the input is unambiguous; demoting an unresolvable id-shaped token to a search
+term was rejected, because a mistyped id is the likeliest remaining case and that rule returns it to a
+silent zero-match run.
+
+Host-unit tests `zig build test`: **220 → 224**. Four new cases in `cli_test.zig` — the
+count-preserving swap (both directions: the reviewed set still archives, the swapped set refuses and
+the task stays `done`), the paste-ready-value round trip (refuse → capture the printed token → paste
+it back → archives), the eight English words as search terms, and an id-shaped word that still
+FILTERS while a real id in the same slot still hard-errors. Several existing cases were rewritten to
+the new value shape via an `allowFor(alloc, short_id, hits)` helper that states the expected hit lines
+LITERALLY rather than scraping them from the guard's own output, so a change in what the guard matches
+fails the test instead of silently re-agreeing with it. Both fixes were sabotage-proved: reverting the
+predicate to `count_matches` alone reds exactly the count-preserving test (223/224 — the swapped fork
+archived); removing the leading-digit gate reds exactly the two word tests (222/224).
+
 ## 2026-08-28
 
 **The per-task decision-guard escape (01M12ZG5ER) reintroduced the exact scroll-past failure it

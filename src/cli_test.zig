@@ -24,6 +24,17 @@ fn mintId() Ulid {
     return ulid.mintAt(io, mint_ms);
 }
 
+/// Build an `--allow-buried-decisions-for <id>:<n>:<digest>` value from the
+/// hit lines the test asserts the task carries. The lines are stated LITERALLY
+/// rather than scraped back out of the guard's own report, so the exemption a
+/// test hands in is an independent claim about the body: if the guard starts
+/// matching a different set of lines, the exemption stops applying and the
+/// test fails, instead of silently re-agreeing with whatever the code now does.
+/// Caller frees.
+fn allowFor(alloc: std.mem.Allocator, short_id: []const u8, hits: []const []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}:{d}:{x:0>8}", .{ short_id, hits.len, cli.Cli.hitDigest(hits) });
+}
+
 /// Build a Cli over a fresh tmpDir store. Caller deinits via `Fixture.deinit`.
 const Fixture = struct {
     tmp: testing.TmpDir,
@@ -3188,7 +3199,7 @@ test "archive: TODO marker still refuses a genuine buried TODO, even sharing a l
     try testing.expectEqual(@as(anyerror, error.UsageError), f2.runExpectErr(&.{"archive"}));
 }
 
-test "archive: --allow-buried-decisions-for <id>:<n> exempts only the named task; another task's genuine marker still refuses the run" {
+test "archive: --allow-buried-decisions-for <id>:<n>:<digest> exempts only the named task; another task's genuine marker still refuses the run" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -3210,9 +3221,11 @@ test "archive: --allow-buried-decisions-for <id>:<n> exempts only the named task
     const meta_s = try f.c.shortId(meta, &mb);
     const real_s = try f.c.shortId(real, &rb);
     // Both bodies carry exactly one hit line each.
-    const meta_for1 = try std.fmt.allocPrint(alloc, "{s}:1", .{meta_s});
+    const meta_for1 = try allowFor(alloc, meta_s, &.{
+        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker.",
+    });
     defer alloc.free(meta_for1);
-    const real_for1 = try std.fmt.allocPrint(alloc, "{s}:1", .{real_s});
+    const real_for1 = try allowFor(alloc, real_s, &.{"OPEN QUESTION: which cadence do we publish on?"});
     defer alloc.free(real_for1);
 
     // EXCLUDES correctly: exempting only `meta` still refuses, because `real`'s
@@ -3237,7 +3250,7 @@ test "archive: --allow-buried-decisions-for <id>:<n> exempts only the named task
 
 // --------------------------------------------- finding 4: the count is an ASSERTION
 
-test "archive --allow-buried-decisions-for <id>:<n>: a NEW marker line appended after the count was named makes the exemption stop applying (the task is NOT archived)" {
+test "archive --allow-buried-decisions-for <id>:<n>:<digest>: a NEW marker line appended after the count was named makes the exemption stop applying (the task is NOT archived)" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -3256,7 +3269,9 @@ test "archive --allow-buried-decisions-for <id>:<n>: a NEW marker line appended 
 
     var mb: [ulid.len]u8 = undefined;
     const meta_s = try f.c.shortId(meta, &mb);
-    const meta_for1 = try std.fmt.allocPrint(alloc, "{s}:1", .{meta_s});
+    const meta_for1 = try allowFor(alloc, meta_s, &.{
+        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker.",
+    });
     defer alloc.free(meta_for1);
 
     // ACCEPTS the expected count: the run goes through as designed.
@@ -3290,9 +3305,104 @@ test "archive --allow-buried-decisions-for <id>:<n>: a NEW marker line appended 
 
     // Re-declaring the CURRENT count (2) lets it through -- the escape still
     // works, it just requires a fresh look each time the body changes.
-    const meta_for2 = try std.fmt.allocPrint(alloc, "{s}:2", .{meta_s});
+    const meta_for2 = try allowFor(alloc, meta_s, &.{
+        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker.",
+        "OPEN QUESTION: which cadence do we publish on?",
+    });
     defer alloc.free(meta_for2);
     try f.run(&.{ "archive", "--allow-buried-decisions-for", meta_for2 });
+    try testing.expectEqual(tracker.State.archived, f.store.get(meta).?.state);
+}
+
+// ------------------------------- 01M13JXWN: the assertion is the hit SET, not its size
+
+test "archive --allow-buried-decisions-for: a count-PRESERVING swap (one marker line deleted, another appended) drops the exemption" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The exact defeat 01M13JXWN describes, at 2 hits instead of 15: the
+    // operator reads two prose-shaped mentions, exempts the task, and a later
+    // edit deletes one of them while appending a GENUINE fork. A cardinality
+    // assertion sees 2 before and 2 after and keeps applying, so the fork is
+    // archived and hidden -- the scroll-past-and-bury failure the guard exists
+    // to prevent, one level down. Only an identity check catches it.
+    const before_a = "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker.";
+    const before_b = "the marker vocabulary is configurable, so TODO can be dropped from it entirely.";
+    const after_b = "OPEN QUESTION: ship the count or the digest?";
+
+    const meta = mintId();
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = before_a ++ "\n" ++ before_b } });
+    try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
+
+    var mb: [ulid.len]u8 = undefined;
+    const meta_s = try f.c.shortId(meta, &mb);
+    const reviewed = try allowFor(alloc, meta_s, &.{ before_a, before_b });
+    defer alloc.free(reviewed);
+    const current = try allowFor(alloc, meta_s, &.{ before_a, after_b });
+    defer alloc.free(current);
+
+    // The premise of the whole test: both declarations name the SAME count.
+    // Without this the case would be an ordinary added/removed line, which the
+    // old cardinality assertion already caught -- and the test would pass
+    // while proving nothing about the swap.
+    try testing.expect(std.mem.indexOf(u8, reviewed, ":2:") != null);
+    try testing.expect(std.mem.indexOf(u8, current, ":2:") != null);
+    try testing.expect(!std.mem.eql(u8, reviewed, current));
+
+    // ACCEPTS the reviewed set: the escape still works while the body is
+    // untouched (the positive leg -- the guard must INCLUDE correctly too).
+    {
+        var f2 = try Fixture.init(alloc);
+        defer f2.deinit();
+        try f2.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = before_a ++ "\n" ++ before_b } });
+        try f2.store.append(.{ .setState = .{ .id = meta, .state = .done } });
+        try f2.run(&.{ "archive", "--allow-buried-decisions-for", reviewed });
+        try testing.expectEqual(tracker.State.archived, f2.store.get(meta).?.state);
+    }
+
+    // REFUSES the swap: same count, different lines.
+    try f.store.append(.{ .setState = .{ .id = meta, .state = .open } });
+    try f.store.append(.{ .setBody = .{ .id = meta, .body = before_a ++ "\n" ++ after_b } });
+    try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
+
+    const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", reviewed });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    // The state transition is the load-bearing assertion; the wording is the
+    // diagnosis that stops the operator reading it as a miscount.
+    try testing.expectEqual(tracker.State.done, f.store.get(meta).?.state);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "same hit COUNT, different hit CONTENT") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, after_b) != null);
+
+    // Re-declaring the CURRENT set lets it through -- the escape survives, it
+    // just demands a fresh read whenever the hits change at all.
+    try f.run(&.{ "archive", "--allow-buried-decisions-for", current });
+    try testing.expectEqual(tracker.State.archived, f.store.get(meta).?.state);
+}
+
+test "archive: the decision guard prints a paste-ready --allow-buried-decisions-for value, and pasting it back exempts exactly that task" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The digest is only a usable assertion if the operator never has to
+    // compute it. A bare refused run must hand back the exact token.
+    const meta = mintId();
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body =
+        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
+    try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
+
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{"archive"}));
+    const flag = "--allow-buried-decisions-for ";
+    const at = std.mem.indexOf(u8, f.warn.items, flag).? + flag.len;
+    const eol = std.mem.indexOfScalarPos(u8, f.warn.items, at, '\n') orelse f.warn.items.len;
+    const printed = try alloc.dupe(u8, f.warn.items[at..eol]);
+    defer alloc.free(printed);
+
+    // It is the real value, not a placeholder: <id>:<n>:<digest>, and it works.
+    try testing.expect(std.mem.indexOf(u8, printed, "<") == null);
+    try testing.expect(std.mem.count(u8, printed, ":") == 2);
+    try f.run(&.{ "archive", "--allow-buried-decisions-for", printed });
     try testing.expectEqual(tracker.State.archived, f.store.get(meta).?.state);
 }
 
@@ -3310,7 +3420,7 @@ test "archive --dry-run: --allow-buried-decisions-for is informational only, and
 
     var mb: [ulid.len]u8 = undefined;
     const meta_s = try f.c.shortId(meta, &mb);
-    const meta_for1 = try std.fmt.allocPrint(alloc, "{s}:1", .{meta_s});
+    const meta_for1 = try allowFor(alloc, meta_s, &.{"discusses the TODO marker"});
     defer alloc.free(meta_for1);
 
     try f.run(&.{ "archive", "--dry-run", "--allow-buried-decisions-for", meta_for1 });
@@ -3332,7 +3442,7 @@ test "archive --dry-run: when every hit is exempted, the message never claims a 
 
     var ab: [ulid.len]u8 = undefined;
     const a_s = try f.c.shortId(a, &ab);
-    const a_for1 = try std.fmt.allocPrint(alloc, "{s}:1", .{a_s});
+    const a_for1 = try allowFor(alloc, a_s, &.{"OPEN QUESTION: which way?"});
     defer alloc.free(a_for1);
 
     try f.run(&.{ "archive", "--dry-run", "--allow-buried-decisions-for", a_for1 });
@@ -3362,7 +3472,7 @@ test "archive: a second bare id-shaped token after --allow-buried-decisions-for 
     var rb: [ulid.len]u8 = undefined;
     const meta_s = try f.c.shortId(meta, &mb);
     const real_s = try f.c.shortId(real, &rb);
-    const meta_for1 = try std.fmt.allocPrint(alloc, "{s}:1", .{meta_s});
+    const meta_for1 = try allowFor(alloc, meta_s, &.{"discusses the TODO marker"});
     defer alloc.free(meta_for1);
 
     // Old (broken) usage: naming the second id as a bare token instead of
@@ -3376,7 +3486,67 @@ test "archive: a second bare id-shaped token after --allow-buried-decisions-for 
     try testing.expectEqual(tracker.State.done, f.store.get(real).?.state);
 }
 
-test "archive --allow-buried-decisions-for: needs '<id>:<n>' -- a value with no count is a hard error" {
+// -------------------------- 01M13JXWS: the id-shape refusal must not eat English
+
+test "archive: 9+ letter English words are search terms, not ids -- the id refusal only fires on a digit-leading token" {
+    // Crockford base32 excludes only I/L/O/U, so ordinary English words of 9+
+    // letters all satisfy the alphabet test. Before the leading-digit gate,
+    // every word below hard-errored with "looks like a task id, not a search
+    // word" on archive's ONLY search surface.
+    const words = [_][]const u8{
+        "statement",  "namespace",  "webserver",  "watermark",
+        "regressed",  "parameters", "assessment", "management",
+    };
+    for (words) |w| {
+        const alloc = testing.allocator;
+        var f = try Fixture.init(alloc);
+        defer f.deinit();
+
+        const a = mintId();
+        try f.store.append(.{ .add = .{ .id = a, .title = "unrelated", .body = "plain" } });
+        try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
+
+        // `try` IS the assertion: a UsageError here is the bug.
+        try f.run(&.{ "archive", w });
+        // ...and it was taken as a SEARCH term, not ignored: nothing matched,
+        // so the done task is untouched.
+        try testing.expect(std.mem.indexOf(u8, f.out.items, "(no done tasks to archive)") != null);
+        try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+    }
+}
+
+test "archive: an id-shaped English word still FILTERS, while a real task id in the same slot is still a hard error" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const hit = mintId();
+    try f.store.append(.{ .add = .{ .id = hit, .title = "namespace collision in the render projection", .body = "done" } });
+    const miss = mintId();
+    try f.store.append(.{ .add = .{ .id = miss, .title = "unrelated", .body = "done" } });
+    try f.store.append(.{ .setState = .{ .id = hit, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = miss, .state = .done } });
+
+    var sb: [ulid.len]u8 = undefined;
+    const miss_s = try f.c.shortId(miss, &sb);
+
+    // EXCLUDES correctly: a digit-leading id in the positional slot is still
+    // refused outright -- the finding-7 guarantee is not weakened by the gate.
+    {
+        const e = f.runExpectErr(&.{ "archive", miss_s });
+        try testing.expectEqual(@as(anyerror, error.UsageError), e);
+        try testing.expectEqual(tracker.State.done, f.store.get(hit).?.state);
+        try testing.expectEqual(tracker.State.done, f.store.get(miss).?.state);
+    }
+    // INCLUDES correctly: the word narrows the run to the one task it matches.
+    {
+        try f.run(&.{ "archive", "namespace" });
+        try testing.expectEqual(tracker.State.archived, f.store.get(hit).?.state);
+        try testing.expectEqual(tracker.State.done, f.store.get(miss).?.state);
+    }
+}
+
+test "archive --allow-buried-decisions-for: needs '<id>:<n>:<digest>' -- a bare id, a count with no digest, and a non-hex digest are each a hard error" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -3388,9 +3558,32 @@ test "archive --allow-buried-decisions-for: needs '<id>:<n>' -- a value with no 
     var ab: [ulid.len]u8 = undefined;
     const a_s = try f.c.shortId(a, &ab);
 
-    const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", a_s });
-    try testing.expectEqual(@as(anyerror, error.UsageError), e);
-    try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+    // A bare id: the original finding-4 hole (an exemption with no assertion
+    // at all, covering every marker line the task ever grows).
+    {
+        const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", a_s });
+        try testing.expectEqual(@as(anyerror, error.UsageError), e);
+        try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+    }
+    // `<id>:<n>` with no digest -- the PRE-01M13JXWN shape. It must not be
+    // silently accepted as a count-only assertion: that is exactly the form a
+    // count-preserving body edit defeats, so the old syntax is a hard error
+    // rather than a quiet downgrade to the weaker guarantee.
+    {
+        const count_only = try std.fmt.allocPrint(alloc, "{s}:1", .{a_s});
+        defer alloc.free(count_only);
+        const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", count_only });
+        try testing.expectEqual(@as(anyerror, error.UsageError), e);
+        try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+    }
+    // A digest field that is not hex.
+    {
+        const bad_hex = try std.fmt.allocPrint(alloc, "{s}:1:zzzzzzzz", .{a_s});
+        defer alloc.free(bad_hex);
+        const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", bad_hex });
+        try testing.expectEqual(@as(anyerror, error.UsageError), e);
+        try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+    }
 }
 
 test "archive --allow-buried-decisions-for: a bad id is a hard error, not a silent no-op" {
@@ -3402,7 +3595,7 @@ test "archive --allow-buried-decisions-for: a bad id is a hard error, not a sile
     try f.store.append(.{ .add = .{ .id = a, .title = "x", .body = "OPEN QUESTION: unresolved" } });
     try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
 
-    const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", "01ZZZZZZZZZZZZZZZZZZZZZZZZ:1" });
+    const e = f.runExpectErr(&.{ "archive", "--allow-buried-decisions-for", "01ZZZZZZZZZZZZZZZZZZZZZZZZ:1:00000000" });
     try testing.expectEqual(@as(anyerror, error.NoSuchId), e);
     try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
 }
