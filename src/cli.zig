@@ -304,18 +304,22 @@ pub const Cli = struct {
     const VerbHelp = struct { name: []const u8, text: []const u8 };
     pub const verb_help = [_]VerbHelp{
         .{ .name = "init", .text =
-        \\trk init [--out <path>] [--force] [--no-gitattributes]
+        \\trk init [--out <path>] [--force] [--no-gitattributes] [--no-gitignore]
         \\  Scaffold a fresh tracker: .tracker/ + an empty log, a config.json
         \\  (render.out defaults to docs/TODO.md; set it with --out), a
-        \\  .tracker/.gitattributes, and a starter TODO.md. Idempotent +
-        \\  non-destructive: never overwrites an existing TODO.md or
-        \\  .gitattributes; --force rewrites config.json only.
+        \\  .tracker/.gitattributes, a .tracker/.gitignore, and a starter TODO.md.
+        \\  Idempotent + non-destructive: never overwrites an existing TODO.md,
+        \\  .gitattributes, or .gitignore; --force rewrites config.json only.
         \\  The .gitattributes union-merges log.jsonl (parallel-worktree appends
         \\  combine) and pins snapshot.jsonl + quarantine.jsonl to the text driver
         \\  (a raced compact must surface as a conflict). It goes INSIDE .tracker/
         \\  on purpose: git resolves attributes per directory and the nearest file
         \\  wins, so a later root-level `*.jsonl` glob cannot capture the baselines.
         \\  --no-gitattributes skips it (a repo managing attributes centrally).
+        \\  The .gitignore ignores compact's backup/ runs (a bounded but nonzero
+        \\  pre-rewrite copy on every compact, see `trk compact --help`) and a
+        \\  crash-orphaned atomic-write temp file, for the same INSIDE-.tracker/
+        \\  reason as the attributes file. --no-gitignore skips it likewise.
         \\  e.g.  trk init            trk init --out TODO.md
         },
         .{ .name = "add", .text =
@@ -516,7 +520,11 @@ pub const Cli = struct {
         \\  not a task, and writing it out would promote a nameless husk into a real
         \\  one. Reported by id, never silent. Warns (stderr) if .tracker/.gitattributes
         \\  is missing a pin — this is the verb that creates the two files that must
-        \\  never be union-merged. Never compact while fan-out worktrees are in flight.
+        \\  never be union-merged. Before rewriting, copies the pre-compact
+        \\  snapshot/log into .tracker/backup/<epoch>/ and evicts down to
+        \\  config's compact.backup_retain (default 10) — ignored by
+        \\  .tracker/.gitignore so it never becomes an untracked stray. Never
+        \\  compact while fan-out worktrees are in flight.
         },
         .{ .name = "archive", .text =
         \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
@@ -641,9 +649,10 @@ pub const Cli = struct {
             \\trk — an in-repo issue tracker
             \\
             \\Usage:
-            \\  trk init [--out <path>] [--force] [--no-gitattributes]   scaffold .tracker/ + config.json
-            \\      + .tracker/.gitattributes + a starter TODO.md. Idempotent and non-destructive: never
-            \\      overwrites an existing TODO.md or .gitattributes (or config.json without --force).
+            \\  trk init [--out <path>] [--force] [--no-gitattributes] [--no-gitignore]   scaffold
+            \\      .tracker/ + config.json + .tracker/.gitattributes + .tracker/.gitignore + a starter
+            \\      TODO.md. Idempotent and non-destructive: never overwrites an existing TODO.md,
+            \\      .gitattributes, or .gitignore (or config.json without --force).
             \\      --out sets config's render.out (default docs/TODO.md).
             \\  trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...] [--in <arc> [--seq <n>]] [--arc]
             \\                    [--needs <id> ...] [--priority <n>] [-v]   (prints the new ULID; -v = friendly)
@@ -914,9 +923,9 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- init
 
-    /// `trk init [--out <path>] [--force] [--no-gitattributes]` — scaffold a fresh
-    /// project's tracker.
-    /// Three artifacts, each created only if absent (idempotent, non-destructive):
+    /// `trk init [--out <path>] [--force] [--no-gitattributes] [--no-gitignore]`
+    /// — scaffold a fresh project's tracker.
+    /// Artifacts, each created only if absent (idempotent, non-destructive):
     ///   1. `.tracker/` + an empty `log.jsonl` (today made lazily on first write;
     ///      init makes it explicit so `trk next` works immediately),
     ///   2. `.tracker/config.json` with a default `render.out` (rewritten only
@@ -924,7 +933,11 @@ pub const Cli = struct {
     ///   3. `.tracker/.gitattributes` — the merge semantics the whole model rests
     ///      on (see `store.gitattributes_text`), skippable with
     ///      `--no-gitattributes` for a repo that manages attributes centrally,
-    ///   4. a starter `TODO.md` at the render path — a valid empty projection.
+    ///   4. `.tracker/.gitignore` — ignores `compact`'s pre-rewrite `backup/`
+    ///      runs (see `store.gitignore_text`) so they never become a permanent
+    ///      untracked stray in `git status`, skippable with `--no-gitignore`
+    ///      for a repo that manages ignores centrally,
+    ///   5. a starter `TODO.md` at the render path — a valid empty projection.
     /// The TODO.md is NEVER overwritten (unlike `trk render`, which regenerates
     /// its projection by design): if one exists init leaves it and reports it, so
     /// init can't clobber a live projection or a user's file.
@@ -932,6 +945,7 @@ pub const Cli = struct {
         var out_arg: ?[]const u8 = null;
         var force = false;
         var write_attrs = true;
+        var write_ignore = true;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--out")) {
@@ -940,6 +954,8 @@ pub const Cli = struct {
                 force = true;
             } else if (std.mem.eql(u8, args[i], "--no-gitattributes")) {
                 write_attrs = false;
+            } else if (std.mem.eql(u8, args[i], "--no-gitignore")) {
+                write_ignore = false;
             } else {
                 try self.print("trk: unknown flag '{s}'\n", .{args[i]});
                 return error.UnknownFlag;
@@ -1023,7 +1039,28 @@ pub const Cli = struct {
             }
         }
 
-        // 4. Seed a starter TODO.md at render_out — ONLY if none exists.
+        // 4. .tracker/.gitignore — never overwritten, and never written at the
+        //    repo ROOT for the same reason .gitattributes isn't: git resolves
+        //    ignores per directory, so a pattern here can't be missed by a repo
+        //    whose root .gitignore never learned about compact's backup dir.
+        if (write_ignore) {
+            const gi = tracker.store.gitignore_name;
+            if (self.dirHas(sub, gi)) {
+                try self.print("{s}/{s} already exists — left untouched\n", .{ sd, gi });
+            } else {
+                sub.writeFile(self.io, .{
+                    .sub_path = gi,
+                    .data = tracker.store.gitignore_text,
+                    .flags = .{},
+                }) catch {
+                    try self.print("trk: init: cannot write {s}/{s}\n", .{ sd, gi });
+                    return error.WriteFailed;
+                };
+                try self.print("created {s}/{s} (ignores compact's backup/ runs)\n", .{ sd, gi });
+            }
+        }
+
+        // 5. Seed a starter TODO.md at render_out — ONLY if none exists.
         if (self.fileExists(render_out)) {
             try self.print("{s} already exists — left untouched (init never overwrites it)\n", .{render_out});
         } else {

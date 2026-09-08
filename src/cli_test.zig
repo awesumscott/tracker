@@ -1820,6 +1820,74 @@ test "trk init never clobbers a tuned .gitattributes" {
     try testing.expect(std.mem.indexOf(u8, f.out.items, ".gitattributes already exists") != null);
 }
 
+test "trk init writes .tracker/.gitignore covering backup/; --no-gitignore skips it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{"init"});
+    const gi = try f.tmp.dir.readFileAlloc(io, ".tracker/.gitignore", alloc, .unlimited);
+    defer alloc.free(gi);
+
+    // compact's pre-rewrite backup runs are what makes an ignore rule
+    // necessary in the first place — assert the line is actually present,
+    // not merely that the file exists.
+    try testing.expect(std.mem.indexOf(u8, gi, "\nbackup/\n") != null);
+    // log.jsonl/snapshot.jsonl/config.json/quarantine.jsonl are meant to be
+    // committed — none of them may appear as an ignored pattern.
+    try testing.expect(std.mem.indexOf(u8, gi, "log.jsonl\n") == null);
+    try testing.expect(std.mem.indexOf(u8, gi, "snapshot.jsonl\n") == null);
+    try testing.expect(std.mem.indexOf(u8, gi, "quarantine.jsonl\n") == null);
+
+    // Opt out: no file at all, and init still succeeds.
+    var f2 = try Fixture.init(alloc);
+    defer f2.deinit();
+    try f2.run(&.{ "init", "--no-gitignore" });
+    try testing.expectError(error.FileNotFound, f2.tmp.dir.access(io, ".tracker/.gitignore", .{}));
+    try f2.tmp.dir.access(io, ".tracker/log.jsonl", .{});
+}
+
+test "trk init never clobbers a tuned .gitignore" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try f.run(&.{"init"});
+
+    // Same non-destructive contract as .gitattributes/TODO.md: init creates,
+    // it never overwrites.
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = ".tracker/.gitignore",
+        .data = "backup/\n# house rule\n",
+        .flags = .{},
+    });
+    try f.run(&.{"init"});
+    const gi = try f.tmp.dir.readFileAlloc(io, ".tracker/.gitignore", alloc, .unlimited);
+    defer alloc.free(gi);
+    try testing.expectEqualStrings("backup/\n# house rule\n", gi);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, ".gitignore already exists") != null);
+}
+
+test "re-running trk init in an existing repo backfills a missing .gitignore without touching .gitattributes" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Simulate a repo that ran an OLDER `trk init` (before .gitignore
+    // existed): write everything init writes except .tracker/.gitignore.
+    try f.run(&.{"init"});
+    try f.tmp.dir.deleteFile(io, ".tracker/.gitignore");
+    const ga_before = try f.tmp.dir.readFileAlloc(io, ".tracker/.gitattributes", alloc, .unlimited);
+    defer alloc.free(ga_before);
+
+    // Re-running init is the migration: it backfills the missing file and
+    // leaves every other artifact byte-for-byte alone.
+    try f.run(&.{"init"});
+    try f.tmp.dir.access(io, ".tracker/.gitignore", .{});
+    const ga_after = try f.tmp.dir.readFileAlloc(io, ".tracker/.gitattributes", alloc, .unlimited);
+    defer alloc.free(ga_after);
+    try testing.expectEqualStrings(ga_before, ga_after);
+}
+
 test "trk compact warns (on stderr) when the .gitattributes pins are missing" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);

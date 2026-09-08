@@ -85,6 +85,35 @@ pub const gitattributes_text =
     \\
 ;
 
+/// Ignore rule for the store's own ephemeral output, written by `trk init`
+/// INTO `.tracker/` for the same reason `gitattributes_text` is: git resolves
+/// ignores per directory too, so a pattern here is immune to a repo's root
+/// `.gitignore` never mentioning it, and needs no git-root discovery since it
+/// is relative to this file's own directory. Only `backup/` (see
+/// `backup_subdir`) and a crash-orphaned atomic-write temp file are listed —
+/// `log.jsonl`, `snapshot.jsonl`, `config.json`, `.gitattributes` and
+/// `quarantine.jsonl` are all meant to be committed, so none of them belongs
+/// here.
+pub const gitignore_name = ".gitignore";
+pub const gitignore_text =
+    \\# Written by `trk init`. Kept INSIDE .tracker/ deliberately: git resolves
+    \\# ignores per directory, so this is immune to a root .gitignore never
+    \\# mentioning it. log.jsonl, snapshot.jsonl, config.json, .gitattributes
+    \\# and quarantine.jsonl are all meant to be committed — nothing here
+    \\# ignores them.
+    \\#
+    \\# compact's pre-rewrite backups (Config.backup_retain bounds how many it
+    \\# keeps, but even one full log+snapshot copy is a permanent untracked
+    \\# stray if `git status` never learns to skip it).
+    \\backup/
+    \\#
+    \\# A crash between atomicWrite's temp-file write and its rename leaves a
+    \\# `.<name>.tmp.<hex>` file behind (see Store.atomicWrite) — rare, but the
+    \\# same untracked-forever shape as the backup dir above.
+    \\.*.tmp.*
+    \\
+;
+
 /// Where `compact` parks the log lines of ghost ids before it truncates the
 /// log (see `Store.compact`). Append-only and never read back by trk — it is a
 /// recovery spool for a human, not part of the fold. Pinned to the default text

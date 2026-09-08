@@ -5,6 +5,34 @@ under a `## YYYY-MM-DD` run heading (config `archive.out` — unset today, so a 
 to stdout; this file is hand-started because a landing needed recording before that config existed).
 Forward-looking work is `docs/TODO.md` (generated); design rationale lives in `docs/design.md`.
 
+## 2026-09-08
+
+**`trk init` now writes `.tracker/.gitignore` (01M21BJFB).** `compact`'s pre-rewrite backup (landed
+2026-08-26) copies the full `snapshot.jsonl`/`log.jsonl` into `.tracker/backup/<ms-epoch>/` on every
+run, and nothing ignored it — measured on the Enix tracker: three compacts in one day left 29 MB
+across three run directories, permanently untracked in `git status`, with the only fix a hand-patched
+root `.gitignore` that doesn't travel to any other repo. `trk init` now writes `.tracker/.gitignore`
+(never overwritten; `--no-gitignore` opts out) alongside `.gitattributes`, placed INSIDE `.tracker/`
+for the identical reason the attributes file is: git resolves ignores per directory, so the pattern
+ships with the store into every repo that runs `init` instead of being a local patch. It covers
+`backup/` and a crash-orphaned `atomicWrite` temp file (`.<name>.tmp.<hex>`); `log.jsonl`,
+`snapshot.jsonl`, `config.json`, `.gitattributes` and `quarantine.jsonl` are deliberately absent from
+it — all five are meant to be committed. Re-running `init` in an existing repo is the migration
+(asserted: it backfills a missing `.gitignore` without touching `.gitattributes` or anything else
+already present).
+
+The backup-retention mechanism itself (`config.backup_retain`, default 10, evicting oldest-first)
+already existed from the 2026-08-26 landing; its host-unit test asserted the survivor COUNT but not
+identity, so it was strengthened alongside this change to assert the two NEWEST runs specifically
+survive and the two oldest are gone — a buggy eviction that kept the wrong two would have passed the
+old test.
+
+Host-unit tests `zig build test`: **224 → 227** (three new cases in `cli_test.zig` for the
+`.gitignore` write/skip/never-clobber/migration behaviors, one existing `store_test.zig` case
+strengthened for survivor identity). Manually verified against a throwaway `git init`'d scratch repo:
+after `trk init` + three `trk compact` runs, `git status --porcelain --ignored` shows
+`.tracker/backup/` as `!!` (ignored) rather than `??` (untracked).
+
 ## 2026-08-31
 
 **The decision-guard escape's count assertion was defeated by a count-PRESERVING body edit

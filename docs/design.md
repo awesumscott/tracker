@@ -291,6 +291,23 @@ git-root discovery, since patterns are relative to the file's own directory — 
 repo root, which `discover.findRoot` already never assumes. `--no-gitattributes` opts out for a repo that
 manages attributes centrally.
 
+**`.tracker/.gitignore` ships with the store the same way** (01M21BJFB, 2026-09-08). `compact`'s
+pre-rewrite backup (see below) is a full copy of `snapshot.jsonl`/`log.jsonl` on every run, and nothing
+ignored it — measured on the Enix tracker: three compacts in one day left 29 MB across three run
+directories, untracked forever in `git status` until a human either hand-patched the host repo's root
+`.gitignore` or learned to read past the noise. The argument for putting the rule inside `.tracker/` is
+the identical one made for `.gitattributes` two paragraphs up — git resolves ignores per directory too,
+so the pattern travels with the store into every repo that runs `trk init`, rather than being a local
+patch someone has to remember to re-add elsewhere. `trk init` writes it alongside `.gitattributes`
+(never overwritten; `--no-gitignore` opts out for a repo managing ignores centrally), covering
+`backup/` and a crash-orphaned `atomicWrite` temp file (`.<name>.tmp.<hex>`, left behind only if a
+process dies between the temp write and its rename). `log.jsonl`, `snapshot.jsonl`, `config.json`,
+`.gitattributes` and `quarantine.jsonl` are deliberately NOT listed — all five are meant to be
+committed, so an ignore rule that swept up the store directory itself (or a glob wide enough to catch
+them) would be a data-loss footgun of a different kind. Re-running `init` in a repo that predates this
+file is the migration: idempotent-by-construction, it backfills the missing `.gitignore` without
+touching anything else already there (asserted in `cli_test.zig`).
+
 **The check is narrow on purpose.** `compact` warns (stderr) when a pin is missing, because it is the verb
 that *creates* the two files that must never be union-merged. It cannot verify what is actually in effect:
 trk is std-only and never shells out to git (`discover.zig` reads `.git` as a plain file for exactly this
@@ -642,7 +659,9 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     verify's restore only fires ON a caught divergence; the backup exists so a human has a same-machine,
     no-git-archaeology recovery path even for a loss this mechanism does NOT catch (a bad merge whose
     corrupted state a *later* compact then faithfully re-persists, which is what actually happened to
-    `01KZTV44M` — see below).
+    `01KZTV44M` — see below). Bounding the count does not by itself keep the directory out of `git
+    status` — see the `.gitattributes`-adjacent `.gitignore` ruling above for why `backup/` also
+    needed an ignore rule, not just a retention cap.
   - **Root cause of `01KZTV44M`'s loss, isolated (not merely narrowed) from the Enix tracker's own git
     history:** the correction (commit `eb677cb1`) landed on a worktree branched BEFORE a compact
     (`2155deea`) had already run on main; union-merging that stale branch back in later (the `adc8f879`

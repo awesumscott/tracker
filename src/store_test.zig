@@ -2740,10 +2740,18 @@ test "compact: pre-compact backup directory retains exactly N runs and evicts ol
     try s.load();
     s.config.backup_retain = 2;
 
+    // Capture the backup-run dir name each compact produces (there's exactly
+    // one new directory after each compact — see below) so the FINAL
+    // assertion can check identity, not just count: keeping "any 2" would
+    // pass a count check while silently evicting the wrong ones.
+    var run_names: [4][]u8 = undefined;
+    defer for (run_names) |n| testing.allocator.free(n);
+
     try s.append(.{ .add = .{ .id = a, .title = "A" } });
     _ = try s.compact(); // 1st compact: `append` already persisted the add to
     // log.jsonl, so even this FIRST compact has real pre-compact log content
     // to back up (only `snapshot.jsonl` is genuinely absent this early).
+    run_names[0] = try newestBackupRunName(tmp.dir);
 
     // Three MORE compacts, each preceded by a genuinely new log line, so
     // each one has real pre-compact content worth backing up. 1 + 3 = 4
@@ -2755,6 +2763,15 @@ test "compact: pre-compact backup directory retains exactly N runs and evicts ol
         const tag_name = try std.fmt.bufPrint(&tag_buf, "round{d}", .{i});
         try s.append(.{ .tag = .{ .id = a, .tag = tag_name } });
         _ = try s.compact();
+        run_names[i + 1] = try newestBackupRunName(tmp.dir);
+    }
+
+    // Every captured name must be distinct (the collision-avoid suffix in
+    // `writeBackup` guards this even inside a fast host-unit loop) — a
+    // duplicate would mean the "newest" probe below is looking at the same
+    // run twice rather than four genuinely different ones.
+    for (run_names, 0..) |ni, ridx| {
+        for (run_names[ridx + 1 ..]) |nj| try testing.expect(!std.mem.eql(u8, ni, nj));
     }
 
     var sub = try tmp.dir.openDir(io, ".tracker", .{});
@@ -2768,6 +2785,38 @@ test "compact: pre-compact backup directory retains exactly N runs and evicts ol
         if (entry.kind == .directory) count += 1;
     }
     try testing.expectEqual(@as(usize, 2), count);
+
+    // The two SURVIVORS are the two NEWEST runs (indices 2, 3) — the two
+    // oldest (0, 1) are gone. Asserting only the count would equally pass a
+    // buggy eviction that kept the oldest 2 instead.
+    try backup_dir.access(io, run_names[2], .{});
+    try backup_dir.access(io, run_names[3], .{});
+    try testing.expectError(error.FileNotFound, backup_dir.access(io, run_names[0], .{}));
+    try testing.expectError(error.FileNotFound, backup_dir.access(io, run_names[1], .{}));
+}
+
+/// The lexicographically-greatest (= most recently created, per
+/// `Store.backupDirName`'s zero-padded-epoch naming) directory entry directly
+/// under `.tracker/backup/` at this instant. Used right after each compact in
+/// the retention test above, before the NEXT compact's eviction can remove it,
+/// to record which run each compact actually produced.
+fn newestBackupRunName(root: std.Io.Dir) ![]u8 {
+    var sub = try root.openDir(io, ".tracker", .{});
+    defer sub.close(io);
+    var backup_dir = try sub.openDir(io, tracker.store.backup_subdir, .{ .iterate = true });
+    defer backup_dir.close(io);
+
+    var newest: ?[]const u8 = null;
+    var buf: [64]u8 = undefined;
+    var it = backup_dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (newest == null or std.mem.order(u8, entry.name, newest.?) == .gt) {
+            @memcpy(buf[0..entry.name.len], entry.name);
+            newest = buf[0..entry.name.len];
+        }
+    }
+    return testing.allocator.dupe(u8, newest.?);
 }
 
 // ----- helpers -----
