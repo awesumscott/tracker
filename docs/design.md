@@ -165,13 +165,20 @@ date-based**:
 - **`archived`** — completed *and recorded* in `docs/CHANGELOG.md`. The graduation tombstone: excluded from
   every working view, retained in the log for audit until `compact` physically GCs it. Still satisfies a
   prereq (it is finished).
-- **`claimed`** — a CLAIM, not a verdict: "the commit I'm riding completes this task, pending verification."
-  Weaker than `done` in both directions on purpose — does **not** satisfy a prereq (`satisfiesPrereq` is
-  false: a dependent waits for the real, verified `done`) and is **not** `next`-eligible (a claim is not
-  available work; surfacing it there would let a second writer redo already-claimed work). It **does** count
-  as remaining for `render`'s TODO.md projection, with its own marker (`[c]`, distinct from open `[ ]`) — an
-  explicit, scannable "awaiting verification" queue (`trk list --state claimed`). See "Settled rulings" below
-  for the motivating case.
+- **`claimed`** — the LEASE: "this task is taken." Written when work is handed out so `next` stops offering
+  it, and always by a named holder (`--holder`). Not `next`-eligible, does **not** satisfy a prereq (the work
+  isn't done), counts as remaining in `render` (marker `[c]`), keeps its arc undrained. Only an `open` task
+  can be claimed (`State.claimRefusal`, enforced in `Store.append`). Released by `trk release`.
+- **`submitted`** — completion PENDING VERIFICATION, not a verdict: "the commit I'm riding completes this
+  task." Weaker than `done` in both directions on purpose — does **not** satisfy a prereq (a dependent waits
+  for the real, verified `done`) and is **not** `next`-eligible (surfacing it would let a second writer redo
+  submitted work). It **does** count as remaining for `render`, marker `[s]` — the scannable "awaiting
+  verification" queue (`trk list --state submitted`), which the orchestrator's post-gate reconcile promotes
+  to `done` or demotes to `open`. Named `claimed` until the lease existed; see "Settled rulings" for the
+  rename, its encoding, and the release path.
+
+Lifecycle for handed-out work: `open` → `claimed` → `submitted` → `done`, with `claimed` → `open` as the
+release. `open` → `submitted` stays legal (a lane's worktree store never saw the main checkout's lease).
 
 **`trk archive` is the graduation step** (`cmdArchive` in `cli.zig`): it **emits each `done` task as a
 markdown bullet, then flips it to `archived`** in one move — the act of recording is the act of retiring.
@@ -408,8 +415,11 @@ runs `trk state done` — the evidence was sitting in `git log` the whole time. 
 — the repo housing `.tracker/`, which the tool itself may not live in), tokenizes the output once (maximal
 alphanumeric runs), and looks each token up against an index of every OPEN task's full id + displayed short
 id (exact-token match, not substring — a short id can never accidentally match as part of an unrelated
-longer token). `claimed` tasks are excluded: a claim already IS the self-reported signal this verb exists to
-surface for a task that never got one.
+longer token). `submitted` tasks are excluded: a submission already IS the self-reported signal this verb
+exists to surface. Leased (`claimed`) tasks are **included**: a lane's commits reach this ancestry only when
+it merges, and its `submitted` line merges with them — so a landed citation on a task still leased means
+the lane merged without submitting (or wrote `claimed` out of the pre-rename habit), stranding it out of
+both `next` and the verification queue.
 
 **Deliberately `git log`, never `git log --all`.** `--all` walks every ref, including a parallel fan-out's
 unmerged worktree branches — a commit hit there is not proof the work is at HEAD (measured in the field: a
@@ -612,6 +622,7 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
 
 ## Open forks
 
+
 - **Anchor adoption — opportunistic *or* a cheap automated full-corpus pass.** The "never mandate
   corpus-wide, it's a tax" framing assumed *manual* anchoring. A one-time automated pass inverts the
   economics: ~1hr, repo-agnostic, re-runnable — paid once against focused-reads that save tokens dozens of
@@ -626,6 +637,42 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   task; disjoint-writer may suffice indefinitely.
 
 ## Settled rulings
+
+- **The lease, and `claimed` → `submitted`** (01M2GGFGR, 2026-09-14). In fan-outs the only thing stopping
+  two lanes or sessions from starting the same task was the orchestrator's memory, and `claimed` already
+  read as "this task is taken" while meaning "this commit completes it". So `claimed` became the lease and
+  the completion report became `submitted`, semantics unchanged.
+  - **Encoding.** The lease is written `"state":"leased"`; `submitted` is written `"submitted"`. The token
+    `"claimed"` is **spent**: every existing line means submitted, and a long-lived branch can union-merge
+    more pre-rename lines in at any time, so it decodes as `submitted` forever and is never written again
+    (`json_codec.stateToWire`/`stateFromWire`). The CLI, `--json` output and `list --state` all use the
+    state *names* (`claimed` = lease); only the codec knows the wire token. `compact` rewrites legacy lines
+    as `submitted`. A pre-rename binary meets `leased`/`submitted` as `BadState` and refuses to load —
+    loud, never a misread.
+  - **Markers.** The lease keeps `[c]`, `submitted` gets `[s]`: the letters follow the names, and TODO.md is
+    regenerated on every render, so no persisted artifact still reads `[c]` as the old meaning.
+  - **What the refusals catch.** A lease needs `--holder`, and the habit never named one, so bare `trk
+    state <id> claimed` fails everywhere — including a lane's worktree store, where the main checkout's lease
+    is invisible and the task reads `open`. Independently, `claimed` from anything but `open` is refused:
+    `claimed` → `claimed` (the mutual exclusion itself), `submitted` → `claimed` (would pull a task out of
+    the verification queue), `done`/`archived`/`dropped`/`blocked` → `claimed`. Every refusal names
+    `submitted`. **Not caught:** a deliberate `--holder` lease written where nobody else reads it (a lane's
+    worktree) — it merges in as a stranded lease, which `trk stale` surfaces once the citing commit lands;
+    and two writers claiming the same task in the same store within the read-append window (no lock;
+    std-only, append-only).
+  - **Release path: a recorded holder, a conditional release, no expiry.** The lease event carries
+    `holder` and its `ts` is the lease's age (`Task.holder`/`lease_ts`, shown by `list`/`show`/`--json`,
+    kept by `compact`). `trk release <id>` / `trk release --holder <h>` append a `release` op naming the
+    holder, which the fold applies **only while that holder still holds the task**; the fold likewise
+    applies a lease only to an `open` task. Replay is ts-ordered last-write-wins, and that is what the
+    conditions are for: a lane's `submitted`, written in its worktree before main's teardown release but
+    merged after it, sorts before the release, so the release finds a submitted task and does nothing — a
+    plain `setState open` would win and silently drop the submission. The same shape keeps a stale release
+    from undoing someone else's newer lease, and a lease taken on a not-yet-merged view from overwriting a
+    submission. Liveness stays with the orchestrator (release a lane's leases when it merges or is
+    discarded); `trk state <id> open` remains the unconditional override.
+    *Rejected: expiry.* It makes `next` a function of the clock rather than the fold, and a lease lapsing
+    under hours of gated work hands the task out twice — the failure the lease exists to prevent.
 
 - **Compaction & history retention.** `compact` (`Store.compact`) writes a fresh full-state snapshot then
   truncates the log. It **drops `dropped` AND `archived` tasks** (and edges touching them) — abandoned work

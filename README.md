@@ -58,8 +58,9 @@ discovery).
 - **`T in X`** — task `T` belongs to arc `X`. An **arc** is a task that's either **declared**
   (`trk arc <id>`, or `trk add --arc` — works even with zero members) or has ≥1 direct `in` member.
   `trk in <task> <arc>`. `trk list --no-arc` lists every task in no arc.
-- **State** — `open` → `done` → `archived` (via `trk archive`, which graduates done tasks to changelog
-  bullets and tombstones them), plus `blocked` (held) and `dropped` (won't-do).
+- **State** — `open` → `claimed` (the lease: taken, hidden from `next`) → `submitted` (completion pending
+  verification) → `done` → `archived` (via `trk archive`, which graduates done tasks to changelog bullets
+  and tombstones them), plus `blocked` (held) and `dropped` (won't-do).
 - **`next`** — the ready frontier: every `open` task whose prerequisites are all satisfied. An arc root
   is a container ("do the arc" = do its non-parked members): `next` holds it back until the members are
   finished, then surfaces it once as the close-out prompt — closing the root is what marks the goal
@@ -77,7 +78,7 @@ discovery).
 
 ## Commands
 
-`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · edit · show · next · list · render · tree · log · doc · compact · archive · init`
+`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · show · next · list · render · tree · log · doc · compact · archive · init`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.

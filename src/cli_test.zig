@@ -189,35 +189,158 @@ test "state rejects a bad state name cleanly" {
     try testing.expectEqual(cli.CliError.BadState, e);
 }
 
-test "state claimed: settable, marked distinctly in list/render, absent from next" {
+test "state submitted: settable, marked distinctly in list/render, absent from next" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
     const a = mintId();
     try f.store.append(.{ .add = .{ .id = a, .title = "builder self-report" } });
 
-    try f.run(&.{ "state", &a.text, "claimed" });
-    try testing.expectEqual(tracker.State.claimed, f.store.get(a).?.state);
+    try f.run(&.{ "state", &a.text, "submitted" });
+    try testing.expectEqual(tracker.State.submitted, f.store.get(a).?.state);
 
     // list: the marker distinguishes it from plain open, and it's the
     // default-visible bucket (no --state needed, unlike archived).
     try f.run(&.{"list"});
-    try testing.expect(std.mem.indexOf(u8, f.out.items, "[c] ") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[s] ") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") != null);
 
     // The explicit awaiting-verification queue.
-    try f.run(&.{ "list", "--state", "claimed" });
+    try f.run(&.{ "list", "--state", "submitted" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") != null);
+    try f.run(&.{ "list", "--state", "claimed" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") == null);
 
     // render: still in TODO.md (isRemaining), with the same distinct marker.
     try f.run(&.{"render"});
-    try testing.expect(std.mem.indexOf(u8, f.out.items, "[c]") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[s]") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") != null);
 
     // next: NOT offered as available work — the frontier stays exactly
-    // "genuinely ready", not inflated with an unverified claim.
+    // "genuinely ready", not inflated with an unverified submission.
     try f.run(&.{"next"});
     try testing.expect(std.mem.indexOf(u8, f.out.items, "builder self-report") == null);
+}
+
+test "state claimed: the lease hides a task from next, shows its holder, and release returns it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "handed out" } });
+
+    try f.run(&.{ "state", &a.text, "claimed", "--holder", "lane-3" });
+    try testing.expectEqual(tracker.State.claimed, f.store.get(a).?.state);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "held by lane-3") != null);
+
+    try f.run(&.{"next"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "handed out") == null);
+    try f.run(&.{ "list", "--state", "claimed" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[c] ") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "(held by lane-3 since ") != null);
+    try f.run(&.{ "show", &a.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "holder:   lane-3") != null);
+    try f.run(&.{"render"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[c]") != null);
+    try f.run(&.{ "list", "--json", "--state", "claimed" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"state\":\"claimed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"holder\":\"lane-3\",\"lease_ts\":") != null);
+
+    try f.run(&.{ "release", &a.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "released from lane-3") != null);
+    try testing.expectEqual(tracker.State.open, f.store.get(a).?.state);
+    try f.run(&.{"next"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "handed out") != null);
+
+    // Releasing again is a reported no-op, not an error.
+    try f.run(&.{ "release", &a.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "not claimed") != null);
+}
+
+test "state claimed: --holder is required (the hint names `submitted`) and only valid for claimed" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "t" } });
+
+    try testing.expectEqual(cli.CliError.HolderRequired, f.runExpectErr(&.{ "state", &a.text, "claimed" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "--holder") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "submitted") != null);
+    try testing.expectEqual(tracker.State.open, f.store.get(a).?.state);
+
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "state", &a.text, "done", "--holder", "x" }));
+    try testing.expectEqual(tracker.State.open, f.store.get(a).?.state);
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "state", &a.text, "claimed", "extra", "--holder", "x" }));
+}
+
+test "state claimed: refused on any non-open task, with a hint naming `submitted`" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // claimed -> claimed: the lease is held (and the old completion habit).
+    const held = mintId();
+    try f.store.append(.{ .add = .{ .id = held, .title = "held" } });
+    try f.run(&.{ "state", &held.text, "claimed", "--holder", "lane-1" });
+    try testing.expectEqual(cli.CliError.ClaimRequiresOpen, f.runExpectErr(&.{ "state", &held.text, "claimed", "--holder", "lane-2" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "already claimed by lane-1") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "submitted") != null);
+    try testing.expectEqualStrings("lane-1", f.store.get(held).?.holder.?);
+
+    // submitted -> claimed: would silently pull it out of the verification queue.
+    const sub = mintId();
+    try f.store.append(.{ .add = .{ .id = sub, .title = "sub" } });
+    try f.store.append(.{ .setState = .{ .id = sub, .state = .submitted } });
+    try testing.expectEqual(cli.CliError.ClaimRequiresOpen, f.runExpectErr(&.{ "state", &sub.text, "claimed", "--holder", "lane-2" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "already submitted") != null);
+    try testing.expectEqual(tracker.State.submitted, f.store.get(sub).?.state);
+
+    // done/blocked -> claimed: only open work can be leased.
+    for ([_]tracker.State{ .done, .blocked }) |st| {
+        const id = mintId();
+        try f.store.append(.{ .add = .{ .id = id, .title = "x" } });
+        try f.store.append(.{ .setState = .{ .id = id, .state = st } });
+        try testing.expectEqual(cli.CliError.ClaimRequiresOpen, f.runExpectErr(&.{ "state", &id.text, "claimed", "--holder", "lane-2" }));
+        try testing.expect(std.mem.indexOf(u8, f.out.items, "only an open task can be claimed") != null);
+        try testing.expect(std.mem.indexOf(u8, f.out.items, "submitted") != null);
+        try testing.expectEqual(st, f.store.get(id).?.state);
+    }
+}
+
+test "release --holder releases exactly that holder's leases; a mismatched holder is refused" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    const b = mintId();
+    const c = mintId();
+    const d = mintId();
+    for ([_]tracker.Ulid{ a, b, c, d }) |id| try f.store.append(.{ .add = .{ .id = id, .title = "t" } });
+    try f.run(&.{ "state", &a.text, "claimed", "--holder", "lane-1" });
+    try f.run(&.{ "state", &b.text, "claimed", "--holder", "lane-1" });
+    try f.run(&.{ "state", &c.text, "claimed", "--holder", "lane-2" });
+    try f.run(&.{ "state", &d.text, "claimed", "--holder", "lane-1" });
+    try f.run(&.{ "state", &d.text, "submitted" });
+
+    try testing.expectEqual(cli.CliError.LeaseHolderMismatch, f.runExpectErr(&.{ "release", &c.text, "--holder", "lane-1" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "held by lane-2, not lane-1") != null);
+    try testing.expectEqual(tracker.State.claimed, f.store.get(c).?.state);
+
+    try f.run(&.{ "release", "--holder", "lane-1" });
+    try testing.expectEqual(tracker.State.open, f.store.get(a).?.state);
+    try testing.expectEqual(tracker.State.open, f.store.get(b).?.state);
+    try testing.expectEqual(tracker.State.claimed, f.store.get(c).?.state);
+    try testing.expectEqual(tracker.State.submitted, f.store.get(d).?.state);
+
+    try f.run(&.{ "release", "--holder", "lane-1" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing claimed by lane-1") != null);
+
+    try f.run(&.{ "release", &c.text, "--holder", "lane-2" });
+    try testing.expectEqual(tracker.State.open, f.store.get(c).?.state);
+
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{"release"}));
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "release", &a.text, &b.text }));
 }
 
 // ----------------------------------------------------------- TRK_READONLY gate
@@ -2102,7 +2225,7 @@ test "every verb supports --help/-h and add --help mints no task" {
     const verbs = [_][]const u8{
         "init",  "add",  "dep",  "undep",  "in",   "unin",    "arc",          "migrate-arcs", "migrate-shorts",
         "state", "next", "list", "render", "tree", "compact", "archive",      "doc",
-        "show",  "edit", "log",  "stale",
+        "show",  "edit", "log",  "stale", "release",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verb_help.len);
 
@@ -2833,25 +2956,31 @@ fn runGitOk(alloc: std.mem.Allocator, dir: std.Io.Dir, argv: []const []const u8)
     if (!ok) return error.GitCommandFailed;
 }
 
-test "trk stale: finds an open task cited in a landed commit; excludes claimed and never-cited" {
+test "trk stale: finds open and leased tasks cited in a landed commit; excludes submitted and never-cited" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
 
     const cited_open = mintId();
-    const cited_claimed = mintId();
+    const cited_submitted = mintId();
+    const cited_leased = mintId();
     const uncited_open = mintId();
     try f.store.append(.{ .add = .{ .id = cited_open, .title = "orphaned close" } });
-    try f.store.append(.{ .add = .{ .id = cited_claimed, .title = "already claimed" } });
-    try f.store.append(.{ .setState = .{ .id = cited_claimed, .state = .claimed } });
+    try f.store.append(.{ .add = .{ .id = cited_submitted, .title = "already submitted" } });
+    try f.store.append(.{ .setState = .{ .id = cited_submitted, .state = .submitted } });
+    try f.store.append(.{ .add = .{ .id = cited_leased, .title = "stranded lease" } });
+    try f.store.append(.{ .setState = .{ .id = cited_leased, .state = .claimed, .holder = "lane-1" } });
     try f.store.append(.{ .add = .{ .id = uncited_open, .title = "never mentioned" } });
 
     var sb1: [ulid.len]u8 = undefined;
     const short1 = try alloc.dupe(u8, try f.c.shortId(cited_open, &sb1));
     defer alloc.free(short1);
     var sb2: [ulid.len]u8 = undefined;
-    const short2 = try alloc.dupe(u8, try f.c.shortId(cited_claimed, &sb2));
+    const short2 = try alloc.dupe(u8, try f.c.shortId(cited_submitted, &sb2));
     defer alloc.free(short2);
+    var sb3: [ulid.len]u8 = undefined;
+    const short3 = try alloc.dupe(u8, try f.c.shortId(cited_leased, &sb3));
+    defer alloc.free(short3);
 
     // A real git repo rooted at the fixture's own tmpDir — the SAME dir
     // `cmdStale` resolves via `self.dir`, so this exercises the real spawn.
@@ -2862,15 +2991,20 @@ test "trk stale: finds an open task cited in a landed commit; excludes claimed a
     const msg1 = try std.fmt.allocPrint(alloc, "merge({s}): completes the orphaned close", .{short1});
     defer alloc.free(msg1);
     try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "--allow-empty", "-m", msg1 });
-    const msg2 = try std.fmt.allocPrint(alloc, "feat({s}): work that was already claimed", .{short2});
+    const msg2 = try std.fmt.allocPrint(alloc, "feat({s}): work that was already submitted", .{short2});
     defer alloc.free(msg2);
     try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "--allow-empty", "-m", msg2 });
+    const msg3 = try std.fmt.allocPrint(alloc, "merge({s}): lane merged without submitting", .{short3});
+    defer alloc.free(msg3);
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "--allow-empty", "-m", msg3 });
 
     try f.run(&.{"stale"});
     try testing.expect(std.mem.indexOf(u8, f.out.items, "orphaned close") != null);
-    try testing.expect(std.mem.indexOf(u8, f.out.items, "already claimed") == null); // claimed: excluded
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[c] ") != null); // leased: included, marked
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "stranded lease") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "already submitted") == null); // submitted: excluded
     try testing.expect(std.mem.indexOf(u8, f.out.items, "never mentioned") == null); // never cited
-    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 open task(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "2 open or claimed task(s)") != null);
 
     // Extra args rejected cleanly.
     try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "stale", "extra" }));

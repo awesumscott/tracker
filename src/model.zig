@@ -27,26 +27,51 @@ pub const State = enum {
     /// retained in the log for audit until `compact` physically GCs it. Like
     /// `done`/`dropped` it satisfies a prereq (it is finished).
     archived,
-    /// A CLAIM, not a verdict: "the commit I'm riding completes this task, pending
-    /// verification." Exists so a task close can ride the implementing commit even
-    /// for GATED work, where a compile-only builder cannot know whether the boot
-    /// gate passed and so is barred from ever asserting `done` (`done` means
-    /// "passed its gate"). Deliberately weaker than `done` in both directions:
+    /// A LEASE: "this task is taken — someone is working it." Written when work
+    /// is handed out, so a second writer (another lane, another session) is not
+    /// offered it. Not a completion claim of any kind:
+    /// - does NOT satisfy a `needs` edge — the work is not done.
+    /// - is NOT `next`-eligible — handing a leased task out again is the
+    ///   double-work the lease exists to prevent.
+    /// - counts as remaining in `trk render` (marker `[c]`), and a leased member
+    ///   keeps its arc undrained.
+    /// Only an `open` task can be claimed, and only by a named holder
+    /// (`claimRefusal` and the holder check, enforced by `Store.append`). Those
+    /// refusals are both the mutual exclusion (a second claim on a held task
+    /// fails) and the fail-loud for the pre-rename habit of writing `claimed`
+    /// to mean completion, which is now `submitted` — the habit never names a
+    /// holder. The fold mirrors the rule: a lease that reaches a non-open task
+    /// (a merge delivering it after a submission) is a no-op.
+    /// Release is the `release` op (conditional on this holder still holding
+    /// it) or a plain `setState open`; completion is `claimed -> submitted|done`.
+    ///
+    /// WIRE TOKEN IS `leased`, NOT `claimed` (see `json_codec.stateToWire`). Every
+    /// `"state":"claimed"` ever serialized means `submitted` — written by the
+    /// pre-rename binary — and a long-lived branch can union-merge more of them
+    /// in at any time, so that token is permanently the legacy spelling of
+    /// `submitted` and is never written again.
+    claimed,
+    /// A SUBMISSION, not a verdict: "the commit I'm riding completes this task,
+    /// pending verification." (Named `claimed` before the lease existed.) Exists
+    /// so a task close can ride the implementing commit even for GATED work,
+    /// where a compile-only builder cannot know whether the boot gate passed and
+    /// so is barred from ever asserting `done` (`done` means "passed its gate").
+    /// Deliberately weaker than `done` in both directions:
     /// - does NOT satisfy a `needs` edge (`satisfiesPrereq` is false) — a
-    ///   dependent must wait for the real, verified `done`, not an unverified claim.
+    ///   dependent must wait for the real, verified `done`, not an unverified
+    ///   submission.
     /// - does NOT appear in `next`'s ready frontier (`isEligible` is false) — it
     ///   is not available work, so surfacing it there would let a second builder
-    ///   pick it up and redo already-claimed work (the "inflate the frontier
-    ///   ambiguously" failure this state exists to avoid).
+    ///   pick it up and redo already-submitted work.
     /// It DOES count as remaining/not-yet-built for `trk render`'s TODO.md
-    /// projection (`isRemaining` in cli.zig), with its own marker distinct from
-    /// `open` — a short, explicit "awaiting verification" queue a human or a hook
-    /// can scan (`trk list --state claimed`), rather than silently blending into
+    /// projection (`isRemaining` in cli.zig), with its own marker (`[s]`) — a
+    /// short, explicit "awaiting verification" queue a human or a hook can scan
+    /// (`trk list --state submitted`), rather than silently blending into
     /// ordinary open work. The orchestrator's post-gate reconcile promotes it to
     /// `done` (gate passed) or demotes it back to `open` with a note (gate
-    /// failed) — the existing "orchestrator alone verifies" rule is unchanged;
-    /// only what a builder agent may itself write changes.
-    claimed,
+    /// failed) — the "orchestrator alone verifies" rule is unchanged; only what
+    /// a builder agent may itself write changes.
+    submitted,
 
     /// Does this task's state satisfy a `needs` edge pointing at it?
     /// (i.e. may a dependent become eligible because of it.)
@@ -63,9 +88,27 @@ pub const State = enum {
         return @tagName(self);
     }
 
+    /// The CLI/JSON-output spelling. NOT the on-disk token for every state —
+    /// see `json_codec.stateFromWire`.
     pub fn fromString(s: []const u8) ?State {
         return std.meta.stringToEnum(State, s);
     }
+
+    /// Why `from -> claimed` must be refused, or null when the lease may be
+    /// taken. Only `open` work can be leased. Pure policy for the write path
+    /// (`Store.append`); the fold itself accepts any transition, because a
+    /// union merge can deliver any sequence.
+    pub fn claimRefusal(from: State) ?ClaimRefusal {
+        return switch (from) {
+            .open => null,
+            .claimed => .already_claimed,
+            .submitted => .already_submitted,
+            .done, .archived, .dropped => .finished,
+            .blocked => .blocked,
+        };
+    }
+
+    pub const ClaimRefusal = enum { already_claimed, already_submitted, finished, blocked };
 };
 
 /// The rank an UNSET priority carries in every ordering. Stored `0` is the
@@ -110,6 +153,10 @@ pub const Task = struct {
     title: []const u8 = "",
     body: []const u8 = "",
     state: State = .open,
+    /// Who holds the lease, and since when (the claiming event's `ts`). Set only
+    /// while `state == .claimed`; every other state clears both.
+    holder: ?[]const u8 = null,
+    lease_ts: i64 = 0,
     /// Global rank, lower first. Stored `0` means UNSET, not "strongest" —
     /// ordering substitutes `default_priority` for it (see `effectivePriority`).
     priority: i32 = 0,
@@ -212,6 +259,15 @@ pub const Op = enum {
     /// task instead gets its short via the `add` event's own `short` field;
     /// this op exists for the retrofit path where `add` already happened.
     setShort,
+    /// Release a lease: `claimed -> open`, applied on fold ONLY if the task is
+    /// still `claimed` by exactly `holder`. The condition is what makes it safe
+    /// under ts-ordered replay: a lane's `submitted` written before the release
+    /// but merged after it sorts first, so the release finds a submitted task
+    /// and does nothing — a plain `setState open` would win and silently drop
+    /// the submission. Likewise a stale release can never undo a newer lease
+    /// taken by someone else. Safe for an older binary to skip (it cannot load
+    /// the `leased` state this op acts on anyway).
+    release,
 };
 
 /// One log event — a tagged union over the op kinds. Fields mirror the JSON
@@ -246,6 +302,7 @@ pub fn eventTaskIds(ev: Event) [2]?Ulid {
         .undocref => |x| .{ x.id, null },
         .arcDeclare => |x| .{ x.id, null },
         .arcStanding => |x| .{ x.id, null },
+        .release => |x| .{ x.id, null },
         .dep => |x| .{ x.from, x.to },
         .undep => |x| .{ x.from, x.to },
         .in => |x| .{ x.task, x.arc },
@@ -282,7 +339,8 @@ pub const Event = union(Op) {
         /// ignores, so the format stays backward AND forward compatible.
         wm: i64 = 0,
     },
-    setState: struct { id: Ulid, state: State, ts: i64 = 0 },
+    /// `holder` is required for (and only written with) `state == .claimed`.
+    setState: struct { id: Ulid, state: State, holder: ?[]const u8 = null, ts: i64 = 0 },
     dep: struct { from: Ulid, to: Ulid, ts: i64 = 0 },
     in: struct { task: Ulid, arc: Ulid, seq: i32 = 0, ts: i64 = 0 },
     setPriority: struct { id: Ulid, priority: i32, ts: i64 = 0 },
@@ -320,4 +378,6 @@ pub const Event = union(Op) {
     arcStanding: struct { id: Ulid, standing: bool, ts: i64 = 0 },
     /// Freeze a task's short id. See `Op.setShort`.
     setShort: struct { id: Ulid, short: []const u8, ts: i64 = 0 },
+    /// Release `holder`'s lease on `id`. See `Op.release`.
+    release: struct { id: Ulid, holder: []const u8, ts: i64 = 0 },
 };

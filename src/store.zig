@@ -187,6 +187,12 @@ pub const Error = error{
     /// direct `Store.append` caller doing `x in x` still gets the
     /// pre-existing `DependencyCycle` diagnosis, not this one.
     UndeclaredArc,
+    /// `setState claimed` on a task that is not `open` — see
+    /// `State.claimRefusal` for the reasons, which the CLI turns into a hint.
+    ClaimRequiresOpen,
+    /// `setState claimed` without a holder. A lease nobody can be asked about
+    /// or release by name is the stranding this exists to prevent.
+    HolderRequired,
 } || std.mem.Allocator.Error;
 
 /// A `needs` edge in memory.
@@ -415,6 +421,7 @@ pub const Store = struct {
             .setBody => |x| x.id,
             .setPriority => |x| x.id,
             .setShort => |x| x.id,
+            .release => |x| x.id,
             else => null,
         };
     }
@@ -459,6 +466,7 @@ pub const Store = struct {
             .setBody => |x| x.id,
             .setPriority => |x| x.id,
             .setShort => |x| x.id,
+            .release => |x| x.id,
             .tag => |x| x.id,
             .untag => |x| x.id,
             .docref => |x| x.id,
@@ -502,7 +510,27 @@ pub const Store = struct {
             },
             .setState => |x| {
                 const t = try self.ensureNode(x.id);
+                if (x.state == .claimed) {
+                    // A lease only ever takes OPEN work. Reaching anything else
+                    // means a merge delivered it after the task moved on (a
+                    // lane's submission, a close) — the lease is stale.
+                    if (t.state != .open) return;
+                    t.holder = if (x.holder) |h| try self.a().dupe(u8, h) else null;
+                    t.lease_ts = x.ts;
+                } else {
+                    t.holder = null;
+                    t.lease_ts = 0;
+                }
                 t.state = x.state;
+            },
+            .release => |x| {
+                const t = try self.ensureNode(x.id);
+                if (t.state != .claimed) return;
+                const h = t.holder orelse return;
+                if (!std.mem.eql(u8, h, x.holder)) return;
+                t.state = .open;
+                t.holder = null;
+                t.lease_ts = 0;
             },
             .setPriority => |x| {
                 const t = try self.ensureNode(x.id);
@@ -1009,6 +1037,8 @@ pub const Store = struct {
             .untag => |x| gpa.free(x.tag),
             .undocref => |x| gpa.free(x.doc_id),
             .setShort => |x| gpa.free(x.short),
+            .setState => |x| if (x.holder) |h| gpa.free(h),
+            .release => |x| gpa.free(x.holder),
             else => {},
         }
     }
@@ -1226,6 +1256,14 @@ pub const Store = struct {
         // doc comment for why this can no longer be inferred from the edge.
         switch (ev_in) {
             .in => |x| if (!x.task.eql(x.arc) and !self.isArc(x.arc)) return error.UndeclaredArc,
+            // A lease is taken only on open work. Checked at WRITE time only:
+            // the fold applies any sequence a merge delivers.
+            .setState => |x| if (x.state == .claimed) {
+                if (x.holder == null or x.holder.?.len == 0) return error.HolderRequired;
+                if (self.tasks.get(key(x.id))) |t| {
+                    if (State.claimRefusal(t.state) != null) return error.ClaimRequiresOpen;
+                }
+            },
             else => {},
         }
 
@@ -1604,10 +1642,12 @@ pub const Store = struct {
         t: Task,
     ) !u64 {
         buf.clearRetainingCapacity();
-        try buf.print(self.gpa, "title\x00{s}\x00body\x00{s}\x00state\x00{s}\x00priority\x00{d}\x00short\x00{s}\x00declared\x00{}\x00standing\x00{}\x00", .{
+        try buf.print(self.gpa, "title\x00{s}\x00body\x00{s}\x00state\x00{s}\x00holder\x00{s}\x00lease_ts\x00{d}\x00priority\x00{d}\x00short\x00{s}\x00declared\x00{}\x00standing\x00{}\x00", .{
             t.title,
             t.body,
             @tagName(t.state),
+            t.holder orelse "\x01",
+            t.lease_ts,
             t.priority,
             t.short orelse "\x01",
             self.declared_arcs.contains(key(id)),
@@ -1880,7 +1920,13 @@ pub const Store = struct {
                 .wm = @max(t.last_ts, t.watermark),
             } });
             if (t.state != .open)
-                try self.emit(buf, .{ .setState = .{ .id = id, .state = t.state } });
+                // A lease keeps its holder and its age across the rewrite.
+                try self.emit(buf, .{ .setState = .{
+                    .id = id,
+                    .state = t.state,
+                    .holder = t.holder,
+                    .ts = t.lease_ts,
+                } });
             if (t.priority != 0)
                 try self.emit(buf, .{ .setPriority = .{ .id = id, .priority = t.priority } });
             for (t.docrefs.items) |dr|
@@ -2043,7 +2089,10 @@ pub const Store = struct {
                 .setState => |x| blk: {
                     ts = x.ts;
                     task_id = x.id;
-                    break :blk try std.fmt.allocPrint(alloc, "state -> {s}", .{x.state.toString()});
+                    break :blk if (x.holder) |h|
+                        try std.fmt.allocPrint(alloc, "state -> {s} (held by {s})", .{ x.state.toString(), h })
+                    else
+                        try std.fmt.allocPrint(alloc, "state -> {s}", .{x.state.toString()});
                 },
                 .dep => |x| blk: {
                     ts = x.ts;
@@ -2119,6 +2168,11 @@ pub const Store = struct {
                     ts = x.ts;
                     task_id = x.id;
                     break :blk try std.fmt.allocPrint(alloc, "short frozen: {s}", .{x.short});
+                },
+                .release => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "release: lease held by {s}", .{x.holder});
                 },
             };
             try out.append(alloc, .{

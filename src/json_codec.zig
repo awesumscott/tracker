@@ -13,7 +13,8 @@
 //!
 //! Schema (one object per line). `op` is the discriminator:
 //!   {"op":"add","id":"<ulid>","title":"..","body":"..","tags":["a","b"],"short":"..."|omitted,"ts":169..}
-//!   {"op":"setState","id":"<ulid>","state":"open|done|blocked|dropped|claimed","ts":0}
+//!   {"op":"setState","id":"<ulid>","state":"open|done|blocked|dropped|archived|leased|submitted","ts":0}
+//!     (state tokens are NOT the CLI names for every state — see `stateToWire`)
 //!   {"op":"dep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"in","task":"<ulid>","arc":"<ulid>","seq":0,"ts":0}
 //!   {"op":"setPriority","id":"<ulid>","priority":0,"ts":0}
@@ -32,6 +33,9 @@
 //!   {"op":"arcDeclare","id":"<ulid>","declared":true|false,"ts":0}
 //!   {"op":"arcStanding","id":"<ulid>","standing":true|false,"ts":0}
 //!   {"op":"setShort","id":"<ulid>","short":"...","ts":0}
+//!   {"op":"release","id":"<ulid>","holder":"...","ts":0}
+//! A `setState` to the lease (`"leased"`) carries `"holder":"..."`; no other
+//! state writes the key, and decode ignores it on any other state.
 //!
 //! ts=0 is tolerated on decode (legacy lines / snapshot events). `add`'s
 //! "short" is likewise optional-on-decode (absent -> null): every add event
@@ -64,6 +68,34 @@ pub const DecodeError = error{
     BadUlid,
     BadState,
 } || std.mem.Allocator.Error;
+
+// ----------------------------------------------------------------- state tokens
+
+/// The on-disk token for a state. Identical to the CLI name except for the
+/// lease: `State.claimed` is written `leased`, because the token `claimed` was
+/// already spent — every line a pre-rename binary wrote with it means
+/// `submitted`, and a long-lived branch can union-merge more of those in at any
+/// time. A token that has never meant anything else keeps both readable forever.
+pub fn stateToWire(st: model.State) []const u8 {
+    return switch (st) {
+        .claimed => "leased",
+        else => st.toString(),
+    };
+}
+
+/// Inverse of `stateToWire`, plus the legacy alias: `claimed` decodes as
+/// `submitted`, never as the lease. An older binary meets `leased`/`submitted`
+/// as `BadState` and refuses to load — loud, never a silent misread.
+pub fn stateFromWire(tok: []const u8) ?model.State {
+    if (std.mem.eql(u8, tok, "leased")) return .claimed;
+    if (std.mem.eql(u8, tok, "claimed")) return .submitted;
+    if (std.mem.eql(u8, tok, "submitted")) return .submitted;
+    const st = model.State.fromString(tok) orelse return null;
+    return switch (st) {
+        .claimed, .submitted => unreachable, // both handled above
+        else => st,
+    };
+}
 
 // ----------------------------------------------------------------- encode
 
@@ -142,7 +174,13 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeKey(buf, gpa, "id", &first);
             try writeJsonString(buf, gpa, s.id.slice());
             try writeKey(buf, gpa, "state", &first);
-            try writeJsonString(buf, gpa, s.state.toString());
+            try writeJsonString(buf, gpa, stateToWire(s.state));
+            if (s.state == .claimed) {
+                if (s.holder) |h| {
+                    try writeKey(buf, gpa, "holder", &first);
+                    try writeJsonString(buf, gpa, h);
+                }
+            }
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, s.ts);
         },
@@ -271,6 +309,14 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeJsonString(buf, gpa, s.short);
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, s.ts);
+        },
+        .release => |r| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, r.id.slice());
+            try writeKey(buf, gpa, "holder", &first);
+            try writeJsonString(buf, gpa, r.holder);
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, r.ts);
         },
     }
     try buf.append(gpa, '}');
@@ -419,8 +465,16 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
         },
         .setState => {
             const id = try getUlid(obj, "id");
-            const st = model.State.fromString(try getStr(obj, "state")) orelse return error.BadState;
-            return .{ .setState = .{ .id = id, .state = st, .ts = getIntDefault(obj, "ts", 0) } };
+            const st = stateFromWire(try getStr(obj, "state")) orelse return error.BadState;
+            const holder: ?[]const u8 = blk: {
+                if (st != .claimed) break :blk null;
+                if (obj.get("holder")) |hv| switch (hv) {
+                    .string => |h| break :blk try gpa.dupe(u8, h),
+                    else => {},
+                };
+                break :blk null;
+            };
+            return .{ .setState = .{ .id = id, .state = st, .holder = holder, .ts = getIntDefault(obj, "ts", 0) } };
         },
         .dep => return .{ .dep = .{
             .from = try getUlid(obj, "from"),
@@ -503,6 +557,11 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
         .setShort => return .{ .setShort = .{
             .id = try getUlid(obj, "id"),
             .short = try gpa.dupe(u8, try getStr(obj, "short")),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
+        .release => return .{ .release = .{
+            .id = try getUlid(obj, "id"),
+            .holder = try gpa.dupe(u8, try getStr(obj, "holder")),
             .ts = getIntDefault(obj, "ts", 0),
         } },
     }
@@ -623,6 +682,41 @@ test "encode/decode ts=0 legacy tolerance" {
     const line = "{\"op\":\"setState\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"state\":\"done\"}";
     const ev = try decode(gpa, line);
     try testing.expectEqual(@as(i64, 0), ev.setState.ts);
+}
+
+test "state wire tokens: legacy `claimed` decodes as submitted; the lease round-trips as `leased`" {
+    const gpa = testing.allocator;
+    const legacy = "{\"op\":\"setState\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"state\":\"claimed\",\"ts\":5}";
+    try testing.expectEqual(model.State.submitted, (try decode(gpa, legacy)).setState.state);
+
+    const id = try ulid.parse("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    for ([_]model.State{ .open, .done, .blocked, .dropped, .archived, .claimed, .submitted }) |st| {
+        buf.clearRetainingCapacity();
+        try encode(&buf, gpa, .{ .setState = .{ .id = id, .state = st, .holder = "lane-3", .ts = 1 } });
+        // No state is ever WRITTEN as the spent token.
+        try testing.expect(std.mem.indexOf(u8, buf.items, "\"claimed\"") == null);
+        // Only the lease carries its holder.
+        try testing.expectEqual(st == .claimed, std.mem.indexOf(u8, buf.items, "\"holder\":\"lane-3\"") != null);
+        const ev = try decode(gpa, buf.items);
+        try testing.expectEqual(st, ev.setState.state);
+        if (ev.setState.holder) |h| {
+            defer gpa.free(h);
+            try testing.expectEqualStrings("lane-3", h);
+        } else try testing.expect(st != .claimed);
+    }
+    buf.clearRetainingCapacity();
+    try encode(&buf, gpa, .{ .setState = .{ .id = id, .state = .claimed, .ts = 1 } });
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\"state\":\"leased\"") != null);
+
+    buf.clearRetainingCapacity();
+    try encode(&buf, gpa, .{ .release = .{ .id = id, .holder = "lane-3", .ts = 9 } });
+    const rel = try decode(gpa, buf.items);
+    defer gpa.free(rel.release.holder);
+    try testing.expectEqualStrings("lane-3", rel.release.holder);
+    try testing.expectEqual(@as(i64, 9), rel.release.ts);
+    try testing.expectError(error.BadState, decode(gpa, "{\"op\":\"setState\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"state\":\"taken\"}"));
 }
 
 test "peekUnknownOp: extracts the op name and defaults breaking to false when absent" {

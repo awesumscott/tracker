@@ -72,6 +72,13 @@ pub const CliError = error{
     /// is not a declared arc — see `Store.isArc`/`Store.append`'s doc
     /// comments for why this is no longer inferred from the edge itself.
     UndeclaredArc,
+    /// `trk state <id> claimed` on a task that is not `open` (see
+    /// `State.claimRefusal`); a hint naming the likely intent is already in `out`.
+    ClaimRequiresOpen,
+    /// `trk state <id> claimed` without `--holder`; the hint names `submitted`.
+    HolderRequired,
+    /// `trk release <id> --holder <h>` where someone other than `<h>` holds it.
+    LeaseHolderMismatch,
     /// `trk stale` could not run or was refused by `git log` (not a git repo,
     /// `git` missing from PATH, non-zero exit). A clean message is already
     /// appended to `out` before this is returned.
@@ -207,6 +214,11 @@ pub const Cli = struct {
         try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"title\":", .{ &id.text, sid });
         try self.writeJsonString(t.title);
         try self.print(",\"state\":\"{s}\",\"priority\":{d}", .{ t.state.toString(), t.priority });
+        if (t.holder) |h| {
+            try self.write(",\"holder\":");
+            try self.writeJsonString(h);
+            try self.print(",\"lease_ts\":{d}", .{t.lease_ts});
+        }
         if (self.seqFor(id, arc_id)) |s| try self.print(",\"seq\":{d}", .{s});
         try self.write(",\"tags\":[");
         for (t.tags.items, 0..) |tg, i| {
@@ -250,6 +262,7 @@ pub const Cli = struct {
         if (std.mem.eql(u8, cmd, "migrate-arcs")) return self.cmdMigrateArcs(rest);
         if (std.mem.eql(u8, cmd, "migrate-shorts")) return self.cmdMigrateShorts(rest);
         if (std.mem.eql(u8, cmd, "state")) return self.cmdState(rest);
+        if (std.mem.eql(u8, cmd, "release")) return self.cmdRelease(rest);
         if (std.mem.eql(u8, cmd, "next")) return self.cmdNext(rest);
         if (std.mem.eql(u8, cmd, "list")) return self.cmdList(rest);
         if (std.mem.eql(u8, cmd, "render")) return self.cmdRender(rest);
@@ -277,13 +290,13 @@ pub const Cli = struct {
     }
 
     /// Every verb whose dispatch writes persisted state: an appended log
-    /// event (`add`/`dep`/`undep`/`in`/`unin`/`state`/`edit`/`doc set`/`doc
+    /// event (`add`/`dep`/`undep`/`in`/`unin`/`state`/`release`/`edit`/`doc set`/`doc
     /// unset`), a scaffolded `.tracker/` (`init`), a rewritten snapshot
     /// (`compact`), or an out-file (`render`, `archive`). Everything else
     /// (`next`/`list`/`show`/`tree`/`log`/`doc list`/`doc resolve`/`help`) is
     /// read-only. `read_only` (`TRK_READONLY`) gates exactly this set.
     const mutating_verbs = [_][]const u8{
-        "init", "add", "dep", "undep", "in", "unin", "arc", "migrate-arcs", "migrate-shorts", "state", "render", "compact", "archive", "edit",
+        "init", "add", "dep", "undep", "in", "unin", "arc", "migrate-arcs", "migrate-shorts", "state", "release", "render", "compact", "archive", "edit",
     };
 
     fn isMutating(cmd: []const u8, rest: []const []const u8) bool {
@@ -453,19 +466,40 @@ pub const Cli = struct {
         \\  e.g.  trk migrate-shorts --min 9
         },
         .{ .name = "state", .text =
-        \\trk state <id> <open|done|blocked|dropped|claimed>
-        \\  Set a task's state. `done` drops it from TODO.md and queues it for
-        \\  `trk archive` — it asserts the work PASSED ITS GATE; `dropped` = won't-do
-        \\  (also leaves TODO.md); `blocked` is a manual hold. `claimed` is weaker
-        \\  than `done`: a CLAIM ("this commit completes the task, pending
-        \\  verification"), safe for a compile-only builder to write in the same
-        \\  commit as the implementing change — it stays in TODO.md (marker `[c]`,
-        \\  distinct from open `[ ]`), does NOT satisfy a dependent's prereq, and
-        \\  does NOT appear in `trk next`'s ready frontier. The orchestrator's
-        \\  post-gate reconcile promotes it to `done` or demotes it to `open`.
-        \\  `trk list --state claimed` is the awaiting-verification queue. Ids
-        \\  accept any unique prefix.
-        \\  e.g.  trk state 01KX6H48 done           trk state 01KX6H48 claimed
+        \\trk state <id> <open|claimed|submitted|done|blocked|dropped> [--holder <who>]
+        \\  Set a task's state. Lifecycle: open -> claimed -> submitted -> done, with
+        \\  `trk release` (claimed -> open) as the release.
+        \\  `claimed` is the LEASE — "this task is taken": it leaves `trk next` so
+        \\  nobody else is handed it. It REQUIRES --holder <who> (a lane or worktree
+        \\  name — whatever `trk release --holder` will later name). Only an OPEN
+        \\  task can be claimed; claiming a task someone already holds is refused.
+        \\  `submitted` is COMPLETION PENDING VERIFICATION ("this commit completes the
+        \\  task"), safe for a compile-only builder to write in the same commit as
+        \\  the implementing change. It stays in TODO.md (marker `[s]`), does NOT
+        \\  satisfy a dependent's prereq, and does NOT appear in `trk next`. The
+        \\  orchestrator's post-gate reconcile promotes it to `done` or demotes it
+        \\  to `open`; `trk list --state submitted` is that queue. (Before the lease
+        \\  existed this state was spelled `claimed` — to report completion, write
+        \\  `submitted`.)
+        \\  `done` drops it from TODO.md and queues it for `trk archive` — it asserts
+        \\  the work PASSED ITS GATE; `dropped` = won't-do (also leaves TODO.md);
+        \\  `blocked` is a manual hold. Ids accept any unique prefix.
+        \\  e.g.  trk state 01KX6H48 claimed --holder lane-3
+        \\        trk state 01KX6H48 submitted
+        },
+        .{ .name = "release", .text =
+        \\trk release <id> [--holder <who>]
+        \\trk release --holder <who>
+        \\  Release a lease (claimed -> open), putting the task back in `trk next`.
+        \\  With an id: releases that task's lease; adding --holder asserts who holds
+        \\  it and refuses if someone else does. With only --holder: releases every
+        \\  task that holder has claimed — the teardown for a lane that finished or
+        \\  died. A task that is not claimed is reported and left alone.
+        \\  The written release names the holder and applies ONLY while that holder
+        \\  still holds the task, so a lane's `submitted` that merges in after the
+        \\  release still wins, and a stale release never undoes someone else's newer
+        \\  lease. (`trk state <id> open` is the unconditional override.)
+        \\  e.g.  trk release --holder lane-3        trk release 01KX6H48
         },
         .{ .name = "next", .text =
         \\trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> ...]
@@ -492,7 +526,8 @@ pub const Cli = struct {
         \\  reachability) — the completeness query for "sort everything into arcs";
         \\  mutually exclusive with --arc. --json for machine-readable output.
         \\  e.g.  trk list --state open net           trk list --no-arc
-        \\        trk list --state claimed             (the awaiting-verification queue)
+        \\        trk list --state submitted           (the awaiting-verification queue)
+        \\        trk list --state claimed             (tasks currently leased)
         },
         .{ .name = "render", .text =
         \\trk render [--out <path>]
@@ -623,9 +658,10 @@ pub const Cli = struct {
         \\  message (this branch's `git log --oneline` ancestry — deliberately NOT
         \\  `--all`, which would count unmerged worktree-branch commits as landed)
         \\  but were never closed? Matches by exact token (full id or displayed short
-        \\  id), not raw substring. `claimed` tasks are excluded (already a healthy,
-        \\  awaiting-verification claim, not the "invisible in the haystack" rot this
-        \\  targets — see `trk state --help`). Runs `git` against the store root (the
+        \\  id), not raw substring. Leased (`claimed`) tasks are included: a landed
+        \\  citation on a task still held means its lane merged without submitting.
+        \\  `submitted` tasks are excluded (already in the awaiting-verification
+        \\  queue — see `trk state --help`). Runs `git` against the store root (the
         \\  repo housing `.tracker/`, which may differ from where `trk` itself lives).
         \\  e.g.  trk stale
         },
@@ -674,9 +710,11 @@ pub const Cli = struct {
             \\  trk migrate-arcs             backfill real declarations for legacy `arc:` tags AND in-edge-only arcs; idempotent
             \\  trk migrate-shorts [--min <n>]   freeze every task's CURRENT short id so it never changes again
             \\      --min <n> is a one-time REPAIR: also lengthens an already-frozen short below n
-            \\  trk state <id> <open|done|blocked|dropped|claimed>
-            \\      `claimed` = a builder's self-report ("this commit completes it, pending
+            \\  trk state <id> <open|claimed|submitted|done|blocked|dropped> [--holder <who>]
+            \\      `claimed` = the lease ("this task is taken"; hides it from `next`; needs --holder).
+            \\      `submitted` = a builder's self-report ("this commit completes it, pending
             \\      verification") — safe for a compile-only agent, unlike `done`.
+            \\  trk release <id> [--holder <who>] | --holder <who>   release a lease (claimed -> open)
             \\  trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> ...]   the ready frontier
             \\  trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> ...]
             \\      <term> (bare or --word <term>, repeatable) ANDs a case-insensitive
@@ -1627,18 +1665,140 @@ pub const Cli = struct {
     // ----------------------------------------------------------- state
 
     fn cmdState(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 2) {
-            try self.write("trk: usage: trk state <id> <open|done|blocked|dropped|claimed>\n");
+        var pos: [2][]const u8 = undefined;
+        var npos: usize = 0;
+        var holder: ?[]const u8 = null;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--holder")) {
+                holder = try self.flagVal(args, &i, "--holder");
+            } else if (std.mem.startsWith(u8, args[i], "--")) {
+                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
+                return error.UnknownFlag;
+            } else {
+                if (npos == pos.len) {
+                    npos += 1;
+                    break;
+                }
+                pos[npos] = args[i];
+                npos += 1;
+            }
+        }
+        if (npos != 2) {
+            try self.write("trk: usage: trk state <id> <open|claimed|submitted|done|blocked|dropped> [--holder <who>]\n");
             return error.UsageError;
         }
-        const id = try self.resolve(args[0]);
-        const st = State.fromString(args[1]) orelse {
-            try self.print("trk: '{s}' is not a state (open|done|blocked|dropped|claimed)\n", .{args[1]});
+        const id = try self.resolve(pos[0]);
+        const st = State.fromString(pos[1]) orelse {
+            try self.print("trk: '{s}' is not a state (open|claimed|submitted|done|blocked|dropped)\n", .{pos[1]});
             return error.BadState;
         };
-        try self.store.append(.{ .setState = .{ .id = id, .state = st } });
         var sb: [ulid.len]u8 = undefined;
-        try self.print("{s} -> {s}\n", .{ try self.shortId(id, &sb), st.toString() });
+        const sid = try self.shortId(id, &sb);
+        if (holder != null and st != .claimed) {
+            try self.write("trk: --holder only applies to `claimed` (the lease)\n");
+            return error.UsageError;
+        }
+        if (st == .claimed and (holder == null or holder.?.len == 0)) {
+            try self.print(
+                "trk: `claimed` is the lease and needs --holder <who> (trk state {s} claimed --holder <lane>). " ++
+                    "If you meant \"this commit completes it\", that is `trk state {s} submitted`.\n",
+                .{ sid, sid },
+            );
+            return error.HolderRequired;
+        }
+        self.store.append(.{ .setState = .{ .id = id, .state = st, .holder = holder } }) catch |e| {
+            if (e != error.ClaimRequiresOpen) return e;
+            const from = self.store.get(id).?.state;
+            // Every refusal names `submitted`: writing `claimed` to mean
+            // completion was the standing habit before the lease existed.
+            switch (State.claimRefusal(from).?) {
+                .already_claimed => try self.print(
+                    "trk: {s} is already claimed by {s}. If you meant \"this commit completes it\", " ++
+                        "that is now `trk state {s} submitted`.\n",
+                    .{ sid, self.store.get(id).?.holder orelse "(unknown holder)", sid },
+                ),
+                .already_submitted => try self.print(
+                    "trk: {s} is already submitted (awaiting verification); `claimed` is now the lease, " ++
+                        "not completion. Nothing to do if you meant completion.\n",
+                    .{sid},
+                ),
+                .finished, .blocked => try self.print(
+                    "trk: {s} is {s}; only an open task can be claimed (the lease). If you meant " ++
+                        "\"this commit completes it\", that is `trk state {s} submitted`.\n",
+                    .{ sid, from.toString(), sid },
+                ),
+            }
+            return error.ClaimRequiresOpen;
+        };
+        if (holder) |h|
+            try self.print("{s} -> {s} (held by {s})\n", .{ sid, st.toString(), h })
+        else
+            try self.print("{s} -> {s}\n", .{ sid, st.toString() });
+    }
+
+    // ----------------------------------------------------------- release
+
+    /// `trk release <id> [--holder <h>]` / `trk release --holder <h>`. Every
+    /// release event names the holder it releases (the task's CURRENT holder
+    /// for the by-id form), because the fold applies it only while that holder
+    /// still holds the task — see `Op.release`.
+    fn cmdRelease(self: *Cli, args: []const []const u8) Error!void {
+        var id_arg: ?[]const u8 = null;
+        var holder: ?[]const u8 = null;
+        var extra_positional = false;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--holder")) {
+                holder = try self.flagVal(args, &i, "--holder");
+            } else if (std.mem.startsWith(u8, args[i], "--")) {
+                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
+                return error.UnknownFlag;
+            } else if (id_arg == null) {
+                id_arg = args[i];
+            } else {
+                extra_positional = true;
+            }
+        }
+        if (extra_positional or (id_arg == null and (holder == null or holder.?.len == 0))) {
+            try self.write("trk: usage: trk release <id> [--holder <who>] | trk release --holder <who>\n");
+            return error.UsageError;
+        }
+
+        if (id_arg) |a| {
+            const id = try self.resolve(a);
+            const t = self.store.get(id).?;
+            var sb: [ulid.len]u8 = undefined;
+            const sid = try self.shortId(id, &sb);
+            if (t.state != .claimed or t.holder == null) {
+                try self.print("release: {s} is {s}, not claimed — nothing to release\n", .{ sid, t.state.toString() });
+                return;
+            }
+            const current = t.holder.?;
+            if (holder) |h| if (!std.mem.eql(u8, h, current)) {
+                try self.print("trk: {s} is held by {s}, not {s} — not releasing\n", .{ sid, current, h });
+                return error.LeaseHolderMismatch;
+            };
+            try self.store.append(.{ .release = .{ .id = id, .holder = current } });
+            try self.print("{s} -> open (released from {s})\n", .{ sid, current });
+            return;
+        }
+
+        const h = holder.?;
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+        var released: usize = 0;
+        for (ids) |id| {
+            const t = self.store.get(id).?;
+            if (t.state != .claimed) continue;
+            const cur = t.holder orelse continue;
+            if (!std.mem.eql(u8, cur, h)) continue;
+            try self.store.append(.{ .release = .{ .id = id, .holder = h } });
+            var sb: [ulid.len]u8 = undefined;
+            try self.print("{s} -> open (released from {s})  {s}\n", .{ try self.shortId(id, &sb), h, t.title });
+            released += 1;
+        }
+        if (released == 0) try self.print("release: nothing claimed by {s}\n", .{h});
     }
 
     // ----------------------------------------------------------- compact
@@ -2590,6 +2750,10 @@ pub const Cli = struct {
         var sb: [ulid.len]u8 = undefined;
         try self.print("{s} {s}  {s}", .{ stateMarker(t.state), try self.shortId(id, &sb), t.title });
         for (t.tags.items) |tg| try self.print("  #{s}", .{tg});
+        if (t.holder) |h| {
+            var tb: [32]u8 = undefined;
+            try self.print("  (held by {s} since {s})", .{ h, fmtTs(t.lease_ts, &tb) });
+        }
         try self.write("\n");
     }
 
@@ -3171,6 +3335,10 @@ pub const Cli = struct {
         try self.print("id:       {s}\n", .{&id.text});
         try self.print("title:    {s}\n", .{t.title});
         try self.print("state:    {s}\n", .{t.state.toString()});
+        if (t.holder) |h| {
+            var tb: [32]u8 = undefined;
+            try self.print("holder:   {s} (since {s} UTC)\n", .{ h, fmtTs(t.lease_ts, &tb) });
+        }
         if (t.priority != 0)
             try self.print("priority: {d}\n", .{t.priority})
         else
@@ -3558,13 +3726,19 @@ pub const Cli = struct {
     /// id. Token (not substring) matching means a short id can never
     /// accidentally match as part of some longer, unrelated token.
     ///
-    /// `claimed` tasks are deliberately EXCLUDED from the report: a claim
-    /// already IS the self-reported "this commit completes it" signal this
-    /// verb exists to surface for an `open` task that never got one —
-    /// flagging an already-claimed task again would just be noise on an
-    /// item that is already in the awaiting-verification queue (`trk list
-    /// --state claimed`), not the "invisible in the haystack" rot this
-    /// targets. See `State.claimed`.
+    /// `submitted` tasks are deliberately EXCLUDED from the report: a
+    /// submission already IS the self-reported "this commit completes it"
+    /// signal this verb exists to surface for a task that never got one —
+    /// flagging it again would just be noise on an item that is already in
+    /// the awaiting-verification queue (`trk list --state submitted`). See
+    /// `State.submitted`.
+    ///
+    /// Leased (`claimed`) tasks are INCLUDED. A lane's commits reach this
+    /// branch's ancestry only when the lane merges, and its `submitted` line
+    /// merges with them — so a landed citation on a task still leased means
+    /// the lane merged without submitting, or wrote the pre-rename `claimed`
+    /// to mean completion. Either way the task is stranded out of both `next`
+    /// and the verification queue, which is exactly this report's rot.
     fn cmdStale(self: *Cli, args: []const []const u8) Error!void {
         if (args.len != 0) {
             try self.write("trk: usage: trk stale\n");
@@ -3605,7 +3779,7 @@ pub const Cli = struct {
         defer self.gpa.free(ids);
         for (ids) |id| {
             const t = self.store.get(id).?;
-            if (t.state != .open) continue; // claimed/done/blocked/dropped/archived: not this report's concern
+            if (t.state != .open and t.state != .claimed) continue; // submitted/done/blocked/dropped/archived: not this report's concern
             try index.put(self.gpa, try self.gpa.dupe(u8, id.slice()), id);
             var sb: [ulid.len]u8 = undefined;
             const sid = try self.shortId(id, &sb);
@@ -3638,7 +3812,7 @@ pub const Cli = struct {
         }
 
         if (hits.count() == 0) {
-            try self.write("trk: stale: nothing — no open task is cited in a landed commit\n");
+            try self.write("trk: stale: nothing — no open or claimed task is cited in a landed commit\n");
             return;
         }
 
@@ -3652,7 +3826,7 @@ pub const Cli = struct {
         }
         std.sort.pdq(Ulid, stale_ids, {}, Ulid.lessThan);
 
-        try self.print("trk: stale: {d} open task(s) cited in a landed commit but never closed:\n", .{stale_ids.len});
+        try self.print("trk: stale: {d} open or claimed task(s) cited in a landed commit but never closed:\n", .{stale_ids.len});
         for (stale_ids) |id| {
             const t = self.store.get(id).?;
             var sb: [ulid.len]u8 = undefined;
@@ -3766,11 +3940,11 @@ fn containsSubCI(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Is this task still not-yet-built work (shown in the TODO projection)?
-/// open + blocked + claimed are pending (a claim is a commit's self-report,
-/// pending the orchestrator's verify — see `State.claimed`); done/dropped/
-/// archived are finished or abandoned.
+/// open + blocked + claimed + submitted are pending (a lease is work in hand;
+/// a submission is a commit's self-report pending the orchestrator's verify —
+/// see `State.submitted`); done/dropped/archived are finished or abandoned.
 fn isRemaining(s: State) bool {
-    return s == .open or s == .blocked or s == .claimed;
+    return s == .open or s == .blocked or s == .claimed or s == .submitted;
 }
 
 /// One-char state marker for line output / the tree.
@@ -3781,9 +3955,12 @@ fn stateMarker(s: State) []const u8 {
         .blocked => "[~]",
         .dropped => "[-]",
         .archived => "[a]",
-        // Distinct from plain `open` on purpose — a claim is not verified work
-        // available to pick up (see `State.claimed`'s doc comment).
+        // Both distinct from plain `open` on purpose — neither is work available
+        // to pick up. The letters follow the state NAMES: TODO.md is regenerated
+        // on every render, so unlike the wire token nothing persisted still
+        // reads `[c]` as the pre-rename meaning.
         .claimed => "[c]",
+        .submitted => "[s]",
     };
 }
 

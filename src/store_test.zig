@@ -1379,7 +1379,7 @@ test "arc root eligibility: all-parked arc is vacuously drained; blocked member 
     }
 }
 
-test "claimed: does not satisfy a prereq and is not next-eligible, unlike done" {
+test "submitted: does not satisfy a prereq and is not next-eligible, unlike done" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1387,27 +1387,27 @@ test "claimed: does not satisfy a prereq and is not next-eligible, unlike done" 
     defer s.deinit();
     try s.load();
 
-    const claimed = mintId();
+    const submitted = mintId();
     const dependent = mintId();
-    try s.append(.{ .add = .{ .id = claimed, .title = "claimed prereq" } });
+    try s.append(.{ .add = .{ .id = submitted, .title = "submitted prereq" } });
     try s.append(.{ .add = .{ .id = dependent, .title = "needs it" } });
-    try s.append(.{ .dep = .{ .from = dependent, .to = claimed } });
-    try s.append(.{ .setState = .{ .id = claimed, .state = .claimed } });
+    try s.append(.{ .dep = .{ .from = dependent, .to = submitted } });
+    try s.append(.{ .setState = .{ .id = submitted, .state = .submitted } });
 
-    // The claimed task itself never appears in the ready frontier — it is
-    // not available work to pick up (see State.claimed's doc comment).
+    // The submitted task itself never appears in the ready frontier — it is
+    // not available work to pick up (see State.submitted's doc comment).
     {
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
-        try testing.expect(!contains(n, claimed));
-        // Its dependent stays blocked too: a claim is unverified, so it does
-        // NOT satisfy the `needs` edge the way `done` would.
+        try testing.expect(!contains(n, submitted));
+        // Its dependent stays blocked too: a submission is unverified, so it
+        // does NOT satisfy the `needs` edge the way `done` would.
         try testing.expect(!contains(n, dependent));
     }
 
-    // Promoting the claim to `done` (the orchestrator's post-gate reconcile)
-    // unblocks the dependent, exactly like any other verified completion.
-    try s.append(.{ .setState = .{ .id = claimed, .state = .done } });
+    // Promoting the submission to `done` (the orchestrator's post-gate
+    // reconcile) unblocks the dependent, exactly like any other verified completion.
+    try s.append(.{ .setState = .{ .id = submitted, .state = .done } });
     {
         const n = try s.next(testing.allocator);
         defer testing.allocator.free(n);
@@ -1415,7 +1415,31 @@ test "claimed: does not satisfy a prereq and is not next-eligible, unlike done" 
     }
 }
 
-test "claimed member does not drain its arc (unverified work never offers the close-out prompt)" {
+test "submitted or claimed member does not drain its arc" {
+    for ([_]tracker.State{ .submitted, .claimed }) |st| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+
+        const arc = mintId();
+        const member = mintId();
+        try s.append(.{ .add = .{ .id = arc, .title = "goal" } });
+        try s.append(.{ .add = .{ .id = member, .title = "the only task" } });
+        try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+        try s.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+        try s.append(.{ .setState = .{ .id = member, .state = st, .holder = "lane-1" } });
+
+        try testing.expect(!s.arcDrained(arc));
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(!contains(n, arc));
+    }
+}
+
+test "claimed (the lease): hidden from next, does not satisfy a prereq, released by open" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1423,18 +1447,202 @@ test "claimed member does not drain its arc (unverified work never offers the cl
     defer s.deinit();
     try s.load();
 
-    const arc = mintId();
-    const member = mintId();
-    try s.append(.{ .add = .{ .id = arc, .title = "goal" } });
-    try s.append(.{ .add = .{ .id = member, .title = "the only task" } });
-    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
-    try s.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
-    try s.append(.{ .setState = .{ .id = member, .state = .claimed } });
+    const leased = mintId();
+    const dependent = mintId();
+    try s.append(.{ .add = .{ .id = leased, .title = "taken" } });
+    try s.append(.{ .add = .{ .id = dependent, .title = "needs it" } });
+    try s.append(.{ .dep = .{ .from = dependent, .to = leased } });
+    try s.append(.{ .setState = .{ .id = leased, .state = .claimed, .holder = "lane-1" } });
+    try testing.expectEqualStrings("lane-1", s.get(leased).?.holder.?);
+    try testing.expect(s.get(leased).?.lease_ts != 0);
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(!contains(n, leased));
+        try testing.expect(!contains(n, dependent));
+    }
 
-    try testing.expect(!s.arcDrained(arc));
-    const n = try s.next(testing.allocator);
-    defer testing.allocator.free(n);
-    try testing.expect(!contains(n, arc));
+    // The release puts it straight back on the frontier and clears the holder.
+    try s.append(.{ .release = .{ .id = leased, .holder = "lane-1" } });
+    try testing.expectEqual(tracker.State.open, s.get(leased).?.state);
+    try testing.expect(s.get(leased).?.holder == null);
+    {
+        const n = try s.next(testing.allocator);
+        defer testing.allocator.free(n);
+        try testing.expect(contains(n, leased));
+    }
+}
+
+test "claimed: append refuses a lease on anything but open, and writes nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    for ([_]tracker.State{ .claimed, .submitted, .done, .dropped, .archived, .blocked }) |from| {
+        const id = mintId();
+        try s.append(.{ .add = .{ .id = id, .title = "t" } });
+        try s.append(.{ .setState = .{ .id = id, .state = from, .holder = "lane-1" } });
+        const ts_before = s.get(id).?.last_ts;
+        try testing.expectError(error.ClaimRequiresOpen, s.append(.{ .setState = .{ .id = id, .state = .claimed, .holder = "lane-2" } }));
+        try testing.expectEqual(from, s.get(id).?.state);
+        try testing.expectEqual(ts_before, s.get(id).?.last_ts);
+    }
+
+    // Reload: the refused writes never reached the log.
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    var it = s2.tasks.valueIterator();
+    var leases: usize = 0;
+    while (it.next()) |t| {
+        if (t.state == .claimed) leases += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), leases);
+}
+
+test "claimed: append refuses a lease with no holder" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    const id = mintId();
+    try s.append(.{ .add = .{ .id = id, .title = "t" } });
+    try testing.expectError(error.HolderRequired, s.append(.{ .setState = .{ .id = id, .state = .claimed } }));
+    try testing.expectError(error.HolderRequired, s.append(.{ .setState = .{ .id = id, .state = .claimed, .holder = "" } }));
+    try testing.expectEqual(tracker.State.open, s.get(id).?.state);
+}
+
+test "release merge race: a lane's submission written before the release but merged after it survives" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    // Main: lease at 10, teardown release at 30. The lane's `submitted` (20)
+    // arrives later in FILE order, as the union merge appends it.
+    try writeRawLog(tmp.dir, &.{
+        .{ .add = .{ .id = a, .title = "t", .ts = 1 } },
+        .{ .setState = .{ .id = a, .state = .claimed, .holder = "lane-1", .ts = 10 } },
+        .{ .release = .{ .id = a, .holder = "lane-1", .ts = 30 } },
+        .{ .setState = .{ .id = a, .state = .submitted, .ts = 20 } },
+    });
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(tracker.State.submitted, s.get(a).?.state);
+    try testing.expect(s.get(a).?.holder == null);
+}
+
+test "release: a stale release never undoes a newer lease taken by someone else" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    try writeRawLog(tmp.dir, &.{
+        .{ .add = .{ .id = a, .title = "t", .ts = 1 } },
+        .{ .setState = .{ .id = a, .state = .claimed, .holder = "lane-1", .ts = 10 } },
+        .{ .release = .{ .id = a, .holder = "lane-1", .ts = 20 } },
+        .{ .setState = .{ .id = a, .state = .claimed, .holder = "lane-2", .ts = 30 } },
+        .{ .release = .{ .id = a, .holder = "lane-1", .ts = 40 } },
+    });
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(tracker.State.claimed, s.get(a).?.state);
+    try testing.expectEqualStrings("lane-2", s.get(a).?.holder.?);
+    try testing.expectEqual(@as(i64, 30), s.get(a).?.lease_ts);
+}
+
+test "claimed: a lease that reaches a non-open task on fold is a no-op" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    // A stale-view re-dispatch: the lane's submission (20) merges in, and a
+    // lease taken on main's not-yet-merged view (30) sorts after it.
+    try writeRawLog(tmp.dir, &.{
+        .{ .add = .{ .id = a, .title = "t", .ts = 1 } },
+        .{ .setState = .{ .id = a, .state = .submitted, .ts = 20 } },
+        .{ .setState = .{ .id = a, .state = .claimed, .holder = "lane-2", .ts = 30 } },
+    });
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(tracker.State.submitted, s.get(a).?.state);
+    try testing.expect(s.get(a).?.holder == null);
+}
+
+test "compact keeps a lease's holder and age" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = a, .title = "t" } });
+        try s.append(.{ .setState = .{ .id = a, .state = .claimed, .holder = "lane-7" } });
+        const lease_ts = s.get(a).?.lease_ts;
+        _ = try s.compact();
+
+        var s2 = Store.open(testing.allocator, io, tmp.dir);
+        defer s2.deinit();
+        try s2.load();
+        try testing.expectEqual(tracker.State.claimed, s2.get(a).?.state);
+        try testing.expectEqualStrings("lane-7", s2.get(a).?.holder.?);
+        try testing.expectEqual(lease_ts, s2.get(a).?.lease_ts);
+        // Still releasable by name after the rewrite.
+        try s2.append(.{ .release = .{ .id = a, .holder = "lane-7" } });
+        try testing.expectEqual(tracker.State.open, s2.get(a).?.state);
+    }
+}
+
+test "legacy `\"state\":\"claimed\"` folds as submitted from log and snapshot, and compact rewrites it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+    const b = mintId();
+    {
+        var sub = try tmp.dir.createDirPathOpen(io, ".tracker", .{});
+        defer sub.close(io);
+        // Literal bytes as the pre-rename binary wrote them — the encoder can
+        // no longer produce this token.
+        const snap = try std.fmt.allocPrint(testing.allocator,
+            \\{{"op":"add","id":"{s}","title":"from snapshot","ts":10}}
+            \\{{"op":"setState","id":"{s}","state":"claimed","ts":11}}
+            \\
+        , .{ &a.text, &a.text });
+        defer testing.allocator.free(snap);
+        try sub.writeFile(io, .{ .sub_path = "snapshot.jsonl", .data = snap });
+        const log = try std.fmt.allocPrint(testing.allocator,
+            \\{{"op":"add","id":"{s}","title":"from log","ts":20}}
+            \\{{"op":"setState","id":"{s}","state":"claimed","ts":21}}
+            \\
+        , .{ &b.text, &b.text });
+        defer testing.allocator.free(log);
+        try sub.writeFile(io, .{ .sub_path = "log.jsonl", .data = log });
+    }
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqual(tracker.State.submitted, s.get(a).?.state);
+    try testing.expectEqual(tracker.State.submitted, s.get(b).?.state);
+
+    _ = try s.compact();
+    {
+        var sub = try tmp.dir.openDir(io, ".tracker", .{});
+        defer sub.close(io);
+        const snap = try sub.readFileAlloc(io, "snapshot.jsonl", testing.allocator, .unlimited);
+        defer testing.allocator.free(snap);
+        try testing.expect(std.mem.indexOf(u8, snap, "\"claimed\"") == null);
+        try testing.expect(std.mem.indexOf(u8, snap, "\"state\":\"submitted\"") != null);
+    }
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqual(tracker.State.submitted, s2.get(a).?.state);
+    try testing.expectEqual(tracker.State.submitted, s2.get(b).?.state);
 }
 
 test "standing arc: excluded from next even when drained, but keeps accepting members" {
