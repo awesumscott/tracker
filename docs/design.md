@@ -395,8 +395,8 @@ title* — every such probe minted a junk task literally named "--help". So help
 dispatch** (a standalone `--help`/`-h` anywhere in a verb's args routes to help), which both closes that trap
 and makes the CLI legible without an external cheat-sheet — the point being that an agent should be able to
 *discover* the tracker's surface from the tool itself, since the tool is the primary consumer.
-The per-verb text lives in one `verb_help` table with a test asserting an entry per dispatched verb, so the
-contract can't rot as verbs are added.
+The per-verb text lives in the `Cli.verbs` table that dispatch itself reads (see "MCP front end"), so a verb
+cannot exist without its help.
 
 **`--not-tag <t>` (repeatable, ANDed) on `next`/`list` derives a query set as a complement, not a
 positive filter — deliberately.** A consumer of `next` (a metal-vs-host axis, e.g.) often wants "everything

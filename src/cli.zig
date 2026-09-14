@@ -206,7 +206,7 @@ pub const Cli = struct {
     /// flushes this to real stderr; tests assert against it directly. Caller
     /// owns it.
     warn: *std.ArrayList(u8),
-    /// When true, every mutating verb (see `mutating_verbs` below) refuses
+    /// When true, every mutating verb (see `isMutating` below) refuses
     /// with `error.ReadOnly` before dispatch; read verbs are unaffected.
     /// main.zig sets this from the `TRK_READONLY` env var; tests can set it
     /// directly on a `Cli` built over a `Fixture`.

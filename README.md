@@ -78,7 +78,7 @@ discovery).
 
 ## Commands
 
-`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · show · next · list · render · tree · log · doc · compact · archive · init`
+`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · show · next · list · render · tree · log · stale · doc · compact · archive · init · mcp-serve`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.

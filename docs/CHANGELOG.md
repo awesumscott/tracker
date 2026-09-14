@@ -5,6 +5,28 @@ under a `## YYYY-MM-DD` run heading (config `archive.out` — unset today, so a 
 to stdout; this file is hand-started because a landing needed recording before that config existed).
 Forward-looking work is `docs/TODO.md` (generated); design rationale lives in `docs/design.md`.
 
+## 2026-09-14
+
+**`claimed` is now a live lease; the old completion report is `submitted` (01M2GGFGR).** In fan-outs
+only the orchestrator's memory stopped two lanes starting the same task. `claimed` now means "this task
+is taken": hidden from `next`, requires `--holder <who>`, refused on anything but an `open` task, marker
+`[c]`. The old meaning ("this commit completes it, pending verification") is renamed `submitted`,
+unchanged, marker `[s]`. On disk the lease is `"leased"`; the spent token `"claimed"` decodes as
+`submitted` forever and `compact` rewrites it. The pre-rename habit `trk state <id> claimed` now fails
+loudly everywhere (no holder). `trk release <id>` / `trk release --holder <who>` write a release the fold
+applies only while that holder still holds the task, so a lane's `submitted` merged after a teardown
+release still wins. `stale` now includes leased tasks. Verified from the Enix side against its store.
+`zig build test`: **227 → 240**.
+
+**`trk mcp-serve` — trk as an MCP server over stdio (01M2GJV9S).** Agents call typed tools instead of a
+shell, so a pipe can't mask an exit, a backtick in a body can't execute, positionals can't be swapped and
+a body edit can't omit its direction. The help table became `Cli.verbs`, which CLI dispatch, `--help`,
+the read-only gate and `tools/list` all read; each call builds argv and runs the verb's own code. 22
+tools (one per verb; `init`/`migrate-*` stay CLI-only); reads return JSON, for which `show`, `tree` and
+`log` gained `--json`. Every tool takes a required `tree` — `"main"` or a linked worktree — validated
+from git's on-disk registration in both directions without a git binary, because subagents share the
+session's one server. Verified from the Enix side through the real tools. `zig build test`: **240 → 251**.
+
 ## 2026-09-08
 
 **`trk init` now writes `.tracker/.gitignore` (01M21BJFB).** `compact`'s pre-rewrite backup (landed
