@@ -94,6 +94,104 @@ const StoreCompactError = @typeInfo(@typeInfo(@TypeOf(Store.compact)).@"fn".retu
 pub const Error = CliError || std.mem.Allocator.Error || error{WriteFailed} ||
     StoreWriteError || StoreCompactError || std.Io.Dir.WriteFileError;
 
+/// Append one warning line per thing `Store.load` tolerated but a human should
+/// see — a malformed config, each self-wait cycle, ghost, withheld stale event
+/// and unknown op. Shared by the CLI (flushed to stderr) and the MCP server
+/// (returned with the tool result), so neither can report less than the other.
+pub fn appendLoadWarnings(gpa: std.mem.Allocator, store: *const Store, w: *std.ArrayList(u8)) !void {
+    // Best-effort config is non-fatal: warn but proceed on a malformed file.
+    if (store.config_malformed)
+        try w.print(gpa, "trk: warning: {s}/{s} is malformed — using default config\n", .{ tracker.store.tracker_subdir, tracker.store.config_name });
+    // Every self-wait cycle already baked into the log (mediated by `in` arc
+    // membership — see Store.load's doc comment) is likewise non-fatal: warn
+    // on EACH one but keep going, since refusing to load would brick the
+    // repo. Looping (not just the first) matters: a log can carry more than
+    // one independent stuck pair, and reporting only one would leave every
+    // other cycled task exactly as silently invisible as the bug this
+    // warning exists to kill.
+    for (store.self_wait_cycles.items) |p|
+        try w.print(
+            gpa,
+            "trk: warning: {s} and {s} form a self-wait cycle across needs + arc-membership edges — " ++
+                "neither can ever complete while depending on the other; fix with `trk undep` or by " ++
+                "re-parenting the membership (`trk in`)\n",
+            .{ &p.from.text, &p.to.text },
+        );
+    // Every log line whose `op` this binary doesn't recognize is likewise
+    // non-fatal: warn on EACH one but keep going (see Store.load's doc
+    // comment / skipped_unknown_ops — a single new-op line must not brick
+    // reads on a not-yet-updated binary). Looping, not just the first, for
+    // the same reason as the self-wait loop above.
+    // Every ghost task (an id the fold materialized with no `add` behind it) is
+    // likewise non-fatal at load: warn on EACH one and keep going, so the data
+    // that IS there stays readable. Looping, not just the first, for the same
+    // reason as the loops above. This fires on EVERY command, which is why
+    // `compact` needs no refusal of its own — it GCs the ghost and spools its
+    // lines to .tracker/quarantine.jsonl, reporting what it took out.
+    for (store.ghost_tasks.items) |id|
+        try w.print(
+            gpa,
+            "trk: warning: {s} has no `add` event anywhere in the fold — its title/tags/arcs " ++
+                "are missing, not empty (a union-merge that outlived a compact). It is not a real " ++
+                "task; `trk compact` will GC it and quarantine its log lines\n",
+            .{&id.text},
+        );
+    // Every task whose late-merged events were withheld as provably stale. Not
+    // fatal, and never a silent drop: the events are still in the log, so a
+    // change that really was wanted can be re-applied deliberately.
+    for (store.superseded.items) |sd|
+        try w.print(
+            gpa,
+            "trk: warning: {s}: {d} log event(s) predate the snapshot's value for this task and were " ++
+                "NOT applied (a pre-compact event union-merged back in). The snapshot's newer state " ++
+                "stands; re-apply deliberately if the change is real\n",
+            .{ &sd.id.text, sd.events },
+        );
+    for (store.skipped_unknown_ops.items) |s|
+        try w.print(
+            gpa,
+            "trk: warning: skipped a log line with unrecognized op \"{s}\" — this binary may be older " ++
+                "than the log; install the latest `trk` to see its effect\n",
+            .{s.op},
+        );
+}
+
+/// One MCP tool parameter, and how it becomes CLI argv (`mcp.zig` builds the
+/// argv and hands it to `Cli.dispatch` — the same code path the CLI verb runs).
+pub const Param = struct {
+    name: []const u8,
+    kind: Kind,
+    /// `null` = positional, filled in declaration order. Otherwise the flag the
+    /// value is passed with (repeated per element for `string_list`; present
+    /// or absent for `boolean`).
+    flag: ?[]const u8 = null,
+    required: bool = false,
+    /// The allowed values of a `choice`.
+    choices: []const []const u8 = &.{},
+    desc: []const u8,
+
+    pub const Kind = enum {
+        string,
+        integer,
+        boolean,
+        string_list,
+        choice,
+        /// `{direction: "append"|"replace", text}` -> `--append-body <text>` /
+        /// `--replace-body <text>`. An object with both fields required, so a
+        /// body edit cannot be issued without naming its direction.
+        body_edit,
+    };
+};
+
+/// One MCP tool: a verb (plus fixed leading args — a subcommand, or `--json`
+/// for the structured read output) and its parameters. Whether it writes is not
+/// declared here; it derives from the verb (`Cli.isMutating`).
+pub const Tool = struct {
+    name: []const u8,
+    argv: []const []const u8 = &.{},
+    params: []const Param = &.{},
+};
+
 pub const Cli = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -119,6 +217,9 @@ pub const Cli = struct {
     /// to it and only noticed by re-reading). main.zig wires real stdin; tests
     /// wire a temp file, so the same read path is exercised either way.
     stdin: ?Io.File = null,
+    /// When false, a body value of `-` is the literal text "-", never a stdin
+    /// read. The MCP front end clears it: its body arrives as a typed string.
+    body_dash_reads_stdin: bool = true,
     /// Scratch for `directPrereqs` — must be drained/copied before the next
     /// call. tree recursion copies into a local dupe before recursing, so reuse
     /// is safe. Owned by the Cli; the caller (main/tests) deinits it.
@@ -144,7 +245,7 @@ pub const Cli = struct {
     /// adds one when the body lacks it: `trk show <id> --body | trk edit <id>
     /// --replace-body -` is then byte-stable, and stable on every later round trip.
     fn bodyArg(self: *Cli, flag: []const u8, arg: []const u8) Error!struct { text: []const u8, owned: bool } {
-        if (!std.mem.eql(u8, arg, "-")) return .{ .text = arg, .owned = false };
+        if (!self.body_dash_reads_stdin or !std.mem.eql(u8, arg, "-")) return .{ .text = arg, .owned = false };
         const f = self.stdin orelse {
             try self.print("trk: {s} -: no stdin to read (pipe one in, e.g. " ++
                 "`trk show <id> --body | trk edit <id> --replace-body -`)\n", .{flag});
@@ -247,35 +348,27 @@ pub const Cli = struct {
         }
         if (argsWantHelp(rest)) return self.helpFor(cmd);
 
-        if (self.read_only and isMutating(cmd, rest)) {
+        return self.dispatch(args);
+    }
+
+    /// Execute `args` (`args[0]` = the verb) with NO help routing: the read-only
+    /// gate, then the verb's handler from `verbs`. `run` is this plus help
+    /// routing; the MCP front end (`mcp.zig`) calls this directly, because its
+    /// argv is built from typed parameters — a body or title that happens to be
+    /// the literal text `--help` is data there, never a help request.
+    pub fn dispatch(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len == 0) return self.usage();
+        const cmd = args[0];
+        const rest = args[1..];
+        const v = findVerb(cmd) orelse {
+            try self.print("trk: unknown command '{s}'\n", .{cmd});
+            return error.UnknownCommand;
+        };
+        if (self.read_only and isMutating(v, rest)) {
             try self.print("trk: refusing to run '{s}' — TRK_READONLY is set (mutations are disabled)\n", .{cmd});
             return error.ReadOnly;
         }
-
-        if (std.mem.eql(u8, cmd, "init")) return self.cmdInit(rest);
-        if (std.mem.eql(u8, cmd, "add")) return self.cmdAdd(rest);
-        if (std.mem.eql(u8, cmd, "dep")) return self.cmdDep(rest);
-        if (std.mem.eql(u8, cmd, "undep")) return self.cmdUndep(rest);
-        if (std.mem.eql(u8, cmd, "in")) return self.cmdIn(rest);
-        if (std.mem.eql(u8, cmd, "unin")) return self.cmdUnin(rest);
-        if (std.mem.eql(u8, cmd, "arc")) return self.cmdArc(rest);
-        if (std.mem.eql(u8, cmd, "migrate-arcs")) return self.cmdMigrateArcs(rest);
-        if (std.mem.eql(u8, cmd, "migrate-shorts")) return self.cmdMigrateShorts(rest);
-        if (std.mem.eql(u8, cmd, "state")) return self.cmdState(rest);
-        if (std.mem.eql(u8, cmd, "release")) return self.cmdRelease(rest);
-        if (std.mem.eql(u8, cmd, "next")) return self.cmdNext(rest);
-        if (std.mem.eql(u8, cmd, "list")) return self.cmdList(rest);
-        if (std.mem.eql(u8, cmd, "render")) return self.cmdRender(rest);
-        if (std.mem.eql(u8, cmd, "tree")) return self.cmdTree(rest);
-        if (std.mem.eql(u8, cmd, "compact")) return self.cmdCompact(rest);
-        if (std.mem.eql(u8, cmd, "archive")) return self.cmdArchive(rest);
-        if (std.mem.eql(u8, cmd, "doc")) return self.cmdDoc(rest);
-        if (std.mem.eql(u8, cmd, "show")) return self.cmdShow(rest);
-        if (std.mem.eql(u8, cmd, "edit")) return self.cmdEdit(rest);
-        if (std.mem.eql(u8, cmd, "log")) return self.cmdLog(rest);
-        if (std.mem.eql(u8, cmd, "stale")) return self.cmdStale(rest);
-        try self.print("trk: unknown command '{s}'\n", .{cmd});
-        return error.UnknownCommand;
+        return v.run(self, rest);
     }
 
     /// True iff `--help` or `-h` appears as a standalone token in `rest`. A flag
@@ -289,34 +382,47 @@ pub const Cli = struct {
         return false;
     }
 
-    /// Every verb whose dispatch writes persisted state: an appended log
-    /// event (`add`/`dep`/`undep`/`in`/`unin`/`state`/`release`/`edit`/`doc set`/`doc
-    /// unset`), a scaffolded `.tracker/` (`init`), a rewritten snapshot
-    /// (`compact`), or an out-file (`render`, `archive`). Everything else
-    /// (`next`/`list`/`show`/`tree`/`log`/`doc list`/`doc resolve`/`help`) is
-    /// read-only. `read_only` (`TRK_READONLY`) gates exactly this set.
-    const mutating_verbs = [_][]const u8{
-        "init", "add", "dep", "undep", "in", "unin", "arc", "migrate-arcs", "migrate-shorts", "state", "release", "render", "compact", "archive", "edit",
-    };
-
-    fn isMutating(cmd: []const u8, rest: []const []const u8) bool {
-        for (mutating_verbs) |v| {
-            if (std.mem.eql(u8, cmd, v)) return true;
-        }
-        if (std.mem.eql(u8, cmd, "doc")) {
-            if (rest.len > 0 and (std.mem.eql(u8, rest[0], "set") or std.mem.eql(u8, rest[0], "unset"))) return true;
+    /// Does running verb `v` with `rest` write persisted state? `Verb.mutates`,
+    /// or — for a verb whose subcommands differ (`doc set`/`doc unset` vs `doc
+    /// list`/`doc resolve`) — whether `rest[0]` is one of its writing
+    /// subcommands. `read_only` (`TRK_READONLY`) gates exactly this.
+    pub fn isMutating(v: *const Verb, rest: []const []const u8) bool {
+        if (v.mutates) return true;
+        if (rest.len == 0) return false;
+        for (v.mutating_subcommands) |sub| {
+            if (std.mem.eql(u8, rest[0], sub)) return true;
         }
         return false;
     }
 
-    /// Per-verb help. `text` is a full synopsis + purpose + key flags + an
-    /// example for one verb. Keep an entry here for EVERY dispatched verb — the
-    /// "every verb supports --help" test enumerates the verbs and asserts each
-    /// has an entry (and that the table count matches), so the `trk <verb> --help`
-    /// contract can't silently rot as verbs are added.
-    const VerbHelp = struct { name: []const u8, text: []const u8 };
-    pub const verb_help = [_]VerbHelp{
-        .{ .name = "init", .text =
+    pub fn findVerb(name: []const u8) ?*const Verb {
+        for (&verbs) |*v| {
+            if (std.mem.eql(u8, v.name, name)) return v;
+        }
+        return null;
+    }
+
+    pub const Verb = struct {
+        name: []const u8,
+        run: *const fn (*Cli, []const []const u8) Error!void,
+        /// Writes persisted state: an appended log event, a scaffolded
+        /// `.tracker/` (`init`), a rewritten snapshot (`compact`), or an
+        /// out-file (`render`, `archive`). See `isMutating`.
+        mutates: bool = false,
+        /// For a verb that is otherwise read-only: the subcommands that write.
+        mutating_subcommands: []const []const u8 = &.{},
+        /// The MCP tools this verb is exposed as (`mcp.zig`). Empty = CLI-only,
+        /// which must be a deliberate, commented choice.
+        tools: []const Tool,
+        /// Full synopsis + purpose + key flags + an example — `trk <verb>
+        /// --help`, and the MCP tool description.
+        text: []const u8,
+    };
+
+    /// THE verb table: dispatch, `--help`, the read-only gate and the MCP tool
+    /// list all derive from it, so none of them can drift from the others.
+    pub const verbs = [_]Verb{
+        .{ .name = "init", .run = &cmdInit, .mutates = true, .tools = &cli_only_tools, .text =
         \\trk init [--out <path>] [--force] [--no-gitattributes] [--no-gitignore]
         \\  Scaffold a fresh tracker: .tracker/ + an empty log, a config.json
         \\  (render.out defaults to docs/TODO.md; set it with --out), a
@@ -335,7 +441,7 @@ pub const Cli = struct {
         \\  reason as the attributes file. --no-gitignore skips it likewise.
         \\  e.g.  trk init            trk init --out TODO.md
         },
-        .{ .name = "add", .text =
+        .{ .name = "add", .run = &cmdAdd, .mutates = true, .tools = &add_tools, .text =
         \\trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...]
         \\       [--in <arc> [--seq <n>]] [--arc] [--needs <id> ...] [--priority <n>] [-v]
         \\  Create a task. Prints ONLY the new full ULID (scriptable: ID=$(trk add "x"));
@@ -356,7 +462,7 @@ pub const Cli = struct {
         \\  e.g.  trk add "Add dark mode" --tag ui --in 01KVX4K0 --needs 01KWZJFRR
         \\        trk add "Ship v2" --arc
         },
-        .{ .name = "dep", .text =
+        .{ .name = "dep", .run = &cmdDep, .mutates = true, .tools = &dep_tools, .text =
         \\trk dep <needer> --needs <prereq> [--needs <prereq> ...]
         \\  Make <needer> require prerequisite <prereq> (a `needs` edge). ONE positional,
         \\  the prereq(s) flagged: two bare positionals of the same type could be swapped
@@ -373,14 +479,14 @@ pub const Cli = struct {
         \\  prereq in a DIFFERENT arc — or the whole of a different arc — is unaffected.
         \\  e.g.  trk dep 01KX6H4V --needs 01KX6H48   (init needs config)
         },
-        .{ .name = "undep", .text =
+        .{ .name = "undep", .run = &cmdUndep, .mutates = true, .tools = &undep_tools, .text =
         \\trk undep <needer> --needs <prereq> [--needs <prereq> ...]
         \\  Remove the <needer> needs <prereq> edge (tombstoned; a no-op if absent).
         \\  Exact argument shape as `trk dep`, so undoing an edge is the same sentence
         \\  with one verb changed. The bare two-positional form is a hard usage error.
         \\  e.g.  trk undep 01KX6H4V --needs 01KX6H48
         },
-        .{ .name = "in", .text =
+        .{ .name = "in", .run = &cmdIn, .mutates = true, .tools = &in_tools, .text =
         \\trk in <task> <arc> [--seq <n>]
         \\  Add <task> to arc <arc> as a DIRECT member, optionally ordered by --seq.
         \\  <arc> MUST already be a declared arc (`trk arc <arc>` / `trk add --arc`) —
@@ -408,7 +514,7 @@ pub const Cli = struct {
         \\  e.g.  trk arc 01KVX4K0               (declare 01KVX4K0 an arc, once)
         \\        trk in 01KX6H4V 01KVX4K0       (add 01KX6H4V to arc 01KVX4K0)
         },
-        .{ .name = "unin", .text =
+        .{ .name = "unin", .run = &cmdUnin, .mutates = true, .tools = &unin_tools, .text =
         \\trk unin <task> <arc>
         \\  Remove the <task> in <arc> membership edge (tombstoned; a no-op if
         \\  absent). Exact mirror of `undep`, for the `in` edge kind. Same argument
@@ -420,7 +526,7 @@ pub const Cli = struct {
         \\  got written has A in the task slot and B in the arc slot.
         \\  e.g.  trk unin 01KX6H4V 01KVX4K0
         },
-        .{ .name = "arc", .text =
+        .{ .name = "arc", .run = &cmdArc, .mutates = true, .tools = &arc_tools, .text =
         \\trk arc <id> [--undo] [--standing [--undo]]
         \\  Declare <id> an arc root (an `arcDeclare` event), independent of whether any
         \\  task is `in` it — the fix for an arc with genuinely zero members yet (a real
@@ -436,7 +542,7 @@ pub const Cli = struct {
         \\  e.g.  trk arc 01KX6H4V           trk arc 01KX6H4V --undo
         \\        trk arc 01KVKHBZQ --standing           trk arc 01KVKHBZQ --standing --undo
         },
-        .{ .name = "migrate-arcs", .text =
+        .{ .name = "migrate-arcs", .run = &cmdMigrateArcs, .mutates = true, .tools = &cli_only_tools, .text =
         \\trk migrate-arcs
         \\  One-time (but idempotent/re-runnable) migration, two passes: (1) for every
         \\  task carrying a legacy `arc:<slug>` tag, emit an `arcDeclare{declared:true}`
@@ -446,7 +552,7 @@ pub const Cli = struct {
         \\  migrated task, plus a summary count. A second run finds nothing — safe to
         \\  re-run blind.
         },
-        .{ .name = "migrate-shorts", .text =
+        .{ .name = "migrate-shorts", .run = &cmdMigrateShorts, .mutates = true, .tools = &cli_only_tools, .text =
         \\trk migrate-shorts [--min <n>]
         \\  One-time (but idempotent/re-runnable) migration: for every task with no
         \\  FROZEN short id yet, freeze it at its CURRENT dynamically-computed short
@@ -465,7 +571,7 @@ pub const Cli = struct {
         \\  or 6 chars becomes longer). Run it once, on purpose, not routinely.
         \\  e.g.  trk migrate-shorts --min 9
         },
-        .{ .name = "state", .text =
+        .{ .name = "state", .run = &cmdState, .mutates = true, .tools = &state_tools, .text =
         \\trk state <id> <open|claimed|submitted|done|blocked|dropped> [--holder <who>]
         \\  Set a task's state. Lifecycle: open -> claimed -> submitted -> done, with
         \\  `trk release` (claimed -> open) as the release.
@@ -487,7 +593,7 @@ pub const Cli = struct {
         \\  e.g.  trk state 01KX6H48 claimed --holder lane-3
         \\        trk state 01KX6H48 submitted
         },
-        .{ .name = "release", .text =
+        .{ .name = "release", .run = &cmdRelease, .mutates = true, .tools = &release_tools, .text =
         \\trk release <id> [--holder <who>]
         \\trk release --holder <who>
         \\  Release a lease (claimed -> open), putting the task back in `trk next`.
@@ -501,24 +607,24 @@ pub const Cli = struct {
         \\  lease. (`trk state <id> open` is the unconditional override.)
         \\  e.g.  trk release --holder lane-3        trk release 01KX6H48
         },
-        .{ .name = "next", .text =
-        \\trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> ...]
+        .{ .name = "next", .run = &cmdNext, .tools = &next_tools, .text =
+        \\trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> | --word <term> ...]
         \\  The ready frontier: open tasks whose prereqs are ALL met. An arc root is
         \\  a container: it is held back until its non-parked members are finished,
         \\  then surfaces once as the close-out prompt (`trk state <root> done` marks
         \\  the goal complete and unblocks anything that needs the arc) — UNLESS the
         \\  arc is marked --standing (`trk arc`), in which case it never surfaces.
-        \\  Bare <term>s (repeatable, ANDed) are a case-insensitive substring search
-        \\  over title+body+tags. --not-tag <t> (repeatable, ANDed exclusion) drops
-        \\  any task carrying that tag — the autonomous-eligible bucket (no blocker
-        \\  tag) is one bare command:
+        \\  Bare <term>s (or --word <term>; repeatable, ANDed) are a case-insensitive
+        \\  substring search over title+body+tags. --not-tag <t> (repeatable, ANDed
+        \\  exclusion) drops any task carrying that tag — the autonomous-eligible
+        \\  bucket (no blocker tag) is one bare command:
         \\    trk next --not-tag metal --not-tag scott-testing --not-tag scott-decision
         \\  --json emits a machine-readable array.
         \\  e.g.  trk next           trk next prism windowed
         },
-        .{ .name = "list", .text =
+        .{ .name = "list", .run = &cmdList, .tools = &list_tools, .text =
         \\trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--not-tag <t> ...]
-        \\         [--limit <n>] [--json] [<term> ...]
+        \\         [--limit <n>] [--json] [<term> | --word <term> ...]
         \\  Every task (not just the ready frontier), filterable by arc/state/tag and
         \\  the same bare-term search as `next`. --not-tag (repeatable, ANDed
         \\  exclusion) drops any task carrying that tag. --no-arc lists every task in
@@ -529,7 +635,7 @@ pub const Cli = struct {
         \\        trk list --state submitted           (the awaiting-verification queue)
         \\        trk list --state claimed             (tasks currently leased)
         },
-        .{ .name = "render", .text =
+        .{ .name = "render", .run = &cmdRender, .mutates = true, .tools = &render_tools, .text =
         \\trk render [--out <path>]
         \\  Write the TODO.md markdown projection. Destination precedence:
         \\  explicit --out > config render.out > stdout. Overwrites the target (it is
@@ -541,12 +647,13 @@ pub const Cli = struct {
         \\  unchanged in the raw bytes. The header reports an arc-less drift count
         \\  every regeneration (`trk list --no-arc` for the list).
         },
-        .{ .name = "tree", .text =
-        \\trk tree <arc-or-task>
+        .{ .name = "tree", .run = &cmdTree, .tools = &tree_tools, .text =
+        \\trk tree <arc-or-task> [--json]
         \\  Print the ASCII prereq hierarchy rooted at an arc or task (prereqs nested
         \\  under their dependents; a shared prereq prints once, then "(seen)").
+        \\  --json: nested {id,short,title,state,children}; a repeat carries "seen":true.
         },
-        .{ .name = "compact", .text =
+        .{ .name = "compact", .run = &cmdCompact, .mutates = true, .tools = &compact_tools, .text =
         \\trk compact
         \\  Rewrite the snapshot + truncate the log, physically GC'ing archived/dropped
         \\  tasks. Orchestrator-only (rewrites the whole snapshot — the merge flashpoint).
@@ -561,9 +668,9 @@ pub const Cli = struct {
         \\  .tracker/.gitignore so it never becomes an untracked stray. Never
         \\  compact while fan-out worktrees are in flight.
         },
-        .{ .name = "archive", .text =
-        \\trk archive [<term> ...] [--arc <id>] [--tag <t>] [--out <path>] [--dry-run]
-        \\            [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>:<digest>]...
+        .{ .name = "archive", .run = &cmdArchive, .mutates = true, .tools = &archive_tools, .text =
+        \\trk archive [<term> | --word <term> ...] [--arc <id>] [--tag <t>] [--out <path>]
+        \\            [--dry-run] [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>:<digest>]...
         \\  Graduate DONE tasks to changelog bullets (--out > config archive.out >
         \\  stdout), then flip each to `archived` so it leaves every view (structural
         \\  dedup — re-running finds nothing). A file target is APPENDED to under a
@@ -600,7 +707,7 @@ pub const Cli = struct {
         \\  (matched case-insensitively). Override with .tracker/config.json ->
         \\  archive.decision_markers, a JSON array of strings; [] disables the check.
         },
-        .{ .name = "doc", .text =
+        .{ .name = "doc", .run = &cmdDoc, .mutating_subcommands = &.{ "set", "unset" }, .tools = &doc_tools, .text =
         \\trk doc set <doc_id> <path>   register/update a doc_id -> repo-relative path
         \\trk doc unset <doc_id>        unregister a doc_id (idempotent; refs fall back
         \\                              to the raw doc_id until it is re-set)
@@ -608,17 +715,18 @@ pub const Cli = struct {
         \\trk doc resolve <doc_id>      print the path for a doc_id
         \\  The registry backs the --doc/--add-doc design pointers on add/edit.
         },
-        .{ .name = "show", .text =
-        \\trk show <id> [--body]
+        .{ .name = "show", .run = &cmdShow, .tools = &show_tools, .text =
+        \\trk show <id> [--body | --json]
         \\  Full detail for one task: body, state, priority, tags, prereqs,
         \\  dependents, arc memberships, and doc pointers. Ids accept any unique prefix.
+        \\  --json emits the same facts as one object.
         \\  --body prints ONLY the raw body bytes (no header, no indent) — the safe
-        \\  read half of an edit round-trip — pipe it back with `--body -`:
-        \\  trk show <id> --body | trk edit <id> --body -
+        \\  read half of an edit round-trip — pipe it back with `--replace-body -`:
+        \\  trk show <id> --body | trk edit <id> --replace-body -
         \\  (`trk edit <id> --body "$(trk show <id> --body)"` also works, but the
         \\  shell eats ALL trailing newlines and the arg is length-capped)
         },
-        .{ .name = "edit", .text =
+        .{ .name = "edit", .run = &cmdEdit, .mutates = true, .tools = &edit_tools, .text =
         \\trk edit <id> [--title <s>] [--replace-body <s|->] [--append-body <s|->]
         \\        [--add-tag <t> ...] [--rm-tag <t> ...]
         \\        [--add-doc <doc_id[#section]> ...] [--rm-doc <doc_id> ...] [--priority <n>]
@@ -648,11 +756,12 @@ pub const Cli = struct {
         \\        trk edit 01KX6H --append-body "2026-08-23: reproduced on main."
         \\        trk edit 01KX6H --rm-doc none
         },
-        .{ .name = "log", .text =
-        \\trk log [<id>] [--limit <n>]
+        .{ .name = "log", .run = &cmdLog, .tools = &log_tools, .text =
+        \\trk log [<id>] [--limit <n>] [--json]
         \\  Event history, most-recent-last: the whole log, or one task's events.
+        \\  --json: an array of {ts,op,task_id,summary}.
         },
-        .{ .name = "stale", .text =
+        .{ .name = "stale", .run = &cmdStale, .tools = &stale_tools, .text =
         \\trk stale
         \\  Cross-reference: which OPEN tasks have their id cited in a LANDED commit
         \\  message (this branch's `git log --oneline` ancestry — deliberately NOT
@@ -665,12 +774,160 @@ pub const Cli = struct {
         \\  repo housing `.tracker/`, which may differ from where `trk` itself lives).
         \\  e.g.  trk stale
         },
+        .{ .name = "mcp-serve", .run = &cmdMcpServe, .tools = &cli_only_tools, .text =
+        \\trk mcp-serve
+        \\  Serve trk as an MCP server: JSON-RPC 2.0, one message per line, on
+        \\  stdin/stdout. Every verb above except init, migrate-arcs, migrate-shorts
+        \\  and mcp-serve is a tool of the same name (`doc` is doc_set, doc_unset,
+        \\  doc_list, doc_resolve) with typed parameters, running the same code as
+        \\  the CLI verb. show/list/next/tree/log return JSON.
+        \\  Every tool takes a REQUIRED `tree`: "main" (the main checkout of the repo
+        \\  the server was started in) or the path of one of that repo's linked git
+        \\  worktrees. Anything else is refused. The store is re-read on every call.
+        \\  TRK_READONLY in the server's environment refuses every writing tool.
+        \\  Register it for Claude Code in .mcp.json:
+        \\    {"mcpServers": {"trk": {"command": "trk", "args": ["mcp-serve"]}}}
+        },
     };
 
-    /// Print one verb's help (from `verb_help`), or fall back to the full usage
+    // ----------------------------------------------------------- MCP tool specs
+    //
+    // Parameters mirror each verb's parser; every `flag` must appear in that
+    // verb's help text (asserted), so a renamed flag cannot leave a stale tool.
+    // Positional string values beginning with `-` are refused by mcp.zig — the
+    // verb parsers would read them as flags.
+
+    /// CLI-only verbs: `init` scaffolds a store (the server serves an existing
+    /// one), `migrate-arcs`/`migrate-shorts` are one-time deliberate repairs
+    /// (`--min` rewrites frozen ids), and `mcp-serve` is the server itself.
+    const cli_only_tools = [_]Tool{};
+
+    const p_id = Param{ .name = "id", .kind = .string, .required = true, .desc = "Task id (any unique prefix)." };
+
+    const add_tools = [_]Tool{.{ .name = "add", .params = &.{
+        .{ .name = "title", .kind = .string, .required = true, .desc = "Task title." },
+        .{ .name = "body", .kind = .string, .flag = "--body", .desc = "Task body." },
+        .{ .name = "tag", .kind = .string_list, .flag = "--tag", .desc = "Tags." },
+        .{ .name = "doc", .kind = .string_list, .flag = "--doc", .desc = "Doc refs, doc_id or doc_id#section." },
+        .{ .name = "in", .kind = .string, .flag = "--in", .desc = "Add to this already-declared arc." },
+        .{ .name = "seq", .kind = .integer, .flag = "--seq", .desc = "Arc sequence (with `in`)." },
+        .{ .name = "arc", .kind = .boolean, .flag = "--arc", .desc = "Declare the new task an arc root." },
+        .{ .name = "needs", .kind = .string_list, .flag = "--needs", .desc = "Prerequisite task ids." },
+        .{ .name = "priority", .kind = .integer, .flag = "--priority", .desc = "Lower sorts first; 0 = unset." },
+    } }};
+
+    const dep_params = [_]Param{
+        .{ .name = "needer", .kind = .string, .required = true, .desc = "The task that needs the prerequisite(s)." },
+        .{ .name = "needs", .kind = .string_list, .flag = "--needs", .required = true, .desc = "Prerequisite task ids." },
+    };
+    const dep_tools = [_]Tool{.{ .name = "dep", .params = &dep_params }};
+    const undep_tools = [_]Tool{.{ .name = "undep", .params = &dep_params }};
+
+    const membership_params = [_]Param{
+        .{ .name = "task", .kind = .string, .required = true, .desc = "The member task." },
+        .{ .name = "arc", .kind = .string, .required = true, .desc = "The (declared) arc." },
+    };
+    const in_tools = [_]Tool{.{ .name = "in", .params = &(membership_params ++ [_]Param{
+        .{ .name = "seq", .kind = .integer, .flag = "--seq", .desc = "Order within the arc; lower first." },
+    }) }};
+    const unin_tools = [_]Tool{.{ .name = "unin", .params = &membership_params }};
+
+    const arc_tools = [_]Tool{.{ .name = "arc", .params = &.{
+        p_id,
+        .{ .name = "undo", .kind = .boolean, .flag = "--undo", .desc = "Retract (with `standing`: just the standing mark)." },
+        .{ .name = "standing", .kind = .boolean, .flag = "--standing", .desc = "Mark a perpetual-category arc." },
+    } }};
+
+    const state_tools = [_]Tool{.{ .name = "state", .params = &.{
+        p_id,
+        .{
+            .name = "state",
+            .kind = .choice,
+            .required = true,
+            .choices = &.{ "open", "claimed", "submitted", "done", "blocked", "dropped" },
+            .desc = "claimed = the lease (needs holder); submitted = completion pending verification.",
+        },
+        .{ .name = "holder", .kind = .string, .flag = "--holder", .desc = "Lease holder; required for claimed, refused otherwise." },
+    } }};
+
+    const release_tools = [_]Tool{.{ .name = "release", .params = &.{
+        .{ .name = "id", .kind = .string, .desc = "Release this task's lease." },
+        .{ .name = "holder", .kind = .string, .flag = "--holder", .desc = "Alone: release every lease this holder has. With id: assert the holder." },
+    } }};
+
+    const p_arc_filter = Param{ .name = "arc", .kind = .string, .flag = "--arc", .desc = "Only this arc's members." };
+    const p_not_tag = Param{ .name = "not_tag", .kind = .string_list, .flag = "--not-tag", .desc = "Exclude tasks carrying any of these tags." };
+    const p_limit = Param{ .name = "limit", .kind = .integer, .flag = "--limit", .desc = "At most this many." };
+    const p_term = Param{ .name = "term", .kind = .string_list, .flag = "--word", .desc = "Case-insensitive substrings over title+body+tags, ANDed." };
+
+    const next_tools = [_]Tool{.{ .name = "next", .argv = &.{"--json"}, .params = &.{ p_arc_filter, p_not_tag, p_limit, p_term } }};
+
+    const list_tools = [_]Tool{.{ .name = "list", .argv = &.{"--json"}, .params = &.{
+        p_arc_filter,
+        .{ .name = "no_arc", .kind = .boolean, .flag = "--no-arc", .desc = "Only tasks in no arc." },
+        .{
+            .name = "state",
+            .kind = .choice,
+            .flag = "--state",
+            .choices = &.{ "open", "claimed", "submitted", "done", "blocked", "dropped", "archived" },
+            .desc = "Only tasks in this state.",
+        },
+        .{ .name = "tag", .kind = .string, .flag = "--tag", .desc = "Only tasks carrying this tag." },
+        p_not_tag,
+        p_limit,
+        p_term,
+    } }};
+
+    const p_out = Param{ .name = "out", .kind = .string, .flag = "--out", .desc = "Output path, relative to the store root." };
+    const render_tools = [_]Tool{.{ .name = "render", .params = &.{p_out} }};
+    const tree_tools = [_]Tool{.{ .name = "tree", .argv = &.{"--json"}, .params = &.{p_id} }};
+    const compact_tools = [_]Tool{.{ .name = "compact" }};
+
+    const archive_tools = [_]Tool{.{ .name = "archive", .params = &.{
+        p_term,
+        .{ .name = "arc", .kind = .string, .flag = "--arc", .desc = "Only this arc's done members." },
+        .{ .name = "tag", .kind = .string, .flag = "--tag", .desc = "Only done tasks carrying this tag." },
+        p_out,
+        .{ .name = "dry_run", .kind = .boolean, .flag = "--dry-run", .desc = "Preview without archiving." },
+        .{ .name = "allow_buried_decisions", .kind = .boolean, .flag = "--allow-buried-decisions", .desc = "Override the decision guard for the whole run." },
+        .{ .name = "allow_buried_decisions_for", .kind = .string_list, .flag = "--allow-buried-decisions-for", .desc = "<id>:<n>:<digest> exemptions, as printed by the guard." },
+    } }};
+
+    const p_doc_id = Param{ .name = "doc_id", .kind = .string, .required = true, .desc = "The doc id." };
+    const doc_tools = [_]Tool{
+        .{ .name = "doc_set", .argv = &.{"set"}, .params = &.{
+            p_doc_id,
+            .{ .name = "path", .kind = .string, .required = true, .desc = "Repo-relative path." },
+        } },
+        .{ .name = "doc_unset", .argv = &.{"unset"}, .params = &.{p_doc_id} },
+        .{ .name = "doc_list", .argv = &.{"list"} },
+        .{ .name = "doc_resolve", .argv = &.{"resolve"}, .params = &.{p_doc_id} },
+    };
+
+    const show_tools = [_]Tool{.{ .name = "show", .argv = &.{"--json"}, .params = &.{p_id} }};
+
+    const edit_tools = [_]Tool{.{ .name = "edit", .params = &.{
+        p_id,
+        .{ .name = "title", .kind = .string, .flag = "--title", .desc = "New title." },
+        .{ .name = "body", .kind = .body_edit, .desc = "Body edit; `direction` is required: append keeps the body, replace overwrites it." },
+        .{ .name = "add_tag", .kind = .string_list, .flag = "--add-tag", .desc = "Tags to add." },
+        .{ .name = "rm_tag", .kind = .string_list, .flag = "--rm-tag", .desc = "Tags to remove." },
+        .{ .name = "add_doc", .kind = .string_list, .flag = "--add-doc", .desc = "Doc refs to add." },
+        .{ .name = "rm_doc", .kind = .string_list, .flag = "--rm-doc", .desc = "Doc ids whose refs to remove." },
+        .{ .name = "priority", .kind = .integer, .flag = "--priority", .desc = "Lower sorts first; 0 = unset." },
+    } }};
+
+    const log_tools = [_]Tool{.{ .name = "log", .argv = &.{"--json"}, .params = &.{
+        .{ .name = "id", .kind = .string, .desc = "Only this task's events." },
+        p_limit,
+    } }};
+
+    const stale_tools = [_]Tool{.{ .name = "stale" }};
+
+    /// Print one verb's help (from `verbs`), or fall back to the full usage
     /// overview for an unknown/absent verb (so `trk help nonsense` still helps).
     fn helpFor(self: *Cli, cmd: []const u8) !void {
-        for (verb_help) |v| {
+        for (verbs) |v| {
             if (std.mem.eql(u8, v.name, cmd)) {
                 try self.write(v.text);
                 try self.write("\n");
@@ -743,7 +1000,7 @@ pub const Cli = struct {
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
             \\  trk doc list                 print all registered doc_id -> path mappings
             \\  trk doc resolve <doc_id>     print the path for a doc_id
-            \\  trk show <id>                full task detail
+            \\  trk show <id> [--body | --json]   full task detail
             \\  trk edit <id> [--title <s>] [--replace-body <s|->] [--append-body <s|->]
             \\                [--add-tag <t> ...] [--rm-tag <t> ...]
             \\                [--add-doc <doc_id[#section]> ...] [--rm-doc <doc_id> ...] [--priority <n>]
@@ -751,7 +1008,8 @@ pub const Cli = struct {
             \\      --append-body reads the current body through trk's own log+snapshot fold,
             \\      which an external read-modify-write cannot do correctly.
             \\  trk log [<id>] [--limit <n>] event history (most-recent-last)
-            \\  trk stale                    open tasks cited in a landed commit but never closed
+            \\  trk stale                    open or claimed tasks cited in a landed commit but never closed
+            \\  trk mcp-serve                serve the verbs as MCP tools over stdio (see `trk mcp-serve --help`)
             \\
             \\Ids accept any unique prefix (git-short-hash style). A task minted after
             \\short-id freezing (or migrated via `trk migrate-shorts`) always displays
@@ -1660,6 +1918,14 @@ pub const Cli = struct {
                 .{ frozen, lengthened },
             );
         }
+    }
+
+    /// `mcp-serve` never reaches dispatch from the real binary: main.zig starts
+    /// the server before any store is loaded. This only answers a direct call.
+    fn cmdMcpServe(self: *Cli, args: []const []const u8) Error!void {
+        _ = args;
+        try self.write("trk: mcp-serve is started by the trk binary itself (`trk mcp-serve`), not from within a command\n");
+        return error.UsageError;
     }
 
     // ----------------------------------------------------------- state
@@ -3126,11 +3392,30 @@ pub const Cli = struct {
     // ----------------------------------------------------------- tree (ASCII)
 
     fn cmdTree(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 1) {
-            try self.write("trk: usage: trk tree <arc-or-task-id>\n");
-            return error.UsageError;
+        var id_arg: ?[]const u8 = null;
+        var json = false;
+        var extra_positional = false;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (id_arg == null) {
+                id_arg = a;
+            } else {
+                extra_positional = true;
+            }
         }
-        const root = try self.resolve(args[0]);
+        if (extra_positional) id_arg = null;
+        const root = try self.resolve(id_arg orelse {
+            try self.write("trk: usage: trk tree <arc-or-task-id> [--json]\n");
+            return error.UsageError;
+        });
+        if (json) {
+            var visited = std.AutoHashMapUnmanaged([ulid.len]u8, void){};
+            defer visited.deinit(self.gpa);
+            try self.treeJson(root, true, &visited);
+            try self.write("\n");
+            return;
+        }
         try self.renderTree(self.out, root);
     }
 
@@ -3176,6 +3461,53 @@ pub const Cli = struct {
             const last = idx == children.items.len - 1;
             try self.treeNode(buf, &prefix, child, last, &visited);
         }
+    }
+
+    /// `trk tree --json`: nested `{id,short,title,state,children}` with the same
+    /// child order as the text view (root: arc members then prereqs, by arc
+    /// seq; below: prereqs by id). A node reached again carries `"seen":true`
+    /// and no children, exactly where the text view prints `(↑ seen)`.
+    fn treeJson(
+        self: *Cli,
+        id: Ulid,
+        is_root: bool,
+        visited: *std.AutoHashMapUnmanaged([ulid.len]u8, void),
+    ) Error!void {
+        const gpa = self.gpa;
+        try self.taskRefOpen(id);
+        if (visited.contains(id.text)) {
+            try self.write(",\"seen\":true}");
+            return;
+        }
+        try visited.put(gpa, id.text, {});
+
+        var children: std.ArrayList(Ulid) = .empty;
+        defer children.deinit(gpa);
+        if (is_root) {
+            var seen_child = std.AutoHashMapUnmanaged([ulid.len]u8, void){};
+            defer seen_child.deinit(gpa);
+            for (self.store.ins.items) |e| {
+                if (e.arc.eql(id)) {
+                    const gop = try seen_child.getOrPut(gpa, e.task.text);
+                    if (!gop.found_existing) try children.append(gpa, e.task);
+                }
+            }
+            for (self.directPrereqs(id)) |p| {
+                const gop = try seen_child.getOrPut(gpa, p.text);
+                if (!gop.found_existing) try children.append(gpa, p);
+            }
+            sortByArcSeqThenId(self, id, children.items);
+        } else {
+            try children.appendSlice(gpa, self.directPrereqs(id));
+            std.sort.pdq(Ulid, children.items, {}, Ulid.lessThan);
+        }
+
+        try self.write(",\"children\":[");
+        for (children.items, 0..) |c, i| {
+            if (i != 0) try self.write(",");
+            try self.treeJson(c, false, visited);
+        }
+        try self.write("]}");
     }
 
     fn treeNode(
@@ -3308,21 +3640,30 @@ pub const Cli = struct {
     fn cmdShow(self: *Cli, args: []const []const u8) Error!void {
         var id_arg: ?[]const u8 = null;
         var raw_body = false;
+        var json = false;
         for (args) |a| {
             if (std.mem.eql(u8, a, "--body")) {
                 raw_body = true;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                json = true;
             } else if (id_arg == null) {
                 id_arg = a;
             } else {
-                try self.write("trk: usage: trk show <id> [--body]\n");
+                try self.write("trk: usage: trk show <id> [--body | --json]\n");
                 return error.UsageError;
             }
         }
         const id = try self.resolve(id_arg orelse {
-            try self.write("trk: usage: trk show <id> [--body]\n");
+            try self.write("trk: usage: trk show <id> [--body | --json]\n");
             return error.UsageError;
         });
         const t = self.store.get(id).?;
+
+        if (raw_body and json) {
+            try self.write("trk: usage: trk show <id> [--body | --json]\n");
+            return error.UsageError;
+        }
+        if (json) return self.showJson(id);
 
         if (raw_body) {
             // Verbatim body bytes, nothing else — the read half of a safe edit
@@ -3448,6 +3789,94 @@ pub const Cli = struct {
                 }
             }
         }
+    }
+
+    /// `trk show <id> --json`: the same facts as the text view, as one object.
+    fn showJson(self: *Cli, id: Ulid) Error!void {
+        const t = self.store.get(id).?;
+        var sb: [ulid.len]u8 = undefined;
+        try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"title\":", .{ &id.text, try self.shortId(id, &sb) });
+        try self.writeJsonString(t.title);
+        try self.print(",\"state\":\"{s}\",\"priority\":{d}", .{ t.state.toString(), t.priority });
+        if (t.holder) |h| {
+            try self.write(",\"holder\":");
+            try self.writeJsonString(h);
+            try self.print(",\"lease_ts\":{d}", .{t.lease_ts});
+        }
+        try self.write(",\"tags\":[");
+        for (t.tags.items, 0..) |tg, i| {
+            if (i != 0) try self.write(",");
+            try self.writeJsonString(tg);
+        }
+        try self.write("],\"body\":");
+        try self.writeJsonString(t.body);
+
+        try self.write(",\"prereqs\":[");
+        {
+            var n: usize = 0;
+            for (self.store.needs.items) |e| {
+                if (!e.from.eql(id)) continue;
+                if (n != 0) try self.write(",");
+                n += 1;
+                try self.taskRefOpen(e.to);
+                if (self.store.isArc(e.to)) {
+                    const p = self.store.arcProgress(e.to);
+                    try self.print(",\"arc_progress\":{{\"done\":{d},\"total\":{d}}}", .{ p.done, p.total });
+                }
+                try self.write("}");
+            }
+        }
+        try self.write("],\"dependents\":[");
+        {
+            const rdeps = try self.store.reverseDeps(self.gpa, id);
+            defer self.gpa.free(rdeps);
+            for (rdeps, 0..) |d, i| {
+                if (i != 0) try self.write(",");
+                try self.taskRefJson(d);
+            }
+        }
+        try self.write("],\"arcs\":[");
+        {
+            const arcs = try self.store.arcsOf(self.gpa, id);
+            defer self.gpa.free(arcs);
+            for (arcs, 0..) |a, i| {
+                if (i != 0) try self.write(",");
+                try self.taskRefOpen(a);
+                if (self.seqFor(id, a)) |seq| try self.print(",\"seq\":{d}", .{seq});
+                try self.write("}");
+            }
+        }
+        try self.write("],\"docrefs\":[");
+        for (t.docrefs.items, 0..) |dr, i| {
+            if (i != 0) try self.write(",");
+            try self.write("{\"doc_id\":");
+            try self.writeJsonString(dr.doc_id);
+            if (dr.section_id) |sec| {
+                try self.write(",\"section_id\":");
+                try self.writeJsonString(sec);
+            }
+            if (self.store.docPath(dr.doc_id)) |path| {
+                try self.write(",\"path\":");
+                try self.writeJsonString(path);
+            }
+            try self.write("}");
+        }
+        try self.write("]}\n");
+    }
+
+    /// `{"id","short","title","state"}` for a task another object points at.
+    fn taskRefJson(self: *Cli, id: Ulid) !void {
+        try self.taskRefOpen(id);
+        try self.write("}");
+    }
+
+    /// `taskRefJson` without its closing brace, for a caller adding fields.
+    fn taskRefOpen(self: *Cli, id: Ulid) !void {
+        const t = self.store.get(id).?;
+        var sb: [ulid.len]u8 = undefined;
+        try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"title\":", .{ &id.text, try self.shortId(id, &sb) });
+        try self.writeJsonString(t.title);
+        try self.print(",\"state\":\"{s}\"", .{t.state.toString()});
     }
 
     // ----------------------------------------------------------- edit
@@ -3644,11 +4073,14 @@ pub const Cli = struct {
     fn cmdLog(self: *Cli, args: []const []const u8) Error!void {
         var id_filter: ?[]const u8 = null;
         var limit: ?usize = null;
+        var json = false;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
             if (std.mem.eql(u8, arg, "--limit")) {
                 limit = try self.parseUsize(try self.flagVal(args, &i, "--limit"));
+            } else if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
             } else if (std.mem.startsWith(u8, arg, "--")) {
                 try self.print("trk: unknown flag '{s}'\n", .{arg});
                 return error.UnknownFlag;
@@ -3688,6 +4120,20 @@ pub const Cli = struct {
             if (filtered.items.len > lim) start = filtered.items.len - lim;
         }
         const to_print = filtered.items[start..];
+
+        if (json) {
+            try self.write("[");
+            for (to_print, 0..) |e, n| {
+                if (n != 0) try self.write(",");
+                try self.print("{{\"ts\":{d},\"op\":\"{s}\",\"task_id\":", .{ e.ts, @tagName(e.op) });
+                if (e.task_id) |tid| try self.print("\"{s}\"", .{&tid.text}) else try self.write("null");
+                try self.write(",\"summary\":");
+                try self.writeJsonString(e.summary);
+                try self.write("}");
+            }
+            try self.write("]\n");
+            return;
+        }
 
         if (to_print.len == 0) {
             try self.write("(no events)\n");

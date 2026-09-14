@@ -12,6 +12,7 @@ const std = @import("std");
 const tracker = @import("tracker");
 const cli = @import("cli.zig");
 const discover = @import("discover.zig");
+const mcp = @import("mcp.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -28,6 +29,25 @@ pub fn main(init: std.process.Init) !u8 {
     }
     while (it.next()) |a| try args.append(gpa, try gpa.dupe(u8, a));
 
+    // `trk mcp-serve` (without --help) runs the MCP server instead of one
+    // command: it opens a store per call, for the tree each call names, so no
+    // store is discovered or loaded here.
+    if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "mcp-serve") and !wantsHelp(args.items[1..])) {
+        const cwd = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(cwd);
+        var server = try mcp.Server.init(gpa, io, cwd, isReadOnly(init.minimal.environ, gpa));
+        defer server.deinit();
+        var in_buf: [64 * 1024]u8 = undefined;
+        var in = std.Io.File.stdin().reader(io, &in_buf);
+        var out_buf: [64 * 1024]u8 = undefined;
+        var out = std.Io.File.stdout().writer(io, &out_buf);
+        server.serve(&in.interface, &out.interface) catch |e| {
+            try printErr(io, gpa, "trk: mcp-serve: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
+    }
+
     // Locate the store root: the nearest ancestor (cwd first, then up) that
     // holds a `.tracker/` dir — git-style, so `trk` runs from any subdirectory
     // of the repo, not just its root. Bounded at a linked git-worktree's root
@@ -43,65 +63,15 @@ pub fn main(init: std.process.Init) !u8 {
         try printErr(io, gpa, "trk: failed to load store: {s}\n", .{@errorName(e)});
         return 1;
     };
-    // Best-effort config is non-fatal: warn but proceed on a malformed file.
-    if (store.config_malformed)
-        printErr(io, gpa, "trk: warning: {s}/{s} is malformed — using default config\n", .{ tracker.store.tracker_subdir, tracker.store.config_name }) catch {};
-    // Every self-wait cycle already baked into the log (mediated by `in` arc
-    // membership — see Store.load's doc comment) is likewise non-fatal: warn
-    // on EACH one but keep going, since refusing to load would brick the
-    // repo. Looping (not just the first) matters: a log can carry more than
-    // one independent stuck pair, and reporting only one would leave every
-    // other cycled task exactly as silently invisible as the bug this
-    // warning exists to kill.
-    for (store.self_wait_cycles.items) |p|
-        printErr(
-            io,
-            gpa,
-            "trk: warning: {s} and {s} form a self-wait cycle across needs + arc-membership edges — " ++
-                "neither can ever complete while depending on the other; fix with `trk undep` or by " ++
-                "re-parenting the membership (`trk in`)\n",
-            .{ &p.from.text, &p.to.text },
-        ) catch {};
-    // Every log line whose `op` this binary doesn't recognize is likewise
-    // non-fatal: warn on EACH one but keep going (see Store.load's doc
-    // comment / skipped_unknown_ops — a single new-op line must not brick
-    // reads on a not-yet-updated binary). Looping, not just the first, for
-    // the same reason as the self-wait loop above.
-    // Every ghost task (an id the fold materialized with no `add` behind it) is
-    // likewise non-fatal at load: warn on EACH one and keep going, so the data
-    // that IS there stays readable. Looping, not just the first, for the same
-    // reason as the loops above. This fires on EVERY command, which is why
-    // `compact` needs no refusal of its own — it GCs the ghost and spools its
-    // lines to .tracker/quarantine.jsonl, reporting what it took out.
-    for (store.ghost_tasks.items) |id|
-        printErr(
-            io,
-            gpa,
-            "trk: warning: {s} has no `add` event anywhere in the fold — its title/tags/arcs " ++
-                "are missing, not empty (a union-merge that outlived a compact). It is not a real " ++
-                "task; `trk compact` will GC it and quarantine its log lines\n",
-            .{&id.text},
-        ) catch {};
-    // Every task whose late-merged events were withheld as provably stale. Not
-    // fatal, and never a silent drop: the events are still in the log, so a
-    // change that really was wanted can be re-applied deliberately.
-    for (store.superseded.items) |sd|
-        printErr(
-            io,
-            gpa,
-            "trk: warning: {s}: {d} log event(s) predate the snapshot's value for this task and were " ++
-                "NOT applied (a pre-compact event union-merged back in). The snapshot's newer state " ++
-                "stands; re-apply deliberately if the change is real\n",
-            .{ &sd.id.text, sd.events },
-        ) catch {};
-    for (store.skipped_unknown_ops.items) |s|
-        printErr(
-            io,
-            gpa,
-            "trk: warning: skipped a log line with unrecognized op \"{s}\" — this binary may be older " ++
-                "than the log; install the latest `trk` to see its effect\n",
-            .{s.op},
-        ) catch {};
+    // Everything the fold tolerated but a human should see (malformed config,
+    // self-wait cycles, ghosts, withheld stale events, unknown ops) — non-fatal,
+    // one warning each. See `cli.appendLoadWarnings`.
+    {
+        var load_warn: std.ArrayList(u8) = .empty;
+        defer load_warn.deinit(gpa);
+        cli.appendLoadWarnings(gpa, &store, &load_warn) catch {};
+        std.Io.File.stderr().writeStreamingAll(io, load_warn.items) catch {};
+    }
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -169,6 +139,13 @@ pub fn main(init: std.process.Init) !u8 {
         }
         return 1;
     }
+}
+
+fn wantsHelp(rest: []const []const u8) bool {
+    for (rest) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return true;
+    }
+    return false;
 }
 
 /// True iff `TRK_READONLY` is set in the environment to any non-empty value.

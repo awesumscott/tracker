@@ -99,7 +99,7 @@ pub fn stateFromWire(tok: []const u8) ?model.State {
 
 // ----------------------------------------------------------------- encode
 
-fn writeJsonString(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+pub fn writeJsonString(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
     try buf.append(gpa, '"');
     for (s) |c| {
         switch (c) {

@@ -125,55 +125,78 @@
 
   </details>
 
-- [s] `01M2GGFGR` Live lease state: 'claimed' becomes 'this task is taken' (hides it from next), and today's commit-tied completion report is renamed 'submitted' -- legacy serialized 'claimed' must keep decoding as submitted #state-machine #scott-ruled
+- [s] `01M2GJV9S` trk mcp-serve: expose the verb table as MCP tools over stdio, so masked exits, shell-executed backticks, swapped positionals and direction-less body edits are unrepresentable -- every tool takes a required tree selector because subagents share the session's one server #mcp #agent-surface
 
-  <details><summary>RULED (Scott, 2026-09-14, in an Enix session): trk gets a LIVE LEASE…</summary>
+  <details><summary>`trk mcp-serve`: trk speaks MCP (JSON-RPC 2.0, newline-delimited, over…</summary>
 
-  RULED (Scott, 2026-09-14, in an Enix session): trk gets a LIVE LEASE meaning "this task is taken", and the
-  names move to match ordinary ticket usage:
-    * `claimed` -- NEW meaning: the lease. Written when work is handed out, so `next` stops offering a task
-      someone already has. Not next-eligible; does not satisfy a prereq (the work is not done).
-    * `submitted` -- today's `claimed`, renamed with its semantics unchanged: "the commit I'm riding completes
-      this task, pending verification". Not next-eligible, does not satisfy a prereq, counts as remaining in
-      render, is the awaiting-verification queue (`list --state submitted`), promoted to done or demoted to
-      open by the post-gate reconcile.
-  Lifecycle: open -> claimed -> submitted -> done, with claimed -> open as the release.
+  `trk mcp-serve`: trk speaks MCP (JSON-RPC 2.0, newline-delimited, over stdio) so an agent calls typed tools
+  instead of shelling out. Filed from the Enix side, where it is task 01M29TMPQ in arc 01M29TM00 (the house tools
+  getting MCP front ends). The Enix task keeps the adoption half: registering the server, moving CLAUDE.md and
+  the skills, and verifying against the Enix store.
 
-  WHY: in Enix fan-outs the only thing stopping two lanes or two concurrent sessions from starting the same
-  task is the orchestrator's memory. Scott read `claimed` as exactly this lease; the current meaning is closer
-  to "submitted", so the rename fixes the vocabulary rather than adding a near-synonym beside it.
+  WHY -- every item is a recorded incident on the Enix tracker, not a hypothesis. Each is a SHELL failure that
+  a typed tool call makes unrepresentable rather than discouraged:
+    * MASKED EXITS. `trk state <id> done | tail -1` reports tail's exit; an orchestrator did it on nearly every
+      close in one session (2026-09-11). A tool result has no pipe.
+    * BACKTICKS EXECUTING AS SHELL inside `--body`/`--append-body` text. Bodies are exactly where code
+      identifiers and shell snippets belong, so this is the highest-traffic hazard.
+    * SWAPPED POSITIONALS -- the reason `dep` refuses the two-positional form. Named parameters make the swap
+      unrepresentable.
+    * A BODY EDIT WITH NO DIRECTION -- as a required enum (append | replace) it cannot be omitted, and the
+      destructive one is named at every call site.
+    * VERB SCOPE. `archive`/`compact`/`render` are orchestrator-only, and a lane ran `render` anyway because
+      the rule lived in prose it never read.
 
-  WHERE EACH IS WRITTEN (context for the design, decided on the Enix side): the lease is a fact true whether
-  or not a lane's work ever merges, so it is written to the MAIN checkout's store and is visible to every
-  tree immediately. `submitted` is true only if the lane's commit lands, so it is written in the lane's
-  worktree and travels with the commit via merge=union. The Enix consumer is an MCP front end for trk
-  (Enix task 01M29TMPQ, which needs this) taking a required tree selector per call.
+  SHAPE
+    * `trk mcp-serve`: initialize (declare the tools capability), tools/list, tools/call; ignore id-less
+      notifications. Stdout carries protocol only; diagnostics go to stderr. std-only, like the rest of trk.
+    * The tool schema is DERIVED FROM THE SAME VERB TABLE `main` dispatches on, so CLI and MCP cannot drift.
+      Every tool calls the same code the CLI verb calls -- never a reimplementation. Bodies in particular
+      must go through trk's own snapshot+log fold: a caller reading log.jsonl directly sees a body last
+      written before the newest compact as EMPTY and truncates it.
+    * Read verbs (show, list, next, tree, log) return structured JSON content, not formatted text -- which
+      also removes the reason anyone pipes them.
+    * States in the schema are the post-rename ones (01M2GGFGR): `submitted` is the completion report;
+      `claimed` requires a holder; release is its own tool.
+    * The CLI stays the primary surface -- docs cite it, humans use it, it works over ssh. MCP is an
+      additional front end. A change that deprecates CLI verbs has overstepped.
 
-  CONSTRAINTS:
-    1. EXISTING LOGS MEAN COMPLETION. Every serialized `"state":"claimed"` already written (Enix alone holds
-       109 across log.jsonl + snapshot.jsonl) means submitted, and so will any written by a pre-rename binary
-       on a long-lived branch that union-merges in later. They must decode as submitted forever. Reusing the
-       wire token "claimed" for the lease makes those lines ambiguous; one structural answer is to never
-       reuse it -- the legacy token decodes to submitted, and the lease gets a wire token that has never
-       meant anything else. Choose and record the encoding in design.md.
-    2. OLD HABIT HAZARD. Agents and docs have written `trk state <id> claimed` to mean completion for months.
-       After the rename that same command silently takes a lease: the task drops out of the
-       awaiting-verification queue and nobody verifies it. Make the habitual misuse fail loud where the
-       state machine allows it -- e.g. claimed -> claimed refused with a hint naming `submitted` -- and say
-       in design.md what is and is not caught.
-    3. A LEASE NEEDS A RELEASE PATH. A lane that dies or is abandoned must not strand its task as claimed
-       forever. Candidates: an explicit release verb/sweep, expiry, a recorded holder (lane/worktree name +
-       ts) that a sweep can check. This is a design fork -- bring a recommendation back to Scott before
-       building it.
-    4. Every surface that names the state moves together: model.zig State + its predicates, json_codec,
-       render markers (the lease and submitted need distinct markers; say which keeps `[c]`), `list --state`,
-       `stale`'s exclusion (a submitted task keeps being excluded; decide and record whether a leased one is),
-       help text, design.md's state list and Settled rulings, README, and the tests.
+  TREE SELECTION -- the constraint that shapes every tool (ruled by Scott, 2026-09-14: expose it as an option)
+    Measured: Claude Code spawns a stdio MCP server ONCE PER SESSION from .mcp.json, cwd = the session's repo
+    root, and SUBAGENTS share that one process (they run inside the parent session and multiplex over its
+    pipe). So a lane working in a git worktree reaches a server whose cwd is the MAIN checkout, and trk's
+    walk-up discovery would silently retarget every lane write from its worktree's .tracker/ to main's.
+    Therefore every tool takes a REQUIRED `tree` parameter: "main", or a worktree path. No default -- same
+    named-at-the-call-site argument as the body direction. A path that is not a linked worktree of the
+    server's repo is REFUSED, never silently resolved elsewhere (trk already recognizes a linked worktree by
+    its `.git` FILE; how to validate membership without shelling out to git is the builder's call -- record
+    it in design.md).
+    Which tree a write belongs in turns on one question: is the fact true only if the lane's commit lands?
+      * yes -> the worktree: `submitted`, and edits describing what the lane's change did.
+      * no  -> main: the `claimed` lease and its release, and defects/follow-ons a lane discovers (filed in
+        a worktree they die with an abandoned lane).
+    The server enforces only the tree's validity, not this policy; the policy is the caller's, stated per call.
 
-  VERIFICATION: host tests here (`zig build test`); then the Enix orchestrator verifies against the Enix
-  store (the 109 legacy values fold as submitted; a lease set in main hides the task from `trk next`) and
-  updates Enix's CLAUDE.md, fan-out/save-sweep skills and issue-tracker.md in the adopting commit (Enix task
-  01M2GG485).
+  VERB SCOPE -- note for the design, not a settled shape
+    Because subagents share the session's one server, the server cannot tell an orchestrator's call from a
+    lane's, so hiding `archive`/`compact`/`render` cannot be done server-side by caller. What can scope it:
+    per-agent-type tool allowlists on the Claude Code side (an agent definition names the MCP tools it gets),
+    which needs those verbs to be separate tools rather than one generic `trk` tool with a verb argument.
+    So: one MCP tool per verb.
+
+  WHERE THIS SITS (ruled by Scott, 2026-09-14)
+    * trk SERVES ITS OWN MCP, because it has its own repo -- not through a wrapper that shells out to it.
+    * The other house tools do not get per-tool servers. A CROSS-PROJECT core MCP server, in its own repo and
+      registered user-wide, carries enixedit (extracted from the Enix tree and renamed) plus generic Bash
+      replacements (process kill, wait-for-condition, run a Windows exe, git). An in-repo Enix server carries
+      enixnet-zig plus Enix's gate/build verbs.
+    * So trk and the core server will both be Zig stdio JSON-RPC servers outside Enix. Build the protocol loop
+      for trk's needs; whether the two later share a small helper is worth a look once both exist, and trk
+      does not wait on it.
+
+  VERIFICATION: host tests here (protocol round-trip: initialize, tools/list, tools/call for a read and a
+  write verb; a `tree` pointing outside the repo's worktrees is refused; a body append through MCP after a
+  compact keeps the snapshot-only body). The Enix side then registers it and verifies against its store.
 
   </details>
 

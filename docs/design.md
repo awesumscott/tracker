@@ -427,7 +427,51 @@ reconciliation pass mis-marked tasks BUILT this way before catching itself with 
 --is-ancestor`). `trk stale` wants only LANDED evidence, so it scopes to the current branch's ancestry by
 construction rather than asking the caller to filter `--all`'s output after the fact.
 
-## Storage, merges, and auth
+## MCP front end — `trk mcp-serve` (01M2GJV9S)
+
+An additional surface for agents, not a replacement: the CLI stays what docs cite, humans use, and ssh
+reaches. JSON-RPC 2.0, one message per line on stdio; `initialize`, `ping`, `tools/list`, `tools/call`,
+id-less notifications ignored. What a typed call removes is the shell: no pipe to mask an exit, no
+backtick executed inside a body, no swappable positionals, no body edit without a direction.
+
+- **One table.** `Cli.verbs` holds each verb's handler, whether it writes, its help text and its tool
+  specs; CLI dispatch, `--help`, the `TRK_READONLY` gate and `tools/list` all read it. A tool call
+  validates its typed arguments, builds argv and runs `Cli.dispatch` — the verb's own code, so a body
+  append still reads through the snapshot+log fold. Every tool flag must appear in its verb's help
+  (asserted), so a renamed flag cannot leave a stale tool.
+- **One tool per verb** (`doc` splits into `doc_set`/`doc_unset`/`doc_list`/`doc_resolve`). The server
+  cannot tell an orchestrator's call from a lane's — subagents share the session's one server — so verb
+  scope (`archive`/`compact`/`render` for orchestrators only) is enforced by per-agent tool allowlists on
+  the client, which needs the verbs to be separate tools. `readOnlyHint` derives from the verb.
+- **CLI-only:** `init` (the server serves existing stores), `migrate-arcs`/`migrate-shorts` (one-time,
+  deliberate repairs; `--min` rewrites frozen ids) and `mcp-serve`.
+- **Read tools return JSON** (`show`/`list`/`next`/`tree`/`log` run with `--json`, which the CLI gained
+  alongside), removing the reason anyone pipes them.
+- **Typed values stay data.** `Cli.dispatch` skips help routing, so a body reading `--help` is text; a body
+  of `-` is text, not a stdin read (`body_dash_reads_stdin = false`). A *positional* string starting with
+  `-` is refused — the verb parsers would read it as a flag.
+- **Failures are results.** A refused argument, a refused tree or a failing verb is a `tools/call` result
+  with `isError: true` and trk's message; only an unknown tool or malformed request is a JSON-RPC error.
+  Load warnings (ghosts, withheld events, …) ride along as a second text block.
+
+**Tree selection.** Claude Code spawns one stdio server per session with cwd at the session's repo root,
+and subagents multiplex over it, so a worktree lane's calls reach a server whose cwd is the main checkout
+— walk-up discovery would silently retarget every lane write to main's store. Every tool therefore takes
+a **required** `tree`, with no default: `"main"` or a linked worktree's path (absolute, or relative to the
+main checkout). The store is opened at exactly that root — no walk-up — re-read on every call, and a tree
+with no `.tracker/` is refused rather than silently created. The server enforces only validity; *which*
+tree a write belongs in (is the fact true only if the lane's commit lands?) is the caller's policy.
+
+- **Validation without git** (std-only, never shells out). At start the server finds the repository from
+  its cwd: a `.git` directory is the common dir and its parent is "main"; a `.git` file (started inside a
+  worktree) is followed to its gitdir and `commondir`. A tree path is accepted only if, after resolving
+  real paths, `<tree>/.git` is a file whose `gitdir:` is `<common>/worktrees/<name>` **and** that
+  registration's `gitdir` file points back at `<tree>/.git`. The two-way check is what refuses a forged or
+  copied `.git` file claiming another worktree's registration, a stale registration whose worktree moved,
+  and a separate repository. Outside git, "main" is the start directory and no other tree exists; a bare
+  repository has no "main".
+
+
 
 Storage is an append-log of events + a full-state snapshot baseline + adopt/condemn compaction. It is realized
 as `.tracker/log.jsonl` (one JSON event per line) plus an optional `.tracker/snapshot.jsonl`, both written via

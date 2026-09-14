@@ -83,6 +83,19 @@ discovery).
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.
 
+## MCP server
+
+`trk mcp-serve` serves the same verbs as MCP tools over stdio, for agents that should call typed tools
+instead of a shell. Register it in `.mcp.json`:
+
+```json
+{ "mcpServers": { "trk": { "command": "trk", "args": ["mcp-serve"] } } }
+```
+
+Every tool takes a required `tree`: `"main"`, or the path of one of the repository's linked git
+worktrees — a lane's write lands in exactly the store it names. `show`/`list`/`next`/`tree`/`log` return
+JSON. `init`, `migrate-arcs` and `migrate-shorts` stay CLI-only. See `trk mcp-serve --help`.
+
 ## Config
 
 `.tracker/config.json` (written by `trk init`) persists where `render`/`archive` write, so you don't pass

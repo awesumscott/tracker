@@ -15,7 +15,7 @@ zig build run -- <args>       # run the CLI, e.g. zig build run -- next
 zig build -Dtarget=x86_64-windows-gnu   # cross-compile check (must stay clean; std-only is a design rule)
 ```
 
-There is no test-filter option wired in build.zig; `zig build test` runs everything (it's fast). Library tests aggregate through the `test {}` block in `src/tracker.zig` — a new test file must be `_ = @import(...)`'d there (or wired in build.zig like cli_test.zig) or it silently won't run.
+There is no test-filter option wired in build.zig; `zig build test` runs everything (it's fast). Library tests aggregate through the `test {}` block in `src/tracker.zig` — a new test file must be `_ = @import(...)`'d there (or wired in build.zig like cli_test.zig / mcp_test.zig) or it silently won't run.
 
 WSL note: this repo lives on ext4 at `~/dev/zig/trk` (moved off the `/mnt/c` DrvFs mount 2026-08-26, sibling to the Enix checkout that consumes it, so `../trk` resolves from there). Build bare into the in-tree `.zig-cache` — do NOT route `ZIG_LOCAL_CACHE_DIR` elsewhere. The trap that rule existed for (Windows file-locking wedging the cache so a build reports success while installing a stale artifact) was a DrvFs property and went away with the move.
 
@@ -25,6 +25,7 @@ Two compilation units, wired in `build.zig`:
 
 - **`tracker` module** (root `src/tracker.zig`) — the platform-free library: `ulid.zig` (id minting), `model.zig` (Task/State/Event data, no I/O), `json_codec.zig` (event line codec), `store.zig` (the fold + queries + writes).
 - **`trk` exe** — `src/main.zig` is a thin shell (build `Io`, find the store root by walking up for `.tracker/` git-style via `src/discover.zig`, map errors to exit codes); all verb logic and the render/tree projections live in `src/cli.zig`, which imports the `tracker` module.
+- **MCP front end** — `src/mcp.zig` (`trk mcp-serve`, started from main.zig before any store loads). Tools derive from `Cli.verbs`, the one table dispatch/help/read-only/`tools/list` all read; a call builds argv and runs `Cli.dispatch`, never the store directly. Adding a verb means a `verbs` entry with `tools` (or a commented CLI-only `cli_only_tools`); every tool flag must appear in the verb's help text (mcp_test.zig asserts it). Every tool takes a required `tree` — see design.md "MCP front end" before touching tree resolution.
 
 Core mechanic: **load = fold**. `Store.load` replays `snapshot.jsonl` (optional baseline) then `log.jsonl` in file order into an in-memory graph; every write is one appended JSON line. Layering is strict: model.zig has no I/O and no fold logic; store semantics never leak into cli.zig (writes go through `Store.append`); cli.zig writes output into a caller-owned `ArrayList(u8)`, never stdout — main.zig flushes it, tests assert against it.
 

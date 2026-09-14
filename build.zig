@@ -58,6 +58,17 @@ pub fn build(b: *std.Build) void {
     const cli_test = b.addTest(.{ .root_module = cli_test_mod });
     test_step.dependOn(&b.addRunArtifact(cli_test).step);
 
+    // MCP server tests (mcp_test.zig drives mcp.zig, which dispatches through
+    // cli.zig), wired the same way as cli_test.
+    const mcp_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/mcp_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "tracker", .module = tracker }},
+    });
+    const mcp_test = b.addTest(.{ .root_module = mcp_test_mod });
+    test_step.dependOn(&b.addRunArtifact(mcp_test).step);
+
     // Store-root discovery tests (discover_test.zig drives discover.zig, the
     // module main.zig's findRoot lives in). No `tracker` import needed --
     // discovery is std.Io.Dir-only, no store/CLI dependency.

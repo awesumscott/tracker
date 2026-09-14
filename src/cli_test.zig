@@ -2220,14 +2220,14 @@ test "every verb supports --help/-h and add --help mints no task" {
     var f = try Fixture.init(alloc);
     defer f.deinit();
 
-    // The full dispatch set. Kept in lockstep with the `verb_help` table via the
+    // The full dispatch set. Kept in lockstep with the `verbs` table via the
     // count assertion below, so a new verb without a help entry is caught.
     const verbs = [_][]const u8{
         "init",  "add",  "dep",  "undep",  "in",   "unin",    "arc",          "migrate-arcs", "migrate-shorts",
         "state", "next", "list", "render", "tree", "compact", "archive",      "doc",
-        "show",  "edit", "log",  "stale", "release",
+        "show",  "edit", "log",  "stale", "release", "mcp-serve",
     };
-    try testing.expectEqual(verbs.len, cli.Cli.verb_help.len);
+    try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
     for (verbs) |v| {
         // `trk <verb> --help` prints that verb's synopsis (starts "trk <verb>"),
