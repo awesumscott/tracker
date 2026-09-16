@@ -4115,3 +4115,231 @@ test "a REFUSED compact restores the tombstone index too — no tombstone for a 
     try testing.expect(f.store.lookupTombstone(&gone.text) == .one);
     try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text }));
 }
+
+// --------------------------------------------- tree: graduated arc members
+//
+// 01M29P5T7. The measured incident: `trk tree <arc>` on an arc whose members
+// had all been archived + compacted printed a well-formed one-line tree, which
+// is exactly what a never-sliced arc prints — and a lane was dispatched to
+// "design and slice" work that had already shipped. `show` on a collected id
+// at least said something distinctive; `tree` said something NORMAL.
+//
+// Every test below is paired on purpose. Making absence speak is only a fix if
+// PRESENCE still reads as presence: an arc with graduated members must show
+// them, AND an arc that genuinely has none must still render as genuinely
+// empty. A change satisfying only the first half would swap one
+// indistinguishable pair for another, pointing the other way.
+
+test "tree: an arc whose members were compacted reports them — one with none stays genuinely empty" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Built-and-graduated arc: one live member, two collected ones.
+    const built = mintId();
+    const still_open = mintId();
+    const d1 = ulid.mintAt(io, 6_000_001);
+    const d2 = ulid.mintAt(io, 6_500_001);
+    // Never-sliced arc, and an arc with a live member only. Both are the
+    // negative half: neither may grow a compacted-members block.
+    const bare = mintId();
+    const live_only = mintId();
+    const live_member = mintId();
+
+    try f.store.append(.{ .add = .{ .id = built, .title = "Arc: the reshape" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = built, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = still_open, .title = "the unfinished remainder" } });
+    try f.store.append(.{ .in = .{ .task = still_open, .arc = built, .seq = 2 } });
+    try f.store.append(.{ .add = .{ .id = d1, .title = "D1 the first slice", .short = d1.text[0..9] } });
+    try f.store.append(.{ .in = .{ .task = d1, .arc = built, .seq = 0 } });
+    try f.store.append(.{ .add = .{ .id = d2, .title = "D2 the second slice", .short = d2.text[0..9] } });
+    try f.store.append(.{ .in = .{ .task = d2, .arc = built, .seq = 1 } });
+    try f.store.append(.{ .setState = .{ .id = d1, .state = .archived } });
+    try f.store.append(.{ .setState = .{ .id = d2, .state = .archived } });
+
+    try f.store.append(.{ .add = .{ .id = bare, .title = "Arc: never sliced" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = bare, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = live_only, .title = "Arc: all live" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = live_only, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = live_member, .title = "a live slice" } });
+    try f.store.append(.{ .in = .{ .task = live_member, .arc = live_only, .seq = 0 } });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // The premise of the whole test: the members really are gone from the live
+    // store AND their membership edges went with them. Without this the
+    // positive arm below could be reading live `ins` rows and proving nothing.
+    try testing.expect(f.store.get(d1) == null);
+    try testing.expect(f.store.get(d2) == null);
+    for (f.store.ins.items) |e| try testing.expect(!e.task.eql(d1) and !e.task.eql(d2));
+
+    // POSITIVE: the built arc names its graduated members.
+    try f.run(&.{ "tree", &built.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members (2)") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "D1 the first slice") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "D2 the second slice") != null);
+    // Live members are untouched — the block is an addition, not a replacement.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the unfinished remainder") != null);
+
+    // A graduated member must not be skimmable as a live one: its row carries
+    // the `compacted:` prefix and no `[ ]`/`[x]`-style state marker. Checked by
+    // building the exact row rather than by searching for the title alone,
+    // which would pass on a row rendered like any other tree node.
+    const row1 = try std.fmt.allocPrint(alloc, "compacted: {s}  was archived  D1 the first slice", .{d1.text[0..9]});
+    defer alloc.free(row1);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, row1) != null);
+    const row2 = try std.fmt.allocPrint(alloc, "compacted: {s}  was archived  D2 the second slice", .{d2.text[0..9]});
+    defer alloc.free(row2);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, row2) != null);
+    try testing.expectEqual(@as(usize, 2), countOccurrences(f.out.items, "compacted: "));
+
+    // NEGATIVE 1: an arc that was genuinely never sliced still renders as a
+    // bare one-line tree. This is the arm a block printed unconditionally (or a
+    // membership filter matching too widely) fails.
+    try f.run(&.{ "tree", &bare.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc: never sliced") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted: ") == null);
+
+    // NEGATIVE 2: an arc with live members and no graduated ones likewise says
+    // nothing about compaction — the block appears for the arc that HAS them,
+    // not for every arc.
+    try f.run(&.{ "tree", &live_only.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "a live slice") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members") == null);
+}
+
+test "tree: a COMPACTED root answers COMPACTED with its graduated members, not \"no task matches\"" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Minted far apart in time so a short prefix of one is not a prefix of
+    // another (a ULID's first 10 chars are its ms stamp).
+    const arc = ulid.mintAt(io, 7_000_001);
+    const member = ulid.mintAt(io, 7_500_001);
+    const live_arc = mintId();
+
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc: finished and graduated", .short = arc.text[0..9] } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = member, .title = "its one slice", .short = member.text[0..9] } });
+    try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 0 } });
+    try f.store.append(.{ .setState = .{ .id = member, .state = .archived } });
+    try f.store.append(.{ .setState = .{ .id = arc, .state = .archived } });
+    try f.store.append(.{ .add = .{ .id = live_arc, .title = "Arc: still here" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = live_arc, .declared = true } });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+    try testing.expect(f.store.get(arc) == null);
+
+    // POSITIVE: the same three-way verdict `show` gives — exit 2, COMPACTED —
+    // and the arc's graduated members under the record, so the reader learns
+    // both that the arc was real and what was in it.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "tree", arc.text[0..9] }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc: finished and graduated") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members (1)") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "its one slice") != null);
+
+    // NEGATIVE 1: an id that never existed is still absent — error.NoSuchId,
+    // no COMPACTED banner. Without this the arm above would pass on a lookup
+    // that says yes to anything.
+    try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "tree", never_id }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") == null);
+
+    // NEGATIVE 2: a LIVE arc still renders as a live tree, exit 0.
+    try f.run(&.{ "tree", &live_arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc: still here") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") == null);
+}
+
+test "tree --json: compacted_members is always at the root, empty when there are none" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const live = mintId();
+    const prereq = mintId();
+    const gone = ulid.mintAt(io, 8_000_001);
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc J" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = live, .title = "live J" } });
+    try f.store.append(.{ .in = .{ .task = live, .arc = arc, .seq = 1 } });
+    try f.store.append(.{ .add = .{ .id = prereq, .title = "prereq J" } });
+    try f.store.append(.{ .dep = .{ .from = live, .to = prereq } });
+    try f.store.append(.{ .add = .{ .id = gone, .title = "graduated J", .short = gone.text[0..9] } });
+    try f.store.append(.{ .in = .{ .task = gone, .arc = arc, .seq = 0 } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // POSITIVE: one entry, carrying the `"compacted":true` discriminator the
+    // live node shape never emits, so a reader branches on a key rather than on
+    // a missing one.
+    try f.run(&.{ "tree", &arc.text, "--json" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"compacted_members\":[{\"compacted\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"title\":\"graduated J\"") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"was\":\"archived\"") != null);
+    // Root only: a child's `children` is its prereq list, never a place a
+    // graduated arc member belongs.
+    try testing.expectEqual(@as(usize, 1), countOccurrences(f.out.items, "\"compacted_members\":"));
+
+    // NEGATIVE: a node with no graduated members still carries the key, with an
+    // EMPTY array — the schema is stable, and "none" is stated rather than
+    // inferred from a key that is not there.
+    try f.run(&.{ "tree", &prereq.text, "--json" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"compacted_members\":[]") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"compacted\":true") == null);
+}
+
+test "show: an arc prereq's progress counts its compacted members separately, and stays quiet with none" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // `dependent` needs two arcs: `drained` was fully built and compacted,
+    // `fresh` has a live member and nothing graduated.
+    const dependent = mintId();
+    const drained = mintId();
+    const fresh = mintId();
+    const fresh_member = mintId();
+    const g1 = ulid.mintAt(io, 9_000_001);
+    const g2 = ulid.mintAt(io, 9_500_001);
+
+    try f.store.append(.{ .add = .{ .id = dependent, .title = "needs both" } });
+    try f.store.append(.{ .add = .{ .id = drained, .title = "Arc drained" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = drained, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = fresh, .title = "Arc fresh" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = fresh, .declared = true } });
+    try f.store.append(.{ .dep = .{ .from = dependent, .to = drained } });
+    try f.store.append(.{ .dep = .{ .from = dependent, .to = fresh } });
+    try f.store.append(.{ .add = .{ .id = fresh_member, .title = "fresh slice" } });
+    try f.store.append(.{ .in = .{ .task = fresh_member, .arc = fresh, .seq = 0 } });
+    for ([_]Ulid{ g1, g2 }) |g| {
+        try f.store.append(.{ .add = .{ .id = g, .title = "drained slice", .short = g.text[0..9] } });
+        try f.store.append(.{ .in = .{ .task = g, .arc = drained, .seq = 0 } });
+        try f.store.append(.{ .setState = .{ .id = g, .state = .archived } });
+    }
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // POSITIVE: the drained arc reads `(0/0 done, +2 compacted)` — the bare
+    // `(0/0 done)` it printed before is what an unsliced arc prints too.
+    try f.run(&.{ "show", &dependent.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc drained  (0/0 done, +2 compacted)") != null);
+    // NEGATIVE, in the SAME output: the arc with nothing graduated keeps the
+    // plain line. A suffix appended unconditionally fails here.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc fresh  (0/1 done)") != null);
+    try testing.expectEqual(@as(usize, 1), countOccurrences(f.out.items, "compacted)"));
+
+    // The machine view states BOTH, because a stable schema is worth more to a
+    // reader that branches than a quiet line is.
+    try f.run(&.{ "show", &dependent.text, "--json" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"arc_progress\":{\"done\":0,\"total\":0,\"compacted\":2}") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"arc_progress\":{\"done\":0,\"total\":1,\"compacted\":0}") != null);
+}

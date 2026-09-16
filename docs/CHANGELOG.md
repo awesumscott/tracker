@@ -22,8 +22,29 @@ before it existed from `git log --all -p -- .tracker/log.jsonl` — the method t
 measured at ~31 s / ~162 MB on a 10,574-commit repo, hence run once and persisted rather than per query.
 A refused compact rolls the index back with the snapshot and log. Sabotage-proved in both directions
 (no-op the write → all 6 new tests red; drop the rebuild's live-guard → the live-task negative red; skip
-the rollback → the refusal test red). Not fixed here, same root cause: `trk tree` still renders an arc
-whose members were compacted as empty (`01M29P5T7`). `zig build test`: **251 → 257**.
+the rollback → the refusal test red). `zig build test`: **251 → 257**.
+
+**`trk tree` names an arc's graduated members instead of rendering the arc EMPTY (01M29P5T7).** The same
+asymmetry one level up, and the one that actually cost a dispatch: `show` on a collected id at least
+answered something distinctive, while `tree` on an arc whose members had all been archived and compacted
+answered with a well-formed one-line tree — indistinguishable from a never-sliced arc. Measured 2026-09-11
+on the Enix tracker: a lane was briefed to "design and slice" an arc that had already been built, closed
+and compacted. Root cause confirmed by reading, not inherited: `renderTree`/`treeJson` apply no state
+filter (an archived member still renders, marked `[a]`), so an arc can only read empty once
+`serializeState`'s `gc_set` has dropped the `in` edges along with the members — which makes this a DISPLAY
+fix over data the tombstone index already keeps. `tree` now prints `compacted members (N)` under the live
+children, one `compacted: <short>  was <reason>  <title>` row each — no state marker and no connector, so a
+graduated member cannot be skim-read as a live one — with `compacted_members` at the root of `--json`
+(always present, possibly empty, entries keyed `"compacted":true`). No `--archived` flag: a flag leaves the
+silence exactly where it did the damage, since the misled reader did not know to ask. `trk tree` on a
+COMPACTED root now gives `show`'s verdict — the record, its graduated members, exit **2** — instead of "no
+task matches". `show`'s own sections were checked and are the same shape; only the task→arc direction is
+recoverable, so its arc-prereq line reads `(0/0 done, +N compacted)` (`--json`: `arc_progress.compacted`,
+always stated) while a compacted dependent and a live task's compacted arc stay unrecoverable — the index
+records no `needs` edges. Sabotage-proved in BOTH directions: no-op the block → the two positive tests red;
+delete the empty-guard so it prints for every arc → the negative test red; fall back to `NoSuchId` on a
+compacted root, make the `show` suffix unconditional, drop the JSON key → one distinct test red each.
+`zig build test`: **257 → 261**.
 
 ## 2026-09-14
 
