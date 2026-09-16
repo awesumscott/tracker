@@ -219,7 +219,7 @@ test "tools/list: one tool per exposed verb, all requiring tree, readOnlyHint fr
         try testing.expectEqualStrings("tree", schema.get("required").?.array.items[0].string);
         try testing.expect(!schema.get("additionalProperties").?.bool);
         const ro = t.object.get("annotations").?.object.get("readOnlyHint").?.bool;
-        const want_ro = for ([_][]const u8{ "next", "list", "tree", "show", "log", "stale", "doc_list", "doc_resolve" }) |rn| {
+        const want_ro = for ([_][]const u8{ "next", "list", "tree", "show", "log", "stale", "tombstones", "doc_list", "doc_resolve" }) |rn| {
             if (std.mem.eql(u8, rn, name)) break true;
         } else false;
         try testing.expectEqual(want_ro, ro);

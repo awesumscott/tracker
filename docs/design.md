@@ -284,8 +284,8 @@ than editing prose anyway, and the point). This is a real, owned cost: the "open
 affordance is gone, replaced by a command.
 
 **The merge semantics ship with the store, inside `.tracker/.gitattributes`** (2026-08-20). The whole merge
-model rests on git attributes — `log.jsonl` union-merged, `snapshot.jsonl` and `quarantine.jsonl` left on the
-default text driver — and nothing wrote them, so every repo re-derived them by hand or (measured across six
+model rests on git attributes — `log.jsonl` and `tombstones.jsonl` union-merged (both append-only, per-line
+independent), `snapshot.jsonl` and `quarantine.jsonl` left on the default text driver — and nothing wrote them, so every repo re-derived them by hand or (measured across six
 of seven repos on one machine) simply didn't have them, leaving the log conflicting instead of unioning
 under live fan-out. `trk init` now writes them, and the placement is the ruling: **inside `.tracker/`, not at
 the repo root**. Git resolves attributes per directory and the file *nearest the path wins*, so pins there
@@ -309,16 +309,17 @@ patch someone has to remember to re-add elsewhere. `trk init` writes it alongsid
 (never overwritten; `--no-gitignore` opts out for a repo managing ignores centrally), covering
 `backup/` and a crash-orphaned `atomicWrite` temp file (`.<name>.tmp.<hex>`, left behind only if a
 process dies between the temp write and its rename). `log.jsonl`, `snapshot.jsonl`, `config.json`,
-`.gitattributes` and `quarantine.jsonl` are deliberately NOT listed — all five are meant to be
-committed, so an ignore rule that swept up the store directory itself (or a glob wide enough to catch
+`.gitattributes`, `quarantine.jsonl` and `tombstones.jsonl` are deliberately NOT listed — all six are meant
+to be committed, so an ignore rule that swept up the store directory itself (or a glob wide enough to catch
 them) would be a data-loss footgun of a different kind. Re-running `init` in a repo that predates this
 file is the migration: idempotent-by-construction, it backfills the missing `.gitignore` without
 touching anything else already there (asserted in `cli_test.zig`).
 
 **The check is narrow on purpose.** `compact` warns (stderr) when a pin is missing, because it is the verb
 that *creates* the two files that must never be union-merged. It cannot verify what is actually in effect:
-trk is std-only and never shells out to git (`discover.zig` reads `.git` as a plain file for exactly this
-reason), and attributes resolve through parent directories, `.git/info/attributes` and `core.attributesFile`
+this path never shells out to git — `discover.zig` reads `.git` as a plain file for exactly this reason, and
+the two verbs that DO spawn it (`stale`, `tombstones --rebuild`) each do so for a question git alone can
+answer — and attributes resolve through parent directories, `.git/info/attributes` and `core.attributesFile`
 — reimplementing that resolution would be worse than not checking. So the warning claims only what trk can
 see about its OWN file ("absent, and here is what it would do"), never "your repo is wrong": a repo pinning
 these at the root is correct too, just not visibly so from here. The pins are matched as whole lines, since
@@ -581,6 +582,53 @@ The merge model is **owned** here, because it gates how parallel agents may touc
     were never folded, and this compaction truncates them regardless. That hazard is bought off by the
     standing operational rule, not by a rescan: **never compact while fan-out worktrees are in flight** — a
     lane whose base predates the compact will union-merge the GC'd events straight back in.
+- **Compaction leaves a TOMBSTONE, so a compacted id still resolves** (2026-09-16, task `01M2M2K1J`).
+  Compaction is the only thing in trk that destroys an id: `serializeState` skips every `isCollectable`
+  task and every edge touching one, then the log is truncated, and afterwards nothing under `.tracker/`
+  mentions the id at all. `trk show <that id>` therefore answered `no task matches` — *the same words, and
+  the same exit code, as for an id that never existed*. Those are opposite facts. The expensive direction
+  is the one that actually bit: a wrong "dangling" verdict invites someone to "fix" a citation that was
+  correct. Measured on the Enix tracker 2026-09-12 — `show` called `01M1RQ7XK` and `01M0QJWJ7` dangling
+  while `scripts/dangling-tracker-id-lint.sh`, which knows the difference, scanned 29,792 citations and
+  found 11,207 live, 18,585 historical and **0** dangling.
+  - **The information was always recoverable; the store just wasn't the one keeping it.** That lint
+    recovers it from `git log --all -p -- .tracker/log.jsonl` — the pre-compact log lines survive in git
+    even though the working tree no longer has them. Correct, and unusable as a lookup: measured on a
+    repo where 10,574 commits touch that path, that scan is ~31 s and ~162 MB of diff output to answer one
+    yes/no question. So the store keeps its own record instead. `compact` appends one line per collected
+    task to `.tracker/tombstones.jsonl` — id, frozen short id, title, why it left (`archived`/`dropped`/
+    `ghost`), the arcs it belonged to, when — **before** any destructive write, because that is the only
+    moment the information still exists; `load` folds the file into `Store.tombstones`, and a lookup is a
+    hash probe. Deliberately no body: the index is read on every command, and the body is still in git
+    history and in `.tracker/backup/`.
+  - **Three answers, three exit codes.** `trk show` exits `0` for a live task, **`2`** for a compacted one
+    (the record is printed under a `COMPACTED` banner, in a shape that cannot be skim-read as a live task),
+    and `1` for an id nothing has ever heard of. Collapsing `2` into `0` would tell the dangling-id lint
+    that a graduated id is live; collapsing it into `1` puts it back where it started. `--json` carries a
+    `"compacted": true` key the live view never emits, so a machine reader branches on a key rather than on
+    the absence of one. `--body` is the exception: it is the read half of a pipe into `trk edit
+    --replace-body -`, and a tombstone has no body, so stdout stays **empty** (which that flag refuses) and
+    the explanation goes to stderr — never plausible-looking body bytes.
+  - **This does not un-GC anything.** The task stays out of the graph, out of `next`, out of every view.
+    The index is the difference between forgetting a task and forgetting *that it ever was*.
+  - **`trk tombstones --rebuild` is the one-shot migration** for ids compacted before the index existed —
+    the lint's own git-history scan, run once and persisted rather than once per question. It recovers
+    title and end-of-life state from the `add`/`setTitle`/`setState` events themselves (largest `ts` wins,
+    so the answer does not depend on git's walk order), skips anything still live, and is idempotent. It
+    uses `--all` — unlike `trk stale`, which is deliberately ancestry-only — because the question is "did
+    this id ever exist", and an id minted on an unmerged branch still existed; a false *live* would be
+    dangerous, a false *existed* is not, since the record says plainly that it is gone. CLI-only: it is
+    not an MCP tool, both because an orchestrator runs it once and because `readOnlyHint` is derived from
+    a tool's fixed argv and could not have seen a `rebuild: true` argument coming.
+  - **A refused compact rolls the index back with everything else.** The tombstones are written before the
+    round-trip self-verify can fail, so `CompactVerifyFailed` restores `tombstones.jsonl` alongside
+    `snapshot.jsonl`/`log.jsonl`. The one error this mechanism must never make is the mirror of the one it
+    fixes: a tombstone for a task that is still live would make `show` report live work as gone.
+  - **Known, not fixed here:** `trk tree <arc>` renders an arc whose members were compacted as EMPTY
+    (task `01M29P5T7`) — the same root cause, since `serializeState` drops the `in` edges along with the
+    member tasks, and `renderTree` applies no state filter of its own (an archived-but-not-yet-compacted
+    member still renders fine). The tombstone records each task's arc memberships, so the data that fix
+    needs is now in the store.
 - **The snapshot carries a PER-TASK watermark, and a log event older than it is withheld and reported**
   (2026-08-20, task `01M0EM3G6`). `compact` stamps each `add` it writes with `wm` — the `ts` of the newest
   event folded into the state being written (carried forward, so a task nothing has touched since an earlier

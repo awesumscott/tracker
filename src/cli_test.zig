@@ -73,6 +73,18 @@ const Fixture = struct {
         if (self.c.run(args)) |_| return error.TestUnexpectedSuccess else |e| return e;
     }
 
+    /// Drop the in-memory fold and re-read the store from disk — what the NEXT
+    /// `trk` invocation sees. Needed after `compact`, whose GC is a property of
+    /// the files it wrote and NOT of the process that wrote them: the compacting
+    /// process still holds every task it just removed, so asserting against it
+    /// would prove nothing about what a reader finds. `self.c.store` keeps
+    /// pointing at the same heap slot, so the Cli follows.
+    fn reopen(self: *Fixture) !void {
+        self.store.deinit();
+        self.store.* = Store.open(self.alloc, io, self.tmp.dir);
+        try self.store.load();
+    }
+
     fn deinit(self: *Fixture) void {
         self.c.prereq_scratch.deinit(self.alloc);
         self.alloc.destroy(self.c);
@@ -2225,7 +2237,7 @@ test "every verb supports --help/-h and add --help mints no task" {
     const verbs = [_][]const u8{
         "init",  "add",  "dep",  "undep",  "in",   "unin",    "arc",          "migrate-arcs", "migrate-shorts",
         "state", "next", "list", "render", "tree", "compact", "archive",      "doc",
-        "show",  "edit", "log",  "stale", "release", "mcp-serve",
+        "show",  "edit", "log",  "stale", "release", "tombstones",   "mcp-serve",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -3824,4 +3836,282 @@ test "archive: decision-guard reporting labels a genuine marker line marker-shap
     try testing.expect(std.mem.indexOf(u8, f.warn.items, "marker-shaped") != null);
     try testing.expectEqual(tracker.State.done, f.store.get(meta).?.state);
     try testing.expectEqual(tracker.State.done, f.store.get(real).?.state);
+}
+
+// ----------------------------------------------------------- compacted-id resolution (01M2M2K1J)
+//
+// The defect these close: `compact` is the only thing that destroys an id, and
+// afterwards `trk show` answered "no task matches" — the SAME words it gives an
+// id that never existed. Every arm below is therefore PAIRED: whatever proves a
+// compacted id now resolves sits beside a proof that a genuinely unknown id
+// still does not, or the "fix" is just a lookup that says yes to everything.
+
+/// A full-length, well-formed ULID that no fixture ever mints: all-Z after the
+/// leading `01`, so it cannot collide with `mintId`'s stream. The NEGATIVE half
+/// of every arm below — the id that must keep reporting missing.
+const never_id = "01ZZZZZZZZZZZZZZZZZZZZZZZZ";
+
+test "show: a COMPACTED id resolves as COMPACTED — a live one stays live and an unknown one stays missing" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const live = mintId();
+    // Minted far from the others in TIME on purpose: a ULID's first 10
+    // characters are its millisecond stamp, so two ids minted a millisecond
+    // apart share a 9-char prefix. A short prefix of a task minted next to the
+    // live ones would be ambiguous against the LIVE set and never reach the
+    // tombstone lookup at all — the arm would pass for the wrong reason.
+    const gone = ulid.mintAt(io, 5_000_001);
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc root" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = gone, .title = "graduated work", .short = gone.text[0..9] } });
+    try f.store.append(.{ .in = .{ .task = gone, .arc = arc } });
+    try f.store.append(.{ .add = .{ .id = live, .title = "still open" } });
+    // `archived` is what `trk archive` leaves behind, and what compact collects.
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+
+    try f.run(&.{"compact"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "entombed") != null);
+    try f.reopen();
+
+    // The task really is GONE from the live store — otherwise the arm below
+    // would be resolving a live task and proving nothing.
+    try testing.expect(f.store.get(gone) == null);
+
+    // POSITIVE: the compacted id resolves, by its frozen SHORT id (the shape
+    // citations actually use), and says COMPACTED.
+    const short = gone.text[0..9];
+    const e = f.runExpectErr(&.{ "show", short });
+    try testing.expectEqual(@as(anyerror, error.CompactedId), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "graduated work") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "archived") != null);
+    // The arc it belonged to is on the record — the membership edge compact
+    // deleted along with the task.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, &arc.text) != null);
+    // And it must not read as a live task at a glance.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "prereqs (needs)") == null);
+
+    // Same answer by full id and by a bare prefix of it.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text }));
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", gone.text[0..12] }));
+
+    // NEGATIVE 1: an id that was never real is STILL missing. Without this the
+    // arm above would pass just as well on a lookup that says yes to anything.
+    const miss = f.runExpectErr(&.{ "show", never_id });
+    try testing.expectEqual(@as(anyerror, error.NoSuchId), miss);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") == null);
+
+    // NEGATIVE 2: a LIVE task is untouched — no tombstone, no COMPACTED banner.
+    try f.run(&.{ "show", &live.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "still open") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "prereqs (needs)") != null);
+}
+
+test "compact entombs ONLY what it collects — a live task never gets a tombstone" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const live = mintId();
+    const archived = mintId();
+    const dropped = mintId();
+    const ghost = mintId();
+    try f.store.append(.{ .add = .{ .id = live, .title = "live" } });
+    try f.store.append(.{ .add = .{ .id = archived, .title = "archived one" } });
+    try f.store.append(.{ .add = .{ .id = dropped, .title = "dropped one" } });
+    try f.store.append(.{ .setState = .{ .id = archived, .state = .archived } });
+    try f.store.append(.{ .setState = .{ .id = dropped, .state = .dropped } });
+    // An id with events but no `add` anywhere: a ghost, the third collectable
+    // class. Its `open` state is a default, not a judgment — so the record must
+    // say "ghost", never "open".
+    try f.store.append(.{ .setBody = .{ .id = ghost, .body = "orphan" } });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    try testing.expectEqual(@as(usize, 3), f.store.tombstones.items.len);
+    // The one that matters: the LIVE task must not be in the index. A tombstone
+    // for a live id would make `show` report a live task as gone — the same
+    // class of wrong verdict, pointing the other way.
+    try testing.expect(f.store.lookupTombstone(&live.text) == .none);
+
+    switch (f.store.lookupTombstone(&archived.text)) {
+        .one => |tb| try testing.expectEqualStrings("archived", tb.reason),
+        else => return error.TestExpectedTombstone,
+    }
+    switch (f.store.lookupTombstone(&dropped.text)) {
+        .one => |tb| try testing.expectEqualStrings("dropped", tb.reason),
+        else => return error.TestExpectedTombstone,
+    }
+    switch (f.store.lookupTombstone(&ghost.text)) {
+        .one => |tb| try testing.expectEqualStrings("ghost", tb.reason),
+        else => return error.TestExpectedTombstone,
+    }
+    try testing.expect(f.store.lookupTombstone(never_id) == .none);
+
+    // The listing verb reports the same three, and only those.
+    try f.run(&.{"tombstones"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "3 compacted task(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, &live.text) == null);
+}
+
+test "show --json/--body on a compacted id: a machine-readable flag, and an EMPTY stdout for the pipe" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    const live = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "graduated", .body = "a real body" } });
+    try f.store.append(.{ .add = .{ .id = live, .title = "kept", .body = "live body" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // POSITIVE: --json carries a key the live view never emits.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--json" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"compacted\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "graduated") != null);
+    // NEGATIVE: a live task's --json must NOT carry it, or the flag is noise.
+    try f.run(&.{ "show", &live.text, "--json" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted") == null);
+
+    // POSITIVE: `--body` is the read half of `... | trk edit --replace-body -`.
+    // A tombstone has no body, so stdout stays EMPTY (which that flag refuses)
+    // and the explanation goes to stderr — never plausible body bytes.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--body" }));
+    try testing.expectEqual(@as(usize, 0), f.out.items.len);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "COMPACTED") != null);
+    // NEGATIVE: a live task's --body still emits its bytes, on stdout.
+    try f.run(&.{ "show", &live.text, "--body" });
+    try testing.expectEqualStrings("live body\n", f.out.items);
+}
+
+test "show: a prefix matching two COMPACTED ids is ambiguous, not silently one of them" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Two ids one millisecond apart share their first 9 timestamp characters.
+    const a = ulid.mintAt(io, 3_000_001);
+    const b = ulid.mintAt(io, 3_000_002);
+    try f.store.append(.{ .add = .{ .id = a, .title = "first gone" } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "second gone" } });
+    try f.store.append(.{ .setState = .{ .id = a, .state = .archived } });
+    try f.store.append(.{ .setState = .{ .id = b, .state = .archived } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    const shared = a.text[0..9];
+    try testing.expectEqualStrings(shared, b.text[0..9]); // the premise, asserted
+    const e = f.runExpectErr(&.{ "show", shared });
+    try testing.expectEqual(@as(anyerror, error.AmbiguousId), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "first gone") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "second gone") != null);
+
+    // The unambiguous halves still resolve to the right record.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &a.text }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "first gone") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "second gone") == null);
+}
+
+test "tombstones --rebuild: recovers an id compacted BEFORE the index existed, and only a real one" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    const live = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "pre-index work", .short = gone.text[0..9] } });
+    try f.store.append(.{ .add = .{ .id = live, .title = "kept" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+
+    // A real repo at the store root, with the log COMMITTED — the only place a
+    // compacted id survives once the working tree no longer has it.
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "tracker log before the compact" });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // Simulate the PRE-INDEX era: the compact happened, but no tombstone was
+    // ever written for it. That is the state every already-compacted id in a
+    // real repo is in, and it is this test's own RED baseline — asserted, not
+    // assumed, one line below.
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstones.jsonl");
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 0), f.store.tombstones.items.len);
+    try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "show", &gone.text }));
+
+    // The recovery.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 new tombstone(s) recorded") != null);
+
+    // POSITIVE: the same citation that reported missing one call ago now
+    // resolves, with the title recovered out of the history.
+    const e = f.runExpectErr(&.{ "show", &gone.text });
+    try testing.expectEqual(@as(anyerror, error.CompactedId), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "pre-index work") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "git-history") != null);
+    // The state at the end of its life, not the state it was born in.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "archived") != null);
+
+    // NEGATIVE 1: a never-existed id is NOT recovered — a history scan that
+    // resolved anything id-shaped would be worse than no scan at all.
+    try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "show", never_id }));
+    // NEGATIVE 2: the LIVE task was in that same history and must NOT have been
+    // entombed — a tombstone for it would make `show` call a live task gone.
+    try testing.expectEqual(@as(usize, 1), f.store.tombstones.items.len);
+    try testing.expect(f.store.lookupTombstone(&live.text) == .none);
+    try f.run(&.{ "show", &live.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") == null);
+
+    // Idempotent: a second run records nothing new.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "0 new tombstone(s) recorded") != null);
+}
+
+test "a REFUSED compact restores the tombstone index too — no tombstone for a task that is still live" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const keep = mintId();
+    const gone = mintId();
+    try f.store.append(.{ .add = .{ .id = keep, .title = "Keep", .body = "keep's real body" } });
+    try f.store.append(.{ .add = .{ .id = gone, .title = "Gone" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+
+    // Sabotage the round-trip self-verify: the compact is REFUSED and the
+    // pre-compact files restored. The tombstone for `gone` was already written
+    // by then (it is durable BEFORE the destructive rewrite), so if it is not
+    // rolled back with the rest, the store is left claiming a task is compacted
+    // while it is still live and still archivable.
+    f.store.test_sabotage_body = .{ .id = keep, .replacement = "CORRUPTED" };
+    try testing.expectEqual(@as(anyerror, error.CompactVerifyFailed), f.runExpectErr(&.{"compact"}));
+
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 0), f.store.tombstones.items.len);
+    try testing.expect(f.store.get(gone) != null); // still live, as the refusal promises
+    // ...and `show` still answers as a LIVE task, not as a compacted one.
+    try f.run(&.{ "show", &gone.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") == null);
+
+    // The POSITIVE half: with the sabotage cleared, the same compact DOES
+    // entomb it — so the arm above measures the rollback, not a write path that
+    // never fires in the first place.
+    f.store.test_sabotage_body = null;
+    try f.run(&.{"compact"});
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 1), f.store.tombstones.items.len);
+    try testing.expect(f.store.lookupTombstone(&gone.text) == .one);
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text }));
 }
