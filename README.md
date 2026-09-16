@@ -78,10 +78,15 @@ discovery).
 
 ## Commands
 
-`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · show · next · list · render · tree · log · stale · doc · compact · archive · init · mcp-serve`
+`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · show · next · list · render · tree · log · stale · doc · compact · archive · tombstones · init · mcp-serve`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.
+
+`trk show` has three exit codes, because it can give three different answers: **0** the task is live,
+**2** the id existed and `trk compact` graduated it out of the store (its record is printed, headed
+`COMPACTED`), **1** no such id, ever. Before the tombstone index the middle case was reported as the
+last one — which is how a perfectly good historical citation gets "fixed". See `trk tombstones --help`.
 
 ## MCP server
 

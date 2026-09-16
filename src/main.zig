@@ -112,6 +112,13 @@ pub fn main(init: std.process.Init) !u8 {
     if (result) |_| {
         return 0;
     } else |e| {
+        // `trk show <compacted-id>` gets its OWN exit status (01M2M2K1J). The
+        // id RESOLVED — in the tombstone index rather than the live store — and
+        // its record is already in `out`, flushed above. That is neither a
+        // success (a caller branching on 0 would read a graduated task as live)
+        // nor a plain failure (1 is "no such id", the exact wrong verdict this
+        // closes). Three answers, three statuses: 0 live, 2 compacted, 1 gone.
+        if (e == error.CompactedId) return 2;
         // CliError variants already emitted a clean message into `out` (flushed
         // above). For anything unexpected (OOM, write failure) emit a terse note
         // to stderr so it isn't silent.

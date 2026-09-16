@@ -82,6 +82,14 @@ pub const gitattributes_text =
     \\# reason and to keep the pair symmetric.
     \\snapshot.jsonl merge=text
     \\quarantine.jsonl merge=text
+    \\#
+    \\# The tombstone index: one append-only line per task `compact` physically
+    \\# GC'd, so a citation of a compacted id still RESOLVES (`trk show`) instead
+    \\# of reading as never-existed. Per-line independent and append-only exactly
+    \\# like log.jsonl, so union — two branches that each carry a compact combine
+    \\# their tombstones instead of one erasing the other's. A duplicate line is
+    \\# harmless: the reader keys by id, last line wins.
+    \\tombstones.jsonl merge=union
     \\
 ;
 
@@ -91,16 +99,16 @@ pub const gitattributes_text =
 /// `.gitignore` never mentioning it, and needs no git-root discovery since it
 /// is relative to this file's own directory. Only `backup/` (see
 /// `backup_subdir`) and a crash-orphaned atomic-write temp file are listed —
-/// `log.jsonl`, `snapshot.jsonl`, `config.json`, `.gitattributes` and
-/// `quarantine.jsonl` are all meant to be committed, so none of them belongs
-/// here.
+/// `log.jsonl`, `snapshot.jsonl`, `config.json`, `.gitattributes`,
+/// `quarantine.jsonl` and `tombstones.jsonl` are all meant to be committed, so
+/// none of them belongs here.
 pub const gitignore_name = ".gitignore";
 pub const gitignore_text =
     \\# Written by `trk init`. Kept INSIDE .tracker/ deliberately: git resolves
     \\# ignores per directory, so this is immune to a root .gitignore never
-    \\# mentioning it. log.jsonl, snapshot.jsonl, config.json, .gitattributes
-    \\# and quarantine.jsonl are all meant to be committed — nothing here
-    \\# ignores them.
+    \\# mentioning it. log.jsonl, snapshot.jsonl, config.json, .gitattributes,
+    \\# quarantine.jsonl and tombstones.jsonl are all meant to be committed —
+    \\# nothing here ignores them.
     \\#
     \\# compact's pre-rewrite backups (Config.backup_retain bounds how many it
     \\# keeps, but even one full log+snapshot copy is a permanent untracked
@@ -123,6 +131,40 @@ pub const gitignore_text =
 /// (Unioning it would NOT resurrect anything — nothing replays this file; that
 /// hazard belongs to `log.jsonl`.)
 pub const quarantine_name = "quarantine.jsonl";
+
+/// The TOMBSTONE INDEX: one line per task `compact` physically GC'd out of the
+/// store (01M2M2K1J).
+///
+/// THE GAP IT CLOSES. `compact` is the only thing that destroys an id:
+/// `serializeState` skips every `isCollectable` task (dropped/archived/ghost)
+/// and every edge touching one, then the log is truncated. After that the id is
+/// in NO file under `.tracker/` — so `trk show <id>` answers "no task matches",
+/// which is byte-identical to the answer for an id that never existed. Those
+/// are opposite facts and the difference matters: a wrong "dangling" verdict
+/// invites someone to "fix" a citation that was correct. Measured 2026-09-12 in
+/// the Enix repo: `show` called 01M1RQ7XK and 01M0QJWJ7 dangling while
+/// `scripts/dangling-tracker-id-lint.sh` scanned 29,792 citations and found
+/// 11,207 live, 18,585 historical and 0 dangling.
+///
+/// WHERE THE LINT RECOVERED IT, AND WHY THAT IS NOT ENOUGH. The lint's
+/// `build_hist_set` runs `git log --all -p -- .tracker/log.jsonl` and greps
+/// every id-shaped string out of the whole diff — the pre-compact log lines
+/// survive in git even though the working tree no longer has them. It is
+/// correct and it is the proof the information is recoverable, but it is not a
+/// mechanism an interactive verb can use: measured on the Enix repo (10,574
+/// commits touch that path) it is ~31 s and ~162 MB of diff output for a single
+/// yes/no question.
+///
+/// SO THE STORE KEEPS ITS OWN RECORD. `compact` appends one line here for each
+/// task it collects, BEFORE anything destructive happens, and `load` folds the
+/// file into `Store.tombstones`. A lookup is then a hash probe, and the answer
+/// is a real record (title, why it left, arcs it belonged to, when) rather than
+/// a bare "it existed". Unlike `quarantine_name` this file IS read back by trk.
+///
+/// Bounded by construction: one short line per task ever collected, never per
+/// event, and it carries no bodies.
+pub const tombstones_name = "tombstones.jsonl";
+
 /// Subdirectory (under `.tracker/`) holding `compact`'s pre-rewrite backups,
 /// one run dir per compact (`backupDirName`), bounded by
 /// `Config.backup_retain` (see `Store.compact`, `writeBackup`,
@@ -220,6 +262,44 @@ pub const Superseded = struct {
     id: Ulid,
     /// How many of that task's events were withheld.
     events: usize,
+};
+
+/// One record in the tombstone index (`tombstones_name`): a task that WAS real
+/// and that `compact` physically GC'd out of the store. Enough to answer "this
+/// id existed, here is what it was, here is why it is gone" — deliberately NOT
+/// the whole task: no body, because the index must stay small enough to load on
+/// every command, and the body is still recoverable from git history and from
+/// `.tracker/backup/`.
+pub const Tombstone = struct {
+    id: Ulid,
+    /// The frozen short id it displayed as, when it had one. Citations in the
+    /// corpus are overwhelmingly SHORT ids, so a tombstone that could only be
+    /// found by its full 26-char id would miss the case this exists for.
+    short: ?[]const u8 = null,
+    title: []const u8 = "",
+    /// Why it left the live store: `"archived"`, `"dropped"`, `"ghost"`, or
+    /// `"unknown"` for a record recovered from history that carried no
+    /// `setState` (see `Cli.cmdTombstones`'s rebuild).
+    reason: []const u8 = "unknown",
+    /// The arcs it was a member of when it was collected. Empty for a recovered
+    /// record — a history scan reconstructs tasks, not edges.
+    arcs: []const Ulid = &.{},
+    /// When `compact` collected it (ms epoch); `0` = unknown (recovered).
+    ts: i64 = 0,
+    /// `"compact"` — written at the moment of collection — or `"git-history"`,
+    /// recovered after the fact by `trk tombstones --rebuild` for an id that was
+    /// compacted away before this index existed.
+    src: []const u8 = "compact",
+};
+
+/// What `Store.lookupTombstone` found for one citation.
+pub const TombstoneMatch = union(enum) {
+    /// No tombstone matches — genuinely nothing the store has ever heard of.
+    none,
+    one: *const Tombstone,
+    /// The prefix matches this many tombstones; the caller must say so rather
+    /// than pick one (same contract as `Cli.resolve`'s `AmbiguousId`).
+    ambiguous: usize,
 };
 
 pub const Store = struct {
@@ -346,6 +426,15 @@ pub const Store = struct {
     /// call. See `compact`, `fingerprintLiveTasks`. gpa-owned; freed in
     /// `deinit`.
     diverged_on_verify: std.ArrayList(Ulid) = .empty,
+    /// The tombstone index, folded from `tombstones_name` by `load` — every
+    /// task `compact` physically GC'd (01M2M2K1J). Sorted by id after load so
+    /// listings are stable. The ArrayList is gpa-owned (freed in `deinit`);
+    /// every string inside it is arena-owned. See `tombstones_name`.
+    tombstones: std.ArrayList(Tombstone) = .empty,
+    /// id -> index into `tombstones`. Gives O(1) exact lookup, and is how the
+    /// fold does last-line-wins (a union-merged index can carry the same id
+    /// twice) and how `compact` avoids re-recording an id already entombed.
+    tombstone_index: std.AutoHashMapUnmanaged(Key, usize) = .empty,
     /// TEST-ONLY sabotage seam for `compact`'s round-trip self-verify (see
     /// store_test.zig): when set, `serializeState` writes THIS replacement
     /// body into the named id's persisted `add` event while leaving the
@@ -383,6 +472,8 @@ pub const Store = struct {
         self.superseded.deinit(self.gpa);
         self.skipped_unknown_ops.deinit(self.gpa);
         self.diverged_on_verify.deinit(self.gpa);
+        self.tombstones.deinit(self.gpa);
+        self.tombstone_index.deinit(self.gpa);
         self.arena.deinit();
     }
 
@@ -739,6 +830,201 @@ pub const Store = struct {
         self.self_wait_cycles.clearRetainingCapacity();
         try self.findSelfWaitCycles(&self.self_wait_cycles);
         self.loadConfig();
+        try self.loadTombstones();
+    }
+
+    /// Fold `.tracker/tombstones.jsonl` into `self.tombstones` (01M2M2K1J).
+    ///
+    /// Best-effort in the same sense as `loadConfig`: an absent file is the
+    /// normal state of a store that has never compacted, and a line this binary
+    /// cannot parse is SKIPPED rather than failing the load — the index is a
+    /// recovery aid, and a verb must never become unrunnable because one
+    /// tombstone line is malformed. Losing a line costs a resolvable citation;
+    /// failing the load costs the whole tracker.
+    ///
+    /// Last line wins per id: the file is union-merged, so the same id can
+    /// legitimately appear twice (two branches each compacted it), and a
+    /// `--rebuild` record can be superseded by a real one.
+    pub fn loadTombstones(self: *Store) !void {
+        self.tombstones.clearRetainingCapacity();
+        self.tombstone_index.clearRetainingCapacity();
+
+        var sub = self.dir.openDir(self.io, tracker_subdir, .{}) catch return;
+        defer sub.close(self.io);
+        const bytes = sub.readFileAlloc(self.io, tombstones_name, self.gpa, .unlimited) catch return;
+        defer self.gpa.free(bytes);
+
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            const t = self.parseTombstone(line) catch continue orelse continue;
+            const gop = try self.tombstone_index.getOrPut(self.gpa, key(t.id));
+            if (gop.found_existing) {
+                self.tombstones.items[gop.value_ptr.*] = t;
+            } else {
+                gop.value_ptr.* = self.tombstones.items.len;
+                try self.tombstones.append(self.gpa, t);
+            }
+        }
+
+        std.sort.pdq(Tombstone, self.tombstones.items, {}, tombstoneLessThan);
+        // The sort moved rows, so every index in the map is now wrong. Rebuild
+        // it from the sorted order rather than sorting a parallel structure —
+        // a stale index here would silently resolve one id to another's record,
+        // which is a worse failure than the one this whole file exists to fix.
+        self.tombstone_index.clearRetainingCapacity();
+        for (self.tombstones.items, 0..) |t, i|
+            try self.tombstone_index.put(self.gpa, key(t.id), i);
+    }
+
+    fn tombstoneLessThan(_: void, lhs: Tombstone, rhs: Tombstone) bool {
+        return std.mem.lessThan(u8, &lhs.id.text, &rhs.id.text);
+    }
+
+    /// Decode one tombstone line. Returns null (not an error) for a line that
+    /// parses as JSON but is not a tombstone — the file's own forward-compat
+    /// slack, mirroring `json_codec`'s unknown-op contract. Strings are
+    /// arena-dup'd so they outlive the parse tree.
+    fn parseTombstone(self: *Store, line: []const u8) !?Tombstone {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, line, .{});
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |o| o,
+            else => return null,
+        };
+        const op = switch (root.get("op") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        if (!std.mem.eql(u8, op, "tombstone")) return null;
+        const id_s = switch (root.get("id") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        const id = ulid.parse(id_s) catch return null;
+
+        var t: Tombstone = .{ .id = id };
+        if (root.get("short")) |v| switch (v) {
+            .string => |s| t.short = try self.a().dupe(u8, s),
+            else => {},
+        };
+        if (root.get("title")) |v| switch (v) {
+            .string => |s| t.title = try self.a().dupe(u8, s),
+            else => {},
+        };
+        if (root.get("reason")) |v| switch (v) {
+            .string => |s| t.reason = try self.a().dupe(u8, s),
+            else => {},
+        };
+        if (root.get("src")) |v| switch (v) {
+            .string => |s| t.src = try self.a().dupe(u8, s),
+            else => {},
+        };
+        if (root.get("ts")) |v| switch (v) {
+            .integer => |n| t.ts = n,
+            else => {},
+        };
+        if (root.get("arcs")) |v| switch (v) {
+            .array => |arr| {
+                var arcs: std.ArrayList(Ulid) = .empty;
+                for (arr.items) |el| switch (el) {
+                    .string => |s| try arcs.append(self.a(), ulid.parse(s) catch continue),
+                    else => {},
+                };
+                t.arcs = arcs.items;
+            },
+            else => {},
+        };
+        return t;
+    }
+
+    /// Resolve a citation against the tombstone index — the dead half of
+    /// `Cli.resolve`. Accepts a full id, a frozen short id, or any prefix of
+    /// either, case-insensitively, so it answers for exactly the citation
+    /// shapes the live resolver accepts.
+    ///
+    /// Never consulted BEFORE the live store: a live task and a tombstone for
+    /// the same id cannot coexist (compact only entombs what it removes), but
+    /// the ordering keeps that a property of the caller rather than a thing to
+    /// trust, and keeps the common path free of this lookup entirely.
+    pub fn lookupTombstone(self: *const Store, s: []const u8) TombstoneMatch {
+        if (s.len == 0) return .none;
+        var found: ?*const Tombstone = null;
+        var n: usize = 0;
+        for (self.tombstones.items) |*t| {
+            const hit = citationMatches(s, &t.id.text) or
+                (t.short != null and citationMatches(s, t.short.?));
+            if (!hit) continue;
+            n += 1;
+            if (found == null) found = t;
+        }
+        if (n == 0) return .none;
+        if (n > 1) return .{ .ambiguous = n };
+        return .{ .one = found.? };
+    }
+
+    /// Case-insensitive "is `pfx` a prefix of `text`" (ids are upper-case
+    /// canonical Crockford). Same rule as `Cli.prefixMatches`; duplicated here
+    /// rather than shared because the store must not depend on the CLI.
+    pub fn citationMatches(pfx: []const u8, text: []const u8) bool {
+        if (pfx.len > text.len) return false;
+        for (pfx, text[0..pfx.len]) |p, c| {
+            if (std.ascii.toUpper(p) != std.ascii.toUpper(c)) return false;
+        }
+        return true;
+    }
+
+    /// Append one tombstone line for `t` to `buf` (hand-rolled JSON,
+    /// deterministic key order — same rule as the event codec).
+    pub fn emitTombstone(self: *Store, buf: *std.ArrayList(u8), t: Tombstone) !void {
+        try buf.appendSlice(self.gpa, "{\"op\":\"tombstone\",\"id\":\"");
+        try buf.appendSlice(self.gpa, &t.id.text);
+        try buf.appendSlice(self.gpa, "\",\"short\":");
+        if (t.short) |s| try codec.writeJsonString(buf, self.gpa, s) else try buf.appendSlice(self.gpa, "null");
+        try buf.appendSlice(self.gpa, ",\"title\":");
+        try codec.writeJsonString(buf, self.gpa, t.title);
+        try buf.appendSlice(self.gpa, ",\"reason\":");
+        try codec.writeJsonString(buf, self.gpa, t.reason);
+        try buf.appendSlice(self.gpa, ",\"arcs\":[");
+        for (t.arcs, 0..) |arc, i| {
+            if (i != 0) try buf.append(self.gpa, ',');
+            try buf.append(self.gpa, '"');
+            try buf.appendSlice(self.gpa, &arc.text);
+            try buf.append(self.gpa, '"');
+        }
+        try buf.appendSlice(self.gpa, "],\"src\":");
+        try codec.writeJsonString(buf, self.gpa, t.src);
+        try buf.print(self.gpa, ",\"ts\":{d}}}\n", .{t.ts});
+    }
+
+    /// Append `rows` to `.tracker/tombstones.jsonl`, skipping any id already in
+    /// the index. Returns how many lines were written. The append is a
+    /// read-modify-atomicWrite (same shape as `quarantineGhosts`) so a crash
+    /// cannot leave a half-line behind.
+    pub fn appendTombstones(self: *Store, sub: Io.Dir, rows: []const Tombstone) !usize {
+        if (rows.len == 0) return 0;
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        const existing = sub.readFileAlloc(self.io, tombstones_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => try self.gpa.dupe(u8, ""),
+            else => return e,
+        };
+        defer self.gpa.free(existing);
+        try out.appendSlice(self.gpa, existing);
+        if (out.items.len != 0 and out.items[out.items.len - 1] != '\n')
+            try out.append(self.gpa, '\n');
+
+        var written: usize = 0;
+        for (rows) |t| {
+            if (self.tombstone_index.contains(key(t.id))) continue;
+            try self.emitTombstone(&out, t);
+            written += 1;
+        }
+        if (written == 0) return 0;
+        try self.atomicWrite(sub, tombstones_name, out.items);
+        return written;
     }
 
     /// After the WHOLE fold: every node that never received an `add` is a ghost
@@ -1014,7 +1300,7 @@ pub const Store = struct {
         return true;
     }
 
-    fn freeEvent(gpa: std.mem.Allocator, ev: Event) void {
+    pub fn freeEvent(gpa: std.mem.Allocator, ev: Event) void {
         switch (ev) {
             .add => |x| {
                 gpa.free(x.title);
@@ -1375,6 +1661,10 @@ pub const Store = struct {
         /// Number of raw log lines moved to `quarantine.jsonl` because they
         /// referenced a ghost id.
         quarantined_lines: usize,
+        /// Number of tombstone lines appended to `tombstones.jsonl` — one per
+        /// task this run physically GC'd that was not already entombed. See
+        /// `tombstones_name`.
+        tombstoned: usize,
     };
 
     /// Compact: write a fresh full-state snapshot then truncate the log.
@@ -1405,6 +1695,15 @@ pub const Store = struct {
     ///     on the next load. A done prereq is what makes a dependent eligible —
     ///     losing it corrupts the graph.
     ///   - Edges (`dep`, `in`) involving a dropped endpoint are also excluded.
+    ///   - EVERYTHING GC'd IS ENTOMBED FIRST (01M2M2K1J). Excluding a task from
+    ///     the snapshot is what makes its id unresolvable, and "never existed"
+    ///     and "existed, finished, graduated" then read identically to every
+    ///     reader — a wrong "dangling" verdict that invites someone to correct
+    ///     a correct citation. So each collected task gets one line in
+    ///     `tombstones.jsonl` (id, short, title, why, arcs, when) before any
+    ///     rewrite. That does not un-GC anything: the task is still out of the
+    ///     graph, out of `next`, out of every view. It is the difference
+    ///     between forgetting a task and forgetting that it ever was.
     ///   - GHOST ids are EXCLUDED too, and their log lines are spooled to
     ///     `quarantine.jsonl` first (see `quarantineGhosts`). A ghost is an id
     ///     the fold only ever saw REFERENCED, never `add`ed (`ghost_tasks`) —
@@ -1460,13 +1759,23 @@ pub const Store = struct {
             else => return e,
         };
         defer if (orig_log) |b| self.gpa.free(b);
+        // The tombstone index is APPENDED to below, before the point of no
+        // return — so a failed verify must restore it too, or a refused compact
+        // would leave behind tombstones for tasks that are still live. That is
+        // the one direction this index must never get wrong: a tombstone for a
+        // live id would make `show` report a live task as compacted.
+        const orig_tombstones = sub.readFileAlloc(self.io, tombstones_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => return e,
+        };
+        defer if (orig_tombstones) |b| self.gpa.free(b);
 
         // Bounded pre-compact backup, taken from the same original bytes,
         // BEFORE the rewrite. Recovery today is git archaeology across
         // worktree merges — exactly how the 01KZTV44M loss stayed invisible
         // for weeks; this gives a same-machine fallback that needs no git
         // history and no reconstructed worktree at all.
-        try self.writeBackup(sub, orig_snapshot, orig_log);
+        try self.writeBackup(sub, orig_snapshot, orig_log, orig_tombstones);
 
         // Step 0: spool the ghosts' log lines, durable BEFORE anything is
         // rewritten. Nothing this compaction discards is destroyed — a
@@ -1474,6 +1783,40 @@ pub const Store = struct {
         // really was worth recovering) is repaired by restoring the snapshot
         // from git and appending the spool back onto the log, ids intact.
         const quarantined = try self.quarantineGhosts(sub);
+
+        // Step 0b: entomb every task this run is about to erase, likewise
+        // durable BEFORE the rewrite (01M2M2K1J). This is the ONLY moment the
+        // information exists in memory: after the snapshot is rewritten the
+        // task, its title and its edges are gone from every file in
+        // `.tracker/`, and the only remaining record is git history — which the
+        // dangling-id lint proves is recoverable but costs ~31 s per query.
+        const tombstoned = blk: {
+            var rows: std.ArrayList(Tombstone) = .empty;
+            defer rows.deinit(self.gpa);
+            const now: i64 = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+            const all_ids = try self.sortedTaskIds(self.gpa);
+            defer self.gpa.free(all_ids);
+            for (all_ids) |id| {
+                const t = self.tasks.get(key(id)).?;
+                if (!isCollectable(t)) continue;
+                var arcs: std.ArrayList(Ulid) = .empty;
+                for (self.ins.items) |e| {
+                    if (e.task.eql(id)) try arcs.append(self.a(), e.arc);
+                }
+                try rows.append(self.gpa, .{
+                    .id = id,
+                    .short = t.short,
+                    .title = t.title,
+                    // A ghost's `open` is `ensureNode`'s default, not a
+                    // judgment — classify it as what it is, never as its state.
+                    .reason = if (!t.has_add) "ghost" else t.state.toString(),
+                    .arcs = arcs.items,
+                    .ts = now,
+                    .src = "compact",
+                });
+            }
+            break :blk try self.appendTombstones(sub, rows.items);
+        };
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.gpa);
@@ -1524,6 +1867,7 @@ pub const Store = struct {
             // corrupt file where none existed.
             if (orig_snapshot) |b| try self.atomicWrite(sub, snapshot_name, b) else sub.deleteFile(self.io, snapshot_name) catch {};
             if (orig_log) |b| try self.atomicWrite(sub, log_name, b) else sub.deleteFile(self.io, log_name) catch {};
+            if (orig_tombstones) |b| try self.atomicWrite(sub, tombstones_name, b) else sub.deleteFile(self.io, tombstones_name) catch {};
             return error.CompactVerifyFailed;
         }
 
@@ -1532,6 +1876,7 @@ pub const Store = struct {
             .log_events_before = log_events_before,
             .ghosts = self.ghost_tasks.items.len,
             .quarantined_lines = quarantined,
+            .tombstoned = tombstoned,
         };
     }
 
@@ -1550,13 +1895,13 @@ pub const Store = struct {
         return std.fmt.bufPrint(buf, "{d:0>20}", .{ts_u}) catch unreachable;
     }
 
-    /// Copy the pre-compact `snapshot.jsonl`/`log.jsonl` bytes (whichever
-    /// existed) into a fresh `.tracker/backup/<ts>/` run dir BEFORE compact
-    /// does anything destructive, then evict down to
+    /// Copy the pre-compact `snapshot.jsonl`/`log.jsonl`/`tombstones.jsonl`
+    /// bytes (whichever existed) into a fresh `.tracker/backup/<ts>/` run dir
+    /// BEFORE compact does anything destructive, then evict down to
     /// `config.backup_retain`. A no-op on the very first compact (nothing to
     /// protect yet — no prior snapshot AND no prior log).
-    fn writeBackup(self: *Store, sub: Io.Dir, orig_snapshot: ?[]const u8, orig_log: ?[]const u8) !void {
-        if (orig_snapshot == null and orig_log == null) return;
+    fn writeBackup(self: *Store, sub: Io.Dir, orig_snapshot: ?[]const u8, orig_log: ?[]const u8, orig_tombstones: ?[]const u8) !void {
+        if (orig_snapshot == null and orig_log == null and orig_tombstones == null) return;
 
         // `.iterate = true`: `evictOldBackups` below scans this dir's entries,
         // which requires the handle to have been opened with iteration
@@ -1594,6 +1939,7 @@ pub const Store = struct {
 
         if (orig_snapshot) |b| try self.atomicWrite(run_dir, snapshot_name, b);
         if (orig_log) |b| try self.atomicWrite(run_dir, log_name, b);
+        if (orig_tombstones) |b| try self.atomicWrite(run_dir, tombstones_name, b);
 
         try self.evictOldBackups(backup_root);
     }

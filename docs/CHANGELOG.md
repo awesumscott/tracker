@@ -5,6 +5,26 @@ under a `## YYYY-MM-DD` run heading (config `archive.out` — unset today, so a 
 to stdout; this file is hand-started because a landing needed recording before that config existed).
 Forward-looking work is `docs/TODO.md` (generated); design rationale lives in `docs/design.md`.
 
+## 2026-09-16
+
+**A compacted id RESOLVES again — `trk show` tells "graduated" from "never existed" (01M2M2K1J).**
+Compaction is the only thing that destroys an id, and it left no trace: `trk show` answered `no task
+matches` for a compacted id, the same words and exit code as for one that was never real. Measured on the
+Enix tracker 2026-09-12, that produced two wrong "dangling" verdicts (`01M1RQ7XK`, `01M0QJWJ7`) while the
+dangling-id lint scanned 29,792 citations and found 0 dangling — the expensive direction, because it
+invites someone to "fix" a correct citation. `compact` now appends a tombstone (id, short, title, why,
+arcs, when) to `.tracker/tombstones.jsonl` before any destructive write, `load` folds it, and `show`
+resolves against it: exit **0 live / 2 compacted / 1 unknown**, a `COMPACTED` record that cannot be
+skim-read as a live task, `"compacted":true` in `--json`, and an EMPTY stdout for `--body` so the
+edit-pipe can't be fed a tombstone. The index is union-merged like the log and is pinned by
+`trk init`/`compact`'s attribute check. `trk tombstones [--rebuild]` lists it and back-fills ids compacted
+before it existed from `git log --all -p -- .tracker/log.jsonl` — the method the lint already used,
+measured at ~31 s / ~162 MB on a 10,574-commit repo, hence run once and persisted rather than per query.
+A refused compact rolls the index back with the snapshot and log. Sabotage-proved in both directions
+(no-op the write → all 6 new tests red; drop the rebuild's live-guard → the live-task negative red; skip
+the rollback → the refusal test red). Not fixed here, same root cause: `trk tree` still renders an arc
+whose members were compacted as empty (`01M29P5T7`). `zig build test`: **251 → 257**.
+
 ## 2026-09-14
 
 **`claimed` is now a live lease; the old completion report is `submitted` (01M2GGFGR).** In fan-outs

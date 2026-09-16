@@ -31,6 +31,7 @@ const Ulid = tracker.Ulid;
 const State = tracker.State;
 const Task = tracker.Task;
 const model = tracker.model;
+const codec = tracker.json_codec;
 const Io = std.Io;
 
 /// Minimum length of a DYNAMICALLY-computed short id — the legacy/back-compat
@@ -83,6 +84,16 @@ pub const CliError = error{
     /// `git` missing from PATH, non-zero exit). A clean message is already
     /// appended to `out` before this is returned.
     GitLogFailed,
+    /// `trk show <id>` resolved the id in the TOMBSTONE index rather than the
+    /// live store: the task existed and `compact` physically GC'd it
+    /// (01M2M2K1J). NOT a failure to find the id — the opposite: the record is
+    /// already printed to `out`. It is a distinct error, and main.zig maps it to
+    /// its own exit code 2, because the three answers `show` can give are three
+    /// different facts and a caller that branches on the exit status must be
+    /// able to tell them apart: 0 = live, 2 = compacted, 1 = no such id. Folding
+    /// this into 0 would tell `dangling-tracker-id-lint.sh` a graduated id is
+    /// live; folding it into 1 would put it back where it started.
+    CompactedId,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -774,6 +785,29 @@ pub const Cli = struct {
         \\  repo housing `.tracker/`, which may differ from where `trk` itself lives).
         \\  e.g.  trk stale
         },
+        .{ .name = "tombstones", .run = &cmdTombstones, .mutating_subcommands = &.{"--rebuild"}, .tools = &tombstones_tools, .text =
+        \\trk tombstones [--rebuild] [--json]
+        \\  The index of tasks `trk compact` physically GC'd (.tracker/tombstones.jsonl).
+        \\  Compaction is the only thing that destroys an id: the task, its title and
+        \\  its edges leave every file under .tracker/, and without this index
+        \\  `trk show <that id>` answers "no task matches" — byte-identical to the
+        \\  answer for an id that NEVER existed. Those are opposite facts, and the
+        \\  wrong one invites someone to "fix" a citation that was correct.
+        \\  With the index, `trk show` resolves a compacted id and says COMPACTED,
+        \\  exiting 2 (0 = live, 2 = compacted, 1 = no such id).
+        \\  No flags: list every tombstone (id, short, why it left, title).
+        \\  --rebuild: RECOVER tombstones for ids compacted BEFORE this index existed,
+        \\  by replaying .tracker/log.jsonl's full git history (`git log --all -p`) and
+        \\  entombing every id it ever carried that is neither live nor already
+        \\  recorded. That is the method scripts/dangling-tracker-id-lint.sh uses to
+        \\  tell historical from dangling — run ONCE and persisted, instead of per
+        \\  query: measured on a 10,574-commit repo it is ~31s and ~162MB of diff,
+        \\  which is fine for a one-shot migration and is exactly why `show` cannot do
+        \\  it live. Idempotent (an id already entombed is skipped); it never touches
+        \\  the log, the snapshot, or any live task. Recovered rows are marked
+        \\  src=git-history and carry no collection time.
+        \\  e.g.  trk tombstones           trk tombstones --rebuild
+        },
         .{ .name = "mcp-serve", .run = &cmdMcpServe, .tools = &cli_only_tools, .text =
         \\trk mcp-serve
         \\  Serve trk as an MCP server: JSON-RPC 2.0, one message per line, on
@@ -923,6 +957,14 @@ pub const Cli = struct {
     } }};
 
     const stale_tools = [_]Tool{.{ .name = "stale" }};
+
+    // READ-ONLY over MCP, deliberately: `--rebuild` is not exposed. It is a
+    // one-shot migration that shells out to `git log --all -p` (~31s, ~162MB on
+    // a real repo) and writes the index — an orchestrator runs it once from the
+    // CLI. Exposing it here would also make `readOnlyHint` a lie, since that
+    // hint is derived from `argv` alone and could not see a `rebuild: true`
+    // argument coming.
+    const tombstones_tools = [_]Tool{.{ .name = "tombstones", .argv = &.{"--json"} }};
 
     /// Print one verb's help (from `verbs`), or fall back to the full usage
     /// overview for an unknown/absent verb (so `trk help nonsense` still helps).
@@ -2105,6 +2147,12 @@ pub const Cli = struct {
             "compacted: {d} events -> {d} live tasks, log truncated\n",
             .{ result.log_events_before, result.live_tasks },
         );
+        if (result.tombstoned != 0)
+            try self.print(
+                "  {d} GC'd task(s) entombed in .tracker/{s} — their ids still RESOLVE:\n" ++
+                    "  `trk show <id>` reports each COMPACTED (exit 2), never \"no such task\".\n",
+                .{ result.tombstoned, tracker.store.tombstones_name },
+            );
         if (result.ghosts != 0) {
             try self.print(
                 "  {d} ghost id(s) GC'd (no `add` event anywhere in the fold — not tasks, the\n" ++
@@ -2127,8 +2175,9 @@ pub const Cli = struct {
     /// which CREATES `snapshot.jsonl`/`quarantine.jsonl` — the exact moment two
     /// files that must never be union-merged come into existence.
     ///
-    /// The claim is deliberately narrow. trk is std-only and never shells out to
-    /// git, so it cannot ask what attributes are actually in EFFECT (a parent
+    /// The claim is deliberately narrow. This path never shells out to git (two
+    /// verbs do — `stale` and `tombstones --rebuild` — but not this one), so it
+    /// cannot ask what attributes are actually in EFFECT (a parent
     /// `.gitattributes`, `.git/info/attributes` and `core.attributesFile` all
     /// feed that, and reimplementing git's resolution would be worse than not
     /// checking). What it can check is its OWN file, so a missing one says
@@ -2161,6 +2210,7 @@ pub const Cli = struct {
             tracker.store.log_name ++ " merge=union",
             tracker.store.snapshot_name ++ " merge=text",
             tracker.store.quarantine_name ++ " merge=text",
+            tracker.store.tombstones_name ++ " merge=union",
         };
         for (pins) |pin| {
             var found = false;
@@ -3636,6 +3686,76 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- show
 
+    /// Does citation `s` name tombstone `tb` — by full id, by frozen short id,
+    /// or by a prefix of either? The predicate `Store.lookupTombstone` counts
+    /// with; re-exposed here so the ambiguity listing prints exactly the rows
+    /// that were counted (a listing computed by a DIFFERENT rule than the count
+    /// is how "N matches" ends up printing a different number of lines).
+    fn tombstoneCited(s: []const u8, tb: *const tracker.store.Tombstone) bool {
+        return Store.citationMatches(s, &tb.id.text) or
+            (tb.short != null and Store.citationMatches(s, tb.short.?));
+    }
+
+    /// The human view for an id that resolved in the TOMBSTONE index rather
+    /// than the live store (01M2M2K1J).
+    ///
+    /// Deliberately NOT shaped like the live view. The whole defect this closes
+    /// is two different facts rendering identically, so the fix must not create
+    /// a third: every line here is prefixed `compacted:` or sits under a banner
+    /// that says COMPACTED in the first three words, and there is no `state:
+    /// open`-shaped line anyone could skim as live. A reader who sees this
+    /// output and a reader who sees a live task cannot mistake one for the
+    /// other even at a glance.
+    fn showTombstone(self: *Cli, tb: *const tracker.store.Tombstone) Error!void {
+        try self.print("COMPACTED — {s} existed and is no longer in the live store.\n\n", .{&tb.id.text});
+        try self.print("id:        {s}\n", .{&tb.id.text});
+        if (tb.short) |s| try self.print("short:     {s}\n", .{s});
+        try self.print("title:     {s}\n", .{if (tb.title.len != 0) tb.title else "(not recorded)"});
+        try self.print("was:       {s}\n", .{tb.reason});
+        if (tb.arcs.len != 0) {
+            try self.write("arcs:      ");
+            for (tb.arcs, 0..) |arc, i| {
+                if (i != 0) try self.write(" ");
+                try self.print("{s}", .{&arc.text});
+            }
+            try self.write("\n");
+        }
+        if (tb.ts != 0) {
+            var buf: [32]u8 = undefined;
+            try self.print("collected: {s} UTC\n", .{fmtTs(tb.ts, &buf)});
+        }
+        try self.print("record:    {s}\n", .{tb.src});
+        try self.print(
+            "\nThis is NOT a dangling citation: the id was real, the work closed, and `trk compact`\n" ++
+                "physically GC'd the task out of .tracker/. Do not \"fix\" a reference to it. The full\n" ++
+                "record — body, events, edges — is still in git history and in .tracker/backup/:\n" ++
+                "  git log --all -p -- .tracker/{s} | grep {s}\n",
+            .{ tracker.store.log_name, &tb.id.text },
+        );
+    }
+
+    /// `--json` for a tombstone. Carries `"compacted": true` — a field the live
+    /// view never emits — so a machine reader branches on a key rather than on
+    /// the absence of one.
+    fn showTombstoneJson(self: *Cli, tb: *const tracker.store.Tombstone) Error!void {
+        try self.write("{\"compacted\":true,\"id\":\"");
+        try self.write(&tb.id.text);
+        try self.write("\",\"short\":");
+        if (tb.short) |s| try self.writeJsonString(s) else try self.write("null");
+        try self.write(",\"title\":");
+        try self.writeJsonString(tb.title);
+        try self.write(",\"was\":");
+        try self.writeJsonString(tb.reason);
+        try self.write(",\"arcs\":[");
+        for (tb.arcs, 0..) |arc, i| {
+            if (i != 0) try self.write(",");
+            try self.print("\"{s}\"", .{&arc.text});
+        }
+        try self.write("],\"src\":");
+        try self.writeJsonString(tb.src);
+        try self.print(",\"collected_ts\":{d}}}\n", .{tb.ts});
+    }
+
     /// `trk show <id>` — full task detail view.
     fn cmdShow(self: *Cli, args: []const []const u8) Error!void {
         var id_arg: ?[]const u8 = null;
@@ -3653,16 +3773,56 @@ pub const Cli = struct {
                 return error.UsageError;
             }
         }
-        const id = try self.resolve(id_arg orelse {
+        const want = id_arg orelse {
             try self.write("trk: usage: trk show <id> [--body | --json]\n");
             return error.UsageError;
-        });
-        const t = self.store.get(id).?;
-
+        };
         if (raw_body and json) {
             try self.write("trk: usage: trk show <id> [--body | --json]\n");
             return error.UsageError;
         }
+        // A live miss is not yet a verdict: the id may have been COMPACTED
+        // (01M2M2K1J). `resolve` has already appended its "no task matches"
+        // line, so rewind `out` to the mark before printing the tombstone —
+        // "no task matches" immediately followed by the task's record is the
+        // confusing half of both answers rather than either one.
+        const mark = self.out.items.len;
+        const id = self.resolve(want) catch |e| {
+            if (e != error.NoSuchId) return e;
+            switch (self.store.lookupTombstone(want)) {
+                .none => return e,
+                .ambiguous => |n| {
+                    self.out.shrinkRetainingCapacity(mark);
+                    try self.print("trk: prefix '{s}' matches no live task and {d} compacted ones:\n", .{ want, n });
+                    for (self.store.tombstones.items) |*tb| {
+                        if (!tombstoneCited(want, tb)) continue;
+                        try self.print("  {s}  {s}\n", .{ tb.short orelse &tb.id.text, tb.title });
+                    }
+                    return error.AmbiguousId;
+                },
+                .one => |tb| {
+                    self.out.shrinkRetainingCapacity(mark);
+                    if (raw_body) {
+                        // `--body` is the READ HALF OF A PIPE (`trk show X
+                        // --body | trk edit Y --replace-body -`). A tombstone
+                        // has no body, and printing its record on stdout here
+                        // would hand that pipe plausible-looking body bytes. So
+                        // stdout stays EMPTY — which `--replace-body -` refuses
+                        // outright — and the explanation goes to stderr.
+                        try self.warn.print(self.gpa,
+                            "trk: {s} is COMPACTED — it existed and `trk compact` GC'd it out of the live " ++
+                                "store, so there is no body to read. `trk show {s}` prints what the tombstone " ++
+                                "index kept.\n",
+                            .{ &tb.id.text, tb.short orelse &tb.id.text },
+                        );
+                        return error.CompactedId;
+                    }
+                    if (json) try self.showTombstoneJson(tb) else try self.showTombstone(tb);
+                    return error.CompactedId;
+                },
+            }
+        };
+        const t = self.store.get(id).?;
         if (json) return self.showJson(id);
 
         if (raw_body) {
@@ -4280,6 +4440,213 @@ pub const Cli = struct {
             const line = hits.get(id.text).?;
             try self.print("{s} {s}  {s}\n    cited in: {s}\n", .{ stateMarker(t.state), sid, t.title, line });
         }
+    }
+
+    // ----------------------------------------------------------- tombstones
+
+    /// `trk tombstones [--rebuild] [--json]` — read, and back-fill, the index of
+    /// ids `compact` physically GC'd (01M2M2K1J). See `store.tombstones_name`.
+    fn cmdTombstones(self: *Cli, args: []const []const u8) Error!void {
+        var rebuild = false;
+        var json = false;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--rebuild")) {
+                rebuild = true;
+            } else if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else {
+                try self.write("trk: usage: trk tombstones [--rebuild] [--json]\n");
+                return error.UsageError;
+            }
+        }
+        if (rebuild) try self.rebuildTombstones();
+
+        if (json) {
+            try self.write("[");
+            for (self.store.tombstones.items, 0..) |*tb, i| {
+                if (i != 0) try self.write(",");
+                try self.showTombstoneJson(tb);
+            }
+            try self.write("]\n");
+            return;
+        }
+        if (self.store.tombstones.items.len == 0) {
+            // The hint is suppressed right after a rebuild: telling someone to
+            // run the command they just ran reads as a failure, when in fact it
+            // is the clean answer — nothing in this store was ever compacted
+            // away. (Observed on trk's own tracker, 2026-09-16.)
+            if (rebuild) {
+                try self.write("trk: tombstones: none — nothing in this store's history was ever compacted away.\n");
+            } else {
+                try self.print(
+                    "trk: tombstones: none recorded in .tracker/{s}. If this repo has ever run " ++
+                        "`trk compact`, its already-compacted ids are recoverable — run " ++
+                        "`trk tombstones --rebuild`.\n",
+                    .{tracker.store.tombstones_name},
+                );
+            }
+            return;
+        }
+        try self.print("trk: {d} compacted task(s) on record:\n", .{self.store.tombstones.items.len});
+        for (self.store.tombstones.items) |*tb| {
+            var buf: [32]u8 = undefined;
+            try self.print("  {s}  {s:<9}  {s}\n      {s}  ({s})\n", .{
+                tb.short orelse &tb.id.text,
+                tb.reason,
+                tb.title,
+                &tb.id.text,
+                if (tb.ts != 0) fmtTs(tb.ts, &buf) else tb.src,
+            });
+        }
+    }
+
+    /// Back-fill the tombstone index from `.tracker/log.jsonl`'s FULL git
+    /// history — the only surviving record of an id compacted before the index
+    /// existed.
+    ///
+    /// WHY GIT AND NOT THE STORE: there is nothing else left. `compact` excludes
+    /// the task from the snapshot and truncates the log, so no file under
+    /// `.tracker/` mentions the id afterwards. `.tracker/backup/` holds only the
+    /// last `compact.backup_retain` runs and is gitignored. Git history is where
+    /// `scripts/dangling-tracker-id-lint.sh` recovers it, and this is that same
+    /// scan — run ONCE and persisted, rather than once per question.
+    ///
+    /// `--all`, unlike `cmdStale`'s deliberately-ancestry-only scan: this asks
+    /// "did this id EVER exist", and an id minted on a branch nobody merged
+    /// still existed. A false LIVE would be dangerous; a false EXISTED is not —
+    /// the record says plainly that it is gone.
+    ///
+    /// Recovers title and state from the events themselves, keeping the value
+    /// with the largest `ts` per id, so the answer does not depend on git's
+    /// newest-first walk order.
+    fn rebuildTombstones(self: *Cli) Error!void {
+        const log_path = tracker.store.tracker_subdir ++ "/" ++ tracker.store.log_name;
+        const result = std.process.run(self.gpa, self.io, .{
+            .argv = &.{ "git", "log", "--all", "-p", "--no-color", "--", log_path },
+            .cwd = .{ .dir = self.dir },
+        }) catch |e| {
+            try self.print(
+                "trk: tombstones: failed to run 'git log': {s} (is the store root a git repo, and is git on PATH?)\n",
+                .{@errorName(e)},
+            );
+            return error.GitLogFailed;
+        };
+        defer self.gpa.free(result.stdout);
+        defer self.gpa.free(result.stderr);
+        const exited_ok = switch (result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!exited_ok) {
+            try self.print("trk: tombstones: 'git log' failed: {s}\n", .{std.mem.trimEnd(u8, result.stderr, " \t\r\n")});
+            return error.GitLogFailed;
+        }
+
+        // id -> the best record seen so far. `title`/`reason` each carry the ts
+        // of the event they came from, so a later `setTitle`/`setState` wins
+        // regardless of the order the history walk hands them over.
+        const Rec = struct {
+            short: ?[]const u8 = null,
+            title: []const u8 = "",
+            title_ts: i64 = -1,
+            reason: []const u8 = "unknown",
+            reason_ts: i64 = -1,
+        };
+        var recs = std.AutoHashMapUnmanaged([ulid.len]u8, Rec){};
+        defer recs.deinit(self.gpa);
+        // Every recovered title/short is copied out of a decoded event that is
+        // freed on the next loop iteration, and there are thousands of them.
+        // One arena freed at the end beats tracking each string: the records
+        // are write-once and all die together, and the rows handed to
+        // `appendTombstones` below borrow from it while it is still alive.
+        var rec_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer rec_arena.deinit();
+        const ra = rec_arena.allocator();
+
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |raw| {
+            // Only ADDED diff lines are log content; `-` lines are the same
+            // content leaving (a compact's truncation) and `+++`/`---` are
+            // headers. A log line is a JSON object, so require the brace.
+            if (raw.len < 2 or raw[0] != '+' or raw[1] != '{') continue;
+            const line = std.mem.trimEnd(u8, raw[1..], " \t\r");
+            const ev = codec.decode(self.gpa, line) catch continue;
+            defer Store.freeEvent(self.gpa, ev);
+            switch (ev) {
+                .add => |a| {
+                    const gop = try recs.getOrPut(self.gpa, a.id.text);
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    if (a.short) |s| gop.value_ptr.short = try ra.dupe(u8, s);
+                    if (a.ts > gop.value_ptr.title_ts) {
+                        gop.value_ptr.title = try ra.dupe(u8, a.title);
+                        gop.value_ptr.title_ts = a.ts;
+                    }
+                },
+                .setTitle => |s| {
+                    const gop = try recs.getOrPut(self.gpa, s.id.text);
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    if (s.ts > gop.value_ptr.title_ts) {
+                        gop.value_ptr.title = try ra.dupe(u8, s.title);
+                        gop.value_ptr.title_ts = s.ts;
+                    }
+                },
+                .setShort => |s| {
+                    const gop = try recs.getOrPut(self.gpa, s.id.text);
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    gop.value_ptr.short = try ra.dupe(u8, s.short);
+                },
+                .setState => |s| {
+                    const gop = try recs.getOrPut(self.gpa, s.id.text);
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    if (s.ts > gop.value_ptr.reason_ts) {
+                        gop.value_ptr.reason = s.state.toString();
+                        gop.value_ptr.reason_ts = s.ts;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Entomb every recovered id that is neither live nor already recorded.
+        // `appendTombstones` re-checks the index itself; the live check is here
+        // because writing a tombstone for a LIVE id is the one error this
+        // mechanism must never make — `show` would then call a live task gone.
+        var rows: std.ArrayList(tracker.store.Tombstone) = .empty;
+        defer rows.deinit(self.gpa);
+        var it = recs.iterator();
+        while (it.next()) |e| {
+            const id = Ulid{ .text = e.key_ptr.* };
+            if (self.store.get(id) != null) continue;
+            try rows.append(self.gpa, .{
+                .id = id,
+                .short = e.value_ptr.short,
+                .title = e.value_ptr.title,
+                .reason = e.value_ptr.reason,
+                .arcs = &.{},
+                .ts = 0,
+                .src = "git-history",
+            });
+        }
+        std.sort.pdq(tracker.store.Tombstone, rows.items, {}, tombstoneIdLessThan);
+
+        var sub = self.dir.createDirPathOpen(self.io, tracker.store.tracker_subdir, .{}) catch |e| {
+            try self.print("trk: tombstones: cannot open .tracker/: {s}\n", .{@errorName(e)});
+            return e;
+        };
+        defer sub.close(self.io);
+        const written = try self.store.appendTombstones(sub, rows.items);
+        // Re-fold so the listing below (and any later lookup in this process)
+        // sees what was just written — the in-memory index was built at load.
+        try self.store.loadTombstones();
+        try self.print(
+            "trk: tombstones: scanned {d} distinct id(s) in the full history of {s}; " ++
+                "{d} new tombstone(s) recorded, {d} already known or still live.\n",
+            .{ recs.count(), log_path, written, recs.count() - written },
+        );
+    }
+
+    fn tombstoneIdLessThan(_: void, lhs: tracker.store.Tombstone, rhs: tracker.store.Tombstone) bool {
+        return std.mem.lessThan(u8, &lhs.id.text, &rhs.id.text);
     }
 };
 
