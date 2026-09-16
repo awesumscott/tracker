@@ -964,6 +964,36 @@ pub const Store = struct {
         return .{ .one = found.? };
     }
 
+    /// Every tombstone naming `arc` among its memberships: the GRADUATED
+    /// members of an arc (01M29P5T7).
+    ///
+    /// This is the only arc-membership fact that survives compaction, and it
+    /// exists solely because `compact` writes the index BEFORE its destructive
+    /// rewrite. `serializeState` drops every `in` edge with a collectable
+    /// endpoint (its `gc_set`), so once an arc's members are collected the live
+    /// store holds no edge connecting them to it at all — and every view that
+    /// enumerates `ins` renders a fully-built arc exactly like one that was
+    /// never sliced. That is the asymmetry this closes: `show` on a collected
+    /// id at least answered COMPACTED, while `tree` on its arc answered with a
+    /// well-formed, entirely unremarkable empty tree.
+    ///
+    /// Returns pointers INTO `self.tombstones`, valid until the next
+    /// `loadTombstones`; the slice itself is caller-owned. Order is the index's
+    /// own (ascending id = mint order), inherited from the sort in
+    /// `loadTombstones` — a filtered scan of a sorted list is still sorted.
+    pub fn compactedMembers(self: *const Store, gpa: std.mem.Allocator, arc: Ulid) ![]const *const Tombstone {
+        var out: std.ArrayList(*const Tombstone) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.tombstones.items) |*t| {
+            for (t.arcs) |member_of| {
+                if (!member_of.eql(arc)) continue;
+                try out.append(gpa, t);
+                break;
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
     /// Case-insensitive "is `pfx` a prefix of `text`" (ids are upper-case
     /// canonical Crockford). Same rule as `Cli.prefixMatches`; duplicated here
     /// rather than shared because the store must not depend on the CLI.

@@ -663,6 +663,15 @@ pub const Cli = struct {
         \\  Print the ASCII prereq hierarchy rooted at an arc or task (prereqs nested
         \\  under their dependents; a shared prereq prints once, then "(seen)").
         \\  --json: nested {id,short,title,state,children}; a repeat carries "seen":true.
+        \\  GRADUATED MEMBERS ARE REPORTED, NOT OMITTED: `compact` deletes an `in` edge
+        \\  along with its collected member, so an arc that was fully built and
+        \\  compacted would otherwise render as a bare one-line tree — identical to one
+        \\  that was never sliced. Any member found in the tombstone index is listed
+        \\  under a `compacted members (N)` heading (root "compacted_members" in --json,
+        \\  always present, possibly empty). An arc with no graduated members still
+        \\  renders with no such block.
+        \\  A COMPACTED root gets `show`'s answer, not "no task matches": the record
+        \\  plus its graduated members, exit 2 (live 0 / compacted 2 / absent 1).
         },
         .{ .name = "compact", .run = &cmdCompact, .mutates = true, .tools = &compact_tools, .text =
         \\trk compact
@@ -3455,10 +3464,44 @@ pub const Cli = struct {
             }
         }
         if (extra_positional) id_arg = null;
-        const root = try self.resolve(id_arg orelse {
+        const want = id_arg orelse {
             try self.write("trk: usage: trk tree <arc-or-task-id> [--json]\n");
             return error.UsageError;
-        });
+        };
+        // Same three-way verdict `show` gives (01M2M2K1J): live 0, COMPACTED 2,
+        // absent 1. `tree` answering "no task matches" for an arc that was
+        // built and graduated is the SAME misreading this task is about,
+        // pointing at the root instead of at its members — so it gets the same
+        // answer, and the arc's graduated members are listed under it.
+        const mark = self.out.items.len;
+        const root = self.resolve(want) catch |e| {
+            if (e != error.NoSuchId) return e;
+            switch (self.store.lookupTombstone(want)) {
+                .none => return e,
+                .ambiguous => |n| {
+                    self.out.shrinkRetainingCapacity(mark);
+                    try self.print("trk: prefix '{s}' matches no live task and {d} compacted ones:\n", .{ want, n });
+                    for (self.store.tombstones.items) |*tb| {
+                        if (!tombstoneCited(want, tb)) continue;
+                        try self.print("  {s}  {s}\n", .{ tb.short orelse &tb.id.text, tb.title });
+                    }
+                    return error.AmbiguousId;
+                },
+                .one => |tb| {
+                    self.out.shrinkRetainingCapacity(mark);
+                    if (json) {
+                        try self.tombstoneJsonOpen(tb);
+                        try self.compactedMembersJson(tb.id);
+                        try self.write("}\n");
+                    } else {
+                        try self.tombstoneRecord(tb);
+                        try self.compactedMemberBlock(self.out, tb.id);
+                        try self.tombstoneFooter(tb);
+                    }
+                    return error.CompactedId;
+                },
+            }
+        };
         if (json) {
             var visited = std.AutoHashMapUnmanaged([ulid.len]u8, void){};
             defer visited.deinit(self.gpa);
@@ -3511,6 +3554,66 @@ pub const Cli = struct {
             const last = idx == children.items.len - 1;
             try self.treeNode(buf, &prefix, child, last, &visited);
         }
+
+        try self.compactedMemberBlock(buf, root);
+    }
+
+    /// The graduated half of an arc's membership: every member `trk compact`
+    /// collected, recovered from the tombstone index (01M29P5T7).
+    ///
+    /// Emitted UNCONDITIONALLY when there is anything to emit, with no flag to
+    /// turn it on. A `--archived` flag would leave the silence exactly where it
+    /// hurt: the reader who was misled did not know to ask, because the empty
+    /// tree gave him no reason to. Absence is only fixed by making it speak.
+    ///
+    /// Shaped so a graduated member CANNOT be skimmed as a live one, which is
+    /// the same rule `showTombstone` follows: no `[x]`-style state marker, no
+    /// box-drawing connector, every row prefixed `compacted:`, under a heading.
+    /// And when the arc has no graduated members this writes NOTHING — a
+    /// genuinely unsliced arc must still render as genuinely empty, or the fix
+    /// has only moved the ambiguity.
+    fn compactedMemberBlock(self: *Cli, buf: *std.ArrayList(u8), arc: Ulid) Error!void {
+        const gpa = self.gpa;
+        const members = try self.store.compactedMembers(gpa, arc);
+        defer gpa.free(members);
+        if (members.len == 0) return;
+
+        try buf.print(gpa, "\ncompacted members ({d}) — built, closed, and GC'd out of the live store:\n", .{members.len});
+        for (members) |tb| {
+            try buf.print(gpa, "  compacted: {s}  was {s}  {s}\n", .{
+                tb.short orelse &tb.id.text,
+                tb.reason,
+                if (tb.title.len != 0) tb.title else "(title not recorded)",
+            });
+        }
+        try buf.print(gpa,
+            "  These are NOT missing members: an arc whose live tree is empty has NOT been shown\n" ++
+            "  to be unsliced. `trk show <id>` for any of them; the full record is in git history.\n", .{});
+    }
+
+    /// `compactedMemberBlock`'s machine half: `,"compacted_members":[...]`,
+    /// always emitted at the root (empty array included) so a consumer branches
+    /// on the array's LENGTH and not on whether the key exists. Named
+    /// `compacted_members`, not `compacted`, because a tombstone root already
+    /// carries `"compacted": true` in the same object.
+    fn compactedMembersJson(self: *Cli, arc: Ulid) Error!void {
+        const gpa = self.gpa;
+        const members = try self.store.compactedMembers(gpa, arc);
+        defer gpa.free(members);
+        try self.write(",\"compacted_members\":[");
+        for (members, 0..) |tb, i| {
+            if (i != 0) try self.write(",");
+            try self.write("{\"compacted\":true,\"id\":\"");
+            try self.write(&tb.id.text);
+            try self.write("\",\"short\":");
+            if (tb.short) |s| try self.writeJsonString(s) else try self.write("null");
+            try self.write(",\"title\":");
+            try self.writeJsonString(tb.title);
+            try self.write(",\"was\":");
+            try self.writeJsonString(tb.reason);
+            try self.print(",\"collected_ts\":{d}}}", .{tb.ts});
+        }
+        try self.write("]");
     }
 
     /// `trk tree --json`: nested `{id,short,title,state,children}` with the same
@@ -3557,7 +3660,11 @@ pub const Cli = struct {
             if (i != 0) try self.write(",");
             try self.treeJson(c, false, visited);
         }
-        try self.write("]}");
+        try self.write("]");
+        // Root only: `children` at a non-root node is a prereq list, and a
+        // graduated arc member is not a prereq of anything here.
+        if (is_root) try self.compactedMembersJson(id);
+        try self.write("}");
     }
 
     fn treeNode(
@@ -3706,7 +3813,18 @@ pub const Cli = struct {
     /// open`-shaped line anyone could skim as live. A reader who sees this
     /// output and a reader who sees a live task cannot mistake one for the
     /// other even at a glance.
+    ///
+    /// Split into `tombstoneRecord` + `tombstoneFooter` so `tree` can slot its
+    /// graduated-member listing BETWEEN them (01M29P5T7), rather than after a
+    /// paragraph that reads like the end of the output. The halves are never
+    /// printed alone — a footer with no record, or a record with no footer,
+    /// would be a third way for this to read wrong.
     fn showTombstone(self: *Cli, tb: *const tracker.store.Tombstone) Error!void {
+        try self.tombstoneRecord(tb);
+        try self.tombstoneFooter(tb);
+    }
+
+    fn tombstoneRecord(self: *Cli, tb: *const tracker.store.Tombstone) Error!void {
         try self.print("COMPACTED — {s} existed and is no longer in the live store.\n\n", .{&tb.id.text});
         try self.print("id:        {s}\n", .{&tb.id.text});
         if (tb.short) |s| try self.print("short:     {s}\n", .{s});
@@ -3725,6 +3843,9 @@ pub const Cli = struct {
             try self.print("collected: {s} UTC\n", .{fmtTs(tb.ts, &buf)});
         }
         try self.print("record:    {s}\n", .{tb.src});
+    }
+
+    fn tombstoneFooter(self: *Cli, tb: *const tracker.store.Tombstone) Error!void {
         try self.print(
             "\nThis is NOT a dangling citation: the id was real, the work closed, and `trk compact`\n" ++
                 "physically GC'd the task out of .tracker/. Do not \"fix\" a reference to it. The full\n" ++
@@ -3738,6 +3859,13 @@ pub const Cli = struct {
     /// view never emits — so a machine reader branches on a key rather than on
     /// the absence of one.
     fn showTombstoneJson(self: *Cli, tb: *const tracker.store.Tombstone) Error!void {
+        try self.tombstoneJsonOpen(tb);
+        try self.write("}\n");
+    }
+
+    /// `showTombstoneJson` without its closing brace + newline, so `tree --json`
+    /// can add `"compacted_members"` to the same object (01M29P5T7).
+    fn tombstoneJsonOpen(self: *Cli, tb: *const tracker.store.Tombstone) Error!void {
         try self.write("{\"compacted\":true,\"id\":\"");
         try self.write(&tb.id.text);
         try self.write("\",\"short\":");
@@ -3753,7 +3881,7 @@ pub const Cli = struct {
         }
         try self.write("],\"src\":");
         try self.writeJsonString(tb.src);
-        try self.print(",\"collected_ts\":{d}}}\n", .{tb.ts});
+        try self.print(",\"collected_ts\":{d}", .{tb.ts});
     }
 
     /// `trk show <id>` — full task detail view.
@@ -3880,9 +4008,19 @@ pub const Cli = struct {
                     // The gate is the ROOT's state (the completion judgment);
                     // drain progress is shown as context, not as the gate.
                     const p = self.store.arcProgress(e.to);
-                    try self.print("  {s} {s}  arc: {s}  ({d}/{d} done)\n", .{
+                    try self.print("  {s} {s}  arc: {s}  ({d}/{d} done", .{
                         stateMarker(pre.state), try self.shortId(e.to, &sb), pre.title, p.done, p.total,
                     });
+                    // `arcProgress` counts LIVE members only — it walks `ins`,
+                    // and compaction deleted the edges along with the members
+                    // (01M29P5T7). So a fully-built, fully-graduated arc reads
+                    // `(0/0 done)`, which is what an unsliced one reads too.
+                    // Appended only when non-zero: the common line must not
+                    // grow a `+0` on every arc.
+                    const gone = try self.store.compactedMembers(self.gpa, e.to);
+                    defer self.gpa.free(gone);
+                    if (gone.len != 0) try self.print(", +{d} compacted", .{gone.len});
+                    try self.write(")\n");
                 } else {
                     try self.print("  {s} {s}  {s}\n", .{
                         stateMarker(pre.state), try self.shortId(e.to, &sb), pre.title,
@@ -3981,7 +4119,12 @@ pub const Cli = struct {
                 try self.taskRefOpen(e.to);
                 if (self.store.isArc(e.to)) {
                     const p = self.store.arcProgress(e.to);
-                    try self.print(",\"arc_progress\":{{\"done\":{d},\"total\":{d}}}", .{ p.done, p.total });
+                    const gone = try self.store.compactedMembers(self.gpa, e.to);
+                    defer self.gpa.free(gone);
+                    // Always emitted, unlike the text view's conditional suffix:
+                    // a machine reader wants a stable schema, a human wants a
+                    // line that stays quiet when there is nothing to say.
+                    try self.print(",\"arc_progress\":{{\"done\":{d},\"total\":{d},\"compacted\":{d}}}", .{ p.done, p.total, gone.len });
                 }
                 try self.write("}");
             }

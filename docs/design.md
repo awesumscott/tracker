@@ -624,11 +624,50 @@ The merge model is **owned** here, because it gates how parallel agents may touc
     round-trip self-verify can fail, so `CompactVerifyFailed` restores `tombstones.jsonl` alongside
     `snapshot.jsonl`/`log.jsonl`. The one error this mechanism must never make is the mirror of the one it
     fixes: a tombstone for a task that is still live would make `show` report live work as gone.
-  - **Known, not fixed here:** `trk tree <arc>` renders an arc whose members were compacted as EMPTY
-    (task `01M29P5T7`) — the same root cause, since `serializeState` drops the `in` edges along with the
-    member tasks, and `renderTree` applies no state filter of its own (an archived-but-not-yet-compacted
-    member still renders fine). The tombstone records each task's arc memberships, so the data that fix
-    needs is now in the store.
+  - **`trk tree` reports an arc's GRADUATED members instead of omitting them** (task `01M29P5T7`). The
+    measured cost of not doing so was one wasted dispatch: `trk tree` on an arc whose members had all been
+    archived and compacted printed a well-formed one-line tree, indistinguishable from a never-sliced arc,
+    and a lane was briefed to "design and slice" work that had already shipped. That is the *asymmetry*
+    this whole mechanism is about, one level up — `show` on a collected id at least said something
+    distinctive, while `tree` said something entirely **normal**. Absence is only dangerous in the shape
+    that looks like an ordinary answer.
+    - *Root cause, and why it is a display fix and not a recovery one.* `renderTree`/`treeJson` iterate
+      `store.ins` with no state filter, so an archived-but-not-yet-compacted member renders fine, marked
+      `[a]`. An arc can therefore only render empty once the `in` EDGES are gone, which happens in exactly
+      one place: `serializeState`'s `gc_set` drops every edge with a collectable endpoint alongside the
+      member tasks. The tombstone already records each collected task's arc memberships, so the fact was in
+      the store and only the view was silent. `Store.compactedMembers` is that read.
+    - *Emitted unconditionally, not behind a `--archived` flag.* A flag leaves the silence exactly where it
+      did the damage: the reader who was misled did not know to ask, because the empty tree gave him no
+      reason to. Under the arc's live children, `tree` prints `compacted members (N)` and one
+      `compacted: <short>  was <reason>  <title>` row each — no state marker, no box-drawing connector, so
+      a graduated member cannot be skim-read as a live one (`showTombstone`'s rule, applied to a list).
+      `--json` carries `compacted_members` at the ROOT, always present and possibly empty, each entry keyed
+      `"compacted": true`.
+    - *The paired negative is the other half of the fix.* An arc that genuinely has no graduated members
+      still renders as a bare one-line tree with no block at all. Making absence speak is only an
+      improvement while presence still reads as presence; a block printed unconditionally would have
+      swapped one indistinguishable pair for another, pointing the other way.
+    - *A COMPACTED root gets `show`'s verdict, not "no task matches".* `trk tree <collected-arc>` prints
+      the tombstone record, its graduated members, and exits **2** — the same three-way contract as `show`,
+      since a graduated ARC read as never-existed is the identical misreading aimed at the root instead of
+      at the members.
+    - *`show`'s own sections, checked and made consistent.* `prereqs`, `dependents (needs this)` and `arcs`
+      all iterate live edges with no state filter, so they behave exactly like `tree`: an archived member
+      still lists, a compacted one vanishes with its edge. Only ONE of those is recoverable — an arc's
+      compacted MEMBERS — because the index records the task→arc direction and nothing else. So `show`'s
+      arc-prereq line, whose `(0/0 done)` was the same silent-absence shape, now reads
+      `(0/0 done, +N compacted)` when there are graduated members and stays unchanged when there are none
+      (`--json` always states `arc_progress.compacted`, because a machine reader wants a stable schema
+      where a human wants a quiet line). A compacted DEPENDENT is not recoverable: the index records no
+      `needs` edges. Nor is a live task's compacted ARC: the live task has no tombstone of its own, and the
+      arc's own record says only what *it* was a member of. Both are limits of what compaction kept, not
+      oversights — recovering either means recording edges the index deliberately does not carry.
+    - *Still omitting them, and knowingly:* `render` (`docs/TODO.md`), `list --arc` and `next` enumerate arc
+      members the same way and say nothing about graduated ones. Not folded in here because the TODO.md
+      projection's format is load-bearing for readers outside this tool and the right shape there is a
+      judgment, not an obvious repair. Carrier: Enix task `01M2MWB6Q`, which also holds the open question
+      of whether a forward-looking projection wants the annotation at all.
 - **The snapshot carries a PER-TASK watermark, and a log event older than it is withheld and reported**
   (2026-08-20, task `01M0EM3G6`). `compact` stamps each `add` it writes with `wm` — the `ts` of the newest
   event folded into the state being written (carried forward, so a task nothing has touched since an earlier
