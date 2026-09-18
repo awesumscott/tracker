@@ -2078,6 +2078,57 @@ test "compact's pin check matches whole lines, not comment mentions" {
     try testing.expect(std.mem.indexOf(u8, f.warn.items, "quarantine.jsonl merge=text") != null);
 }
 
+test "compact warns for tombstones.jsonl specifically on a PRE-EXISTING store's legacy 3-pin .gitattributes (01M2N0QW2)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try f.store.append(.{ .add = .{ .id = mintId(), .title = "a task" } });
+
+    // The exact byte-for-byte content `trk init` wrote BEFORE the tombstones
+    // pin was added to the template (eb427ca) — what every store created
+    // before that commit still carries today, verbatim (confirmed against
+    // both this repo's own .tracker/.gitattributes and Enix's). `init` never
+    // rewrites an existing .gitattributes, so this file can never self-heal;
+    // `compact`'s check is what has to catch it.
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = ".tracker/.gitattributes",
+        .data =
+        \\# Written by `trk init`. Kept INSIDE .tracker/ deliberately: git resolves
+        \\# attributes per directory and the file nearest the path wins, so these
+        \\# cannot be overridden by a broader pattern in a parent .gitattributes.
+        \\#
+        \\# The append-only event log: every line is an independent, idempotent event.
+        \\# Union-merge so parallel-worktree appends combine instead of conflicting —
+        \\# that is what lets a lane close its OWN tasks in its worktree and have the
+        \\# events merge on integration. Merge-SAFE, not a general CRDT: it rests on
+        \\# the fan-out invariant that each writer mutates only its own disjoint tasks.
+        \\log.jsonl merge=union
+        \\#
+        \\# Whole-file baselines, written ONLY by a serialized, orchestrator-only
+        \\# `compact` (read-modify-rename, not append). Two sides diverging here means
+        \\# two compactions raced — a rule violation that must SURFACE as a conflict,
+        \\# never be silently combined. snapshot.jsonl is replayed on every load, so a
+        \\# union merge would interleave two baselines and duplicate/revert state;
+        \\# quarantine.jsonl (the ghost-retirement spool) is never read back by trk, so
+        \\# unioning it is merely wrong rather than corrupting — pinned for the same
+        \\# reason and to keep the pair symmetric.
+        \\snapshot.jsonl merge=text
+        \\quarantine.jsonl merge=text
+        \\
+        ,
+        .flags = .{},
+    });
+    try f.run(&.{"compact"});
+    // POSITIVE: the one pin this legacy file lacks is named.
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "tombstones.jsonl merge=union") != null);
+    // NEGATIVE: the three pins the legacy file already carries are NOT
+    // re-flagged — a check that warned on everything regardless of content
+    // would pass this same assertion for the wrong reason.
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "log.jsonl merge=union` line") == null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "snapshot.jsonl merge=text` line") == null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "quarantine.jsonl merge=text` line") == null);
+}
+
 test "trk init --force rewrites config with a custom --out; leaves an existing TODO.md" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
@@ -4293,6 +4344,49 @@ test "tombstones --rebuild: recovers an id compacted BEFORE the index existed, a
     // Idempotent: a second run records nothing new.
     try f.run(&.{ "tombstones", "--rebuild" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "0 new tombstone(s) recorded") != null);
+}
+
+test "tombstones --rebuild warns on an unpinned .gitattributes too (01M2N0QW2) — it can be the FIRST write to tombstones.jsonl, before any compact ever runs" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "pre-index work", .short = gone.text[0..9] } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "tracker log before the compact" });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+    // This store has never had a tombstones.jsonl at all — `--rebuild` below
+    // is its first-ever write to that file, and there is deliberately NO
+    // .tracker/.gitattributes on disk (the Fixture scaffolds the store
+    // directly, without going through `init`).
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstones.jsonl");
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 0), f.store.tombstones.items.len);
+
+    f.warn.clearRetainingCapacity();
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 new tombstone(s) recorded") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, ".gitattributes is absent") != null);
+
+    // Pin it, and the warning goes silent on the next rebuild — proves the
+    // check is live (not a permanent nag) and that `--rebuild` itself is the
+    // call site being exercised, not some other command run in between.
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = ".tracker/.gitattributes",
+        .data = tracker.store.gitattributes_text,
+        .flags = .{},
+    });
+    f.warn.clearRetainingCapacity();
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, ".gitattributes") == null);
 }
 
 test "tombstones --rebuild: recovers a GHOST whose full committed history is setBody+dep only — no add/setTitle/setShort/setState anywhere (01M2N8WMD's exact shape)" {

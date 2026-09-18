@@ -2199,13 +2199,18 @@ pub const Cli = struct {
     }
 
     /// Warn (to stderr, never stdout) when `.tracker/.gitattributes` is absent or
-    /// missing one of its pins. Called from `compact` because that is the verb
-    /// which CREATES `snapshot.jsonl`/`quarantine.jsonl` — the exact moment two
-    /// files that must never be union-merged come into existence.
+    /// missing one of its pins. Called from `compact` — the verb which CREATES
+    /// `snapshot.jsonl`/`quarantine.jsonl` and writes `tombstones.jsonl` — and
+    /// from `tombstones --rebuild`, the other verb that writes
+    /// `tombstones.jsonl` (and can be the FIRST thing ever to, in a store that
+    /// has never run `compact`). Each is the exact moment one of these
+    /// whole-file-or-append-but-must-not-union files comes into existence or
+    /// changes, so each is where a missing pin needs to surface.
     ///
-    /// The claim is deliberately narrow. This path never shells out to git (two
-    /// verbs do — `stale` and `tombstones --rebuild` — but not this one), so it
-    /// cannot ask what attributes are actually in EFFECT (a parent
+    /// The claim is deliberately narrow. THIS CHECK never shells out to git —
+    /// `stale` and `tombstones --rebuild`'s own history scan do, but this
+    /// function, even called from the latter, does not — so it cannot ask what
+    /// attributes are actually in EFFECT (a parent
     /// `.gitattributes`, `.git/info/attributes` and `core.attributesFile` all
     /// feed that, and reimplementing git's resolution would be worse than not
     /// checking). What it can check is its OWN file, so a missing one says
@@ -4768,7 +4773,16 @@ pub const Cli = struct {
             }
             return self.verifyTombstoneIndex();
         }
-        if (rebuild) try self.rebuildTombstones();
+        if (rebuild) {
+            try self.rebuildTombstones();
+            // Same reason `compact` checks: `--rebuild` is the OTHER verb that
+            // writes tombstones.jsonl, and can be the FIRST one to (a store
+            // that has never run `compact` still has a rebuildable git
+            // history). Without this, a repo whose only tombstones.jsonl write
+            // ever came from `--rebuild` would carry an unpinned file with no
+            // warning until some later `compact` happened to run.
+            try self.warnUnpinnedAttrs();
+        }
 
         if (json) {
             try self.write("[");
