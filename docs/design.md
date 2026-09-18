@@ -875,6 +875,30 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
 
 ## Settled rulings
 
+- **A parse failure names the argument that FAILED, and guesses the spelling** (01M1FMMFZ, 2026-09-18).
+  `trk add --tags=a,b "<title>"` printed `unknown flag '<the title>'` — blaming the one argument in the
+  line that was correct, and sending the reader to hunt a quoting bug in a long heredoc-written title.
+  `add` took `args[0]` as the title unconditionally, so the misspelled flag was swallowed into the title
+  slot and the real title arrived as an unexpected second positional. Three parts to the ruling:
+  - **The title is the first BARE token**, not `args[0]`. The blame then lands on the token that actually
+    failed to parse, and `trk add --tag ui "<title>"` (flags first) works as anyone would expect. A second
+    bare token is its own message — "add takes exactly one positional (the title)" — because that is a lost
+    quote, not an unknown flag. A title that genuinely starts with `-` has to be reworded; trk has no `--`
+    terminator, and adding one would buy a case nobody has hit at the cost of a second parsing mode.
+    No MCP escape hatch is needed: `buildArgv` already refuses a dash-leading positional at the boundary,
+    where the message can say what really happened, so a typed `title` is non-dash by construction.
+  - **`Verb.flags` joins the table**, alongside `run`/`mutates`/`tools`, and every `unknown flag` site goes
+    through one `Cli.unknownFlag`. It names a near-miss within an edit distance of 2 over that verb's own
+    vocabulary (`--tags` → `--tag`, `--limt` → `--limit`), because the whole class of error is reaching for
+    the plural of a repeatable option; 2, not 1, also catches `--priorty`, and is far too tight to suggest
+    `--tag` for `--json`. An `=`-joined value on a real flag (`--tag=ui`) gets its own line — no trk flag
+    has ever taken one, which is exactly why the spelling is plausible and worth saying out loud. A
+    cli_test arm asserts every listed flag appears in its verb's help text, mirroring the rule mcp_test
+    already enforces for the tool schemas.
+  - **A dash-leading token in an ID slot is a flag too.** `trk edit --titel x` answered "no task matches
+    prefix '--titel'", which sends the reader looking for a task. No ULID or short id begins with a dash,
+    so `Cli.resolve` routes it to the same diagnostic — one fix covering every id-positional verb.
+
 - **The lease, and `claimed` → `submitted`** (01M2GGFGR, 2026-09-14). In fan-outs the only thing stopping
   two lanes or sessions from starting the same task was the orchestrator's memory, and `claimed` already
   read as "this task is taken" while meaning "this commit completes it". So `claimed` became the lease and

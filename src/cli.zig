@@ -242,6 +242,13 @@ pub const Cli = struct {
     /// call. tree recursion copies into a local dupe before recursing, so reuse
     /// is safe. Owned by the Cli; the caller (main/tests) deinits it.
     prereq_scratch: std.ArrayList(Ulid) = .empty,
+    /// The verb `dispatch` is currently running. Set there and nowhere else,
+    /// purely so `unknownFlag` can name the verb and search ITS flag vocabulary
+    /// for a near-miss without threading a flag list through fourteen parse
+    /// loops. Null when a `cmdX` is called directly (never in production —
+    /// `main.zig` and `mcp.zig` both go through `run`/`dispatch`); the
+    /// diagnostic then simply drops the verb-specific half rather than guessing.
+    current_verb: ?*const Verb = null,
 
     fn print(self: *Cli, comptime fmt: []const u8, args: anytype) !void {
         try self.out.print(self.gpa, fmt, args);
@@ -386,6 +393,7 @@ pub const Cli = struct {
             try self.print("trk: refusing to run '{s}' — TRK_READONLY is set (mutations are disabled)\n", .{cmd});
             return error.ReadOnly;
         }
+        self.current_verb = v;
         return v.run(self, rest);
     }
 
@@ -432,6 +440,16 @@ pub const Cli = struct {
         /// The MCP tools this verb is exposed as (`mcp.zig`). Empty = CLI-only,
         /// which must be a deliberate, commented choice.
         tools: []const Tool,
+        /// Every flag THIS verb's parser accepts, for the near-miss suggestion
+        /// in `unknownFlag` (01M1FMMFZ) — the whole class of error there is
+        /// someone reaching for the plural of a repeatable option, and naming
+        /// the right spelling turns a hunt into a glance. A verb that takes no
+        /// flags leaves it empty. Kept in the table rather than beside each
+        /// parse loop so the message does not need the loop's locals, and
+        /// asserted against the verb's own help text by a cli_test arm — the
+        /// same "flags live in one place" rule mcp_test.zig already enforces
+        /// for the tool schemas.
+        flags: []const []const u8 = &.{},
         /// Full synopsis + purpose + key flags + an example — `trk <verb>
         /// --help`, and the MCP tool description.
         text: []const u8,
@@ -440,7 +458,7 @@ pub const Cli = struct {
     /// THE verb table: dispatch, `--help`, the read-only gate and the MCP tool
     /// list all derive from it, so none of them can drift from the others.
     pub const verbs = [_]Verb{
-        .{ .name = "init", .run = &cmdInit, .mutates = true, .tools = &cli_only_tools, .text =
+        .{ .name = "init", .run = &cmdInit, .mutates = true, .tools = &cli_only_tools, .flags = &.{ "--out", "--force", "--no-gitattributes", "--no-gitignore" }, .text =
         \\trk init [--out <path>] [--force] [--no-gitattributes] [--no-gitignore]
         \\  Scaffold a fresh tracker: .tracker/ + an empty log, a config.json
         \\  (render.out defaults to docs/TODO.md; set it with --out), a
@@ -459,7 +477,7 @@ pub const Cli = struct {
         \\  reason as the attributes file. --no-gitignore skips it likewise.
         \\  e.g.  trk init            trk init --out TODO.md
         },
-        .{ .name = "add", .run = &cmdAdd, .mutates = true, .tools = &add_tools, .text =
+        .{ .name = "add", .run = &cmdAdd, .mutates = true, .tools = &add_tools, .flags = &.{ "--body", "--tag", "--needs", "--doc", "--in", "--seq", "--arc", "--priority", "-v", "--verbose" }, .text =
         \\trk add "<title>" [--body <s>] [--tag <t> ...] [--doc <doc_id[#section]> ...]
         \\       [--in <arc> [--seq <n>]] [--arc] [--needs <id> ...] [--priority <n>] [-v]
         \\  Create a task. Prints ONLY the new full ULID (scriptable: ID=$(trk add "x"));
@@ -480,7 +498,7 @@ pub const Cli = struct {
         \\  e.g.  trk add "Add dark mode" --tag ui --in 01KVX4K0 --needs 01KWZJFRR
         \\        trk add "Ship v2" --arc
         },
-        .{ .name = "dep", .run = &cmdDep, .mutates = true, .tools = &dep_tools, .text =
+        .{ .name = "dep", .run = &cmdDep, .mutates = true, .tools = &dep_tools, .flags = &.{ "--needs" }, .text =
         \\trk dep <needer> --needs <prereq> [--needs <prereq> ...]
         \\  Make <needer> require prerequisite <prereq> (a `needs` edge). ONE positional,
         \\  the prereq(s) flagged: two bare positionals of the same type could be swapped
@@ -497,14 +515,14 @@ pub const Cli = struct {
         \\  prereq in a DIFFERENT arc — or the whole of a different arc — is unaffected.
         \\  e.g.  trk dep 01KX6H4V --needs 01KX6H48   (init needs config)
         },
-        .{ .name = "undep", .run = &cmdUndep, .mutates = true, .tools = &undep_tools, .text =
+        .{ .name = "undep", .run = &cmdUndep, .mutates = true, .tools = &undep_tools, .flags = &.{ "--needs" }, .text =
         \\trk undep <needer> --needs <prereq> [--needs <prereq> ...]
         \\  Remove the <needer> needs <prereq> edge (tombstoned; a no-op if absent).
         \\  Exact argument shape as `trk dep`, so undoing an edge is the same sentence
         \\  with one verb changed. The bare two-positional form is a hard usage error.
         \\  e.g.  trk undep 01KX6H4V --needs 01KX6H48
         },
-        .{ .name = "in", .run = &cmdIn, .mutates = true, .tools = &in_tools, .text =
+        .{ .name = "in", .run = &cmdIn, .mutates = true, .tools = &in_tools, .flags = &.{ "--seq" }, .text =
         \\trk in <task> <arc> [--seq <n>]
         \\  Add <task> to arc <arc> as a DIRECT member, optionally ordered by --seq.
         \\  <arc> MUST already be a declared arc (`trk arc <arc>` / `trk add --arc`) —
@@ -544,7 +562,7 @@ pub const Cli = struct {
         \\  got written has A in the task slot and B in the arc slot.
         \\  e.g.  trk unin 01KX6H4V 01KVX4K0
         },
-        .{ .name = "arc", .run = &cmdArc, .mutates = true, .tools = &arc_tools, .text =
+        .{ .name = "arc", .run = &cmdArc, .mutates = true, .tools = &arc_tools, .flags = &.{ "--undo", "--standing" }, .text =
         \\trk arc <id> [--undo] [--standing [--undo]]
         \\  Declare <id> an arc root (an `arcDeclare` event), independent of whether any
         \\  task is `in` it — the fix for an arc with genuinely zero members yet (a real
@@ -570,7 +588,7 @@ pub const Cli = struct {
         \\  migrated task, plus a summary count. A second run finds nothing — safe to
         \\  re-run blind.
         },
-        .{ .name = "migrate-shorts", .run = &cmdMigrateShorts, .mutates = true, .tools = &cli_only_tools, .text =
+        .{ .name = "migrate-shorts", .run = &cmdMigrateShorts, .mutates = true, .tools = &cli_only_tools, .flags = &.{ "--min" }, .text =
         \\trk migrate-shorts [--min <n>]
         \\  One-time (but idempotent/re-runnable) migration: for every task with no
         \\  FROZEN short id yet, freeze it at its CURRENT dynamically-computed short
@@ -589,7 +607,7 @@ pub const Cli = struct {
         \\  or 6 chars becomes longer). Run it once, on purpose, not routinely.
         \\  e.g.  trk migrate-shorts --min 9
         },
-        .{ .name = "state", .run = &cmdState, .mutates = true, .tools = &state_tools, .text =
+        .{ .name = "state", .run = &cmdState, .mutates = true, .tools = &state_tools, .flags = &.{ "--holder" }, .text =
         \\trk state <id> <open|claimed|submitted|done|blocked|dropped> [--holder <who>]
         \\  Set a task's state. Lifecycle: open -> claimed -> submitted -> done, with
         \\  `trk release` (claimed -> open) as the release.
@@ -611,7 +629,7 @@ pub const Cli = struct {
         \\  e.g.  trk state 01KX6H48 claimed --holder lane-3
         \\        trk state 01KX6H48 submitted
         },
-        .{ .name = "release", .run = &cmdRelease, .mutates = true, .tools = &release_tools, .text =
+        .{ .name = "release", .run = &cmdRelease, .mutates = true, .tools = &release_tools, .flags = &.{ "--holder" }, .text =
         \\trk release <id> [--holder <who>]
         \\trk release --holder <who>
         \\  Release a lease (claimed -> open), putting the task back in `trk next`.
@@ -625,7 +643,7 @@ pub const Cli = struct {
         \\  lease. (`trk state <id> open` is the unconditional override.)
         \\  e.g.  trk release --holder lane-3        trk release 01KX6H48
         },
-        .{ .name = "next", .run = &cmdNext, .tools = &next_tools, .text =
+        .{ .name = "next", .run = &cmdNext, .tools = &next_tools, .flags = &.{ "--arc", "--not-tag", "--limit", "--json", "--word" }, .text =
         \\trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> | --word <term> ...]
         \\  The ready frontier: open tasks whose prereqs are ALL met. An arc root is
         \\  a container: it is held back until its non-parked members are finished,
@@ -640,7 +658,7 @@ pub const Cli = struct {
         \\  --json emits a machine-readable array.
         \\  e.g.  trk next           trk next prism windowed
         },
-        .{ .name = "list", .run = &cmdList, .tools = &list_tools, .text =
+        .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--state", "--tag", "--not-tag", "--limit", "--json", "--word" }, .text =
         \\trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--not-tag <t> ...]
         \\         [--limit <n>] [--json] [<term> | --word <term> ...]
         \\  Every task (not just the ready frontier), filterable by arc/state/tag and
@@ -653,7 +671,7 @@ pub const Cli = struct {
         \\        trk list --state submitted           (the awaiting-verification queue)
         \\        trk list --state claimed             (tasks currently leased)
         },
-        .{ .name = "render", .run = &cmdRender, .mutates = true, .tools = &render_tools, .text =
+        .{ .name = "render", .run = &cmdRender, .mutates = true, .tools = &render_tools, .flags = &.{ "--out" }, .text =
         \\trk render [--out <path>]
         \\  Write the TODO.md markdown projection. Destination precedence:
         \\  explicit --out > config render.out > stdout. Overwrites the target (it is
@@ -665,7 +683,7 @@ pub const Cli = struct {
         \\  unchanged in the raw bytes. The header reports an arc-less drift count
         \\  every regeneration (`trk list --no-arc` for the list).
         },
-        .{ .name = "tree", .run = &cmdTree, .tools = &tree_tools, .text =
+        .{ .name = "tree", .run = &cmdTree, .tools = &tree_tools, .flags = &.{ "--json" }, .text =
         \\trk tree <arc-or-task> [--json]
         \\  Print the ASCII prereq hierarchy rooted at an arc or task (prereqs nested
         \\  under their dependents; a shared prereq prints once, then "(seen)").
@@ -695,7 +713,7 @@ pub const Cli = struct {
         \\  .tracker/.gitignore so it never becomes an untracked stray. Never
         \\  compact while fan-out worktrees are in flight.
         },
-        .{ .name = "archive", .run = &cmdArchive, .mutates = true, .tools = &archive_tools, .text =
+        .{ .name = "archive", .run = &cmdArchive, .mutates = true, .tools = &archive_tools, .flags = &.{ "--out", "--dry-run", "--allow-buried-decisions", "--allow-buried-decisions-for", "--arc", "--tag", "--word" }, .text =
         \\trk archive [<term> | --word <term> ...] [--arc <id>] [--tag <t>] [--out <path>]
         \\            [--dry-run] [--allow-buried-decisions] [--allow-buried-decisions-for <id>:<n>:<digest>]...
         \\  Graduate DONE tasks to changelog bullets (--out > config archive.out >
@@ -742,7 +760,7 @@ pub const Cli = struct {
         \\trk doc resolve <doc_id>      print the path for a doc_id
         \\  The registry backs the --doc/--add-doc design pointers on add/edit.
         },
-        .{ .name = "show", .run = &cmdShow, .tools = &show_tools, .text =
+        .{ .name = "show", .run = &cmdShow, .tools = &show_tools, .flags = &.{ "--body", "--json" }, .text =
         \\trk show <id> [--body | --json]
         \\  Full detail for one task: body, state, priority, tags, prereqs,
         \\  dependents, arc memberships, and doc pointers. Ids accept any unique prefix.
@@ -753,7 +771,7 @@ pub const Cli = struct {
         \\  (`trk edit <id> --body "$(trk show <id> --body)"` also works, but the
         \\  shell eats ALL trailing newlines and the arg is length-capped)
         },
-        .{ .name = "edit", .run = &cmdEdit, .mutates = true, .tools = &edit_tools, .text =
+        .{ .name = "edit", .run = &cmdEdit, .mutates = true, .tools = &edit_tools, .flags = &.{ "--title", "--replace-body", "--append-body", "--add-doc", "--rm-doc", "--add-tag", "--rm-tag", "--priority" }, .text =
         \\trk edit <id> [--title <s>] [--replace-body <s|->] [--append-body <s|->]
         \\        [--add-tag <t> ...] [--rm-tag <t> ...]
         \\        [--add-doc <doc_id[#section]> ...] [--rm-doc <doc_id> ...] [--priority <n>]
@@ -809,12 +827,12 @@ pub const Cli = struct {
         \\  e.g.  trk rule 01M298M9Z "RULED: (a), see docs/design.md"
         \\        trk show 01M298M9Z --body | trk rule 01M298M9Z -
         },
-        .{ .name = "log", .run = &cmdLog, .tools = &log_tools, .text =
+        .{ .name = "log", .run = &cmdLog, .tools = &log_tools, .flags = &.{ "--limit", "--json" }, .text =
         \\trk log [<id>] [--limit <n>] [--json]
         \\  Event history, most-recent-last: the whole log, or one task's events.
         \\  --json: an array of {ts,op,task_id,summary}.
         },
-        .{ .name = "stale", .run = &cmdStale, .tools = &stale_tools, .text =
+        .{ .name = "stale", .run = &cmdStale, .tools = &stale_tools, .flags = &.{ "--oneline" }, .text =
         \\trk stale
         \\  Cross-reference: which OPEN tasks have their id cited in a LANDED commit
         \\  message (this branch's `git log --oneline` ancestry — deliberately NOT
@@ -827,7 +845,7 @@ pub const Cli = struct {
         \\  repo housing `.tracker/`, which may differ from where `trk` itself lives).
         \\  e.g.  trk stale
         },
-        .{ .name = "tombstones", .run = &cmdTombstones, .mutating_subcommands = &.{"--rebuild"}, .tools = &tombstones_tools, .text =
+        .{ .name = "tombstones", .run = &cmdTombstones, .mutating_subcommands = &.{"--rebuild"}, .tools = &tombstones_tools, .flags = &.{ "--rebuild", "--verify", "--json" }, .text =
         \\trk tombstones [--rebuild | --verify] [--json]
         \\  The index of tasks `trk compact` physically GC'd (.tracker/tombstones.jsonl).
         \\  Compaction is the only thing that destroys an id: the task, its title and
@@ -1152,6 +1170,13 @@ pub const Cli = struct {
             try self.write("trk: empty id\n");
             return error.BadId;
         }
+        // A `-`-leading token in an id slot is a misspelled FLAG that the
+        // parser swallowed as the positional, not an id anyone meant to type —
+        // no ULID or short id begins with a dash. Same misdirection `cmdAdd`
+        // carried (01M1FMMFZ): `trk edit --titel x` used to answer "no task
+        // matches prefix '--titel'", sending the reader to look for a task.
+        // Routing it through `unknownFlag` names the near-miss instead.
+        if (s[0] == '-') return self.unknownFlag(s);
 
         // Prefix match (case-insensitive, against the canonical upper-case text).
         const ids = try self.store.allIds(self.gpa);
@@ -1264,6 +1289,118 @@ pub const Cli = struct {
     }
 
     /// Read the next arg as a flag value or report a clean missing-arg error.
+    /// Report an argument the parser could not use, and return the error to
+    /// propagate. Every `unknown flag` site goes through here.
+    ///
+    /// What it exists to fix (01M1FMMFZ): the message used to be a bare
+    /// `unknown flag '<arg>'`, and on a positional-title verb the `<arg>` it
+    /// named was the wrong one. `trk add --tags=a,b "<title>"` swallowed
+    /// `--tags=a,b` into the title slot, met the real title as an unexpected
+    /// second positional, and blamed THAT — pointing at the one argument in the
+    /// line that was correct. The cost is not cosmetic: it sends you to inspect
+    /// a long, backtick-and-em-dash-bearing title written through a heredoc,
+    /// hunting a quoting bug that was never there. `cmdAdd` now takes the first
+    /// BARE token as the title so the blame lands on the token that actually
+    /// failed to parse; this function makes the message worth reading when it
+    /// gets there.
+    ///
+    /// Three shapes, because three different mistakes reach here:
+    ///   * `--tag=x` — an `=`-joined value. No trk flag has ever taken one, and
+    ///     that is exactly why it is worth saying out loud rather than just
+    ///     "unknown flag": the spelling is plausible, and the fix is a space.
+    ///   * `--tags` — a near-miss on a real flag. The whole class of error is
+    ///     someone reaching for the plural of a REPEATABLE option (`--tag <t>
+    ///     ...`), which is a one-character edit, so a bounded edit distance over
+    ///     the verb's own vocabulary names the right spelling nearly every time.
+    ///   * a bare token — not a flag at all, just one positional too many.
+    /// Returns the ERROR VALUE rather than an error union, so every call site
+    /// — including `parseNeedsArgs`, which returns a struct — is the same one
+    /// line: `return self.unknownFlag(arg);`.
+    fn unknownFlag(self: *Cli, arg: []const u8) Error {
+        self.reportUnknownFlag(arg) catch |e| return e;
+        return error.UnknownFlag;
+    }
+
+    fn reportUnknownFlag(self: *Cli, arg: []const u8) Error!void {
+        const verb = if (self.current_verb) |v| v.name else "";
+        const known: []const []const u8 = if (self.current_verb) |v| v.flags else &.{};
+
+        if (arg.len == 0 or arg[0] != '-') {
+            try self.print("trk: unexpected argument '{s}' — it is not a flag, and this verb has no", .{arg});
+            if (verb.len > 0) {
+                try self.print(" further positional to put it in (trk {s} --help)\n", .{verb});
+            } else {
+                try self.write(" further positional to put it in\n");
+            }
+            return;
+        }
+
+        // `--flag=value`: report the JOINED form, but search on the flag half —
+        // `--tags=a,b` is both mistakes at once and the near-miss is the more
+        // useful half to name.
+        const eq = std.mem.indexOfScalar(u8, arg, '=');
+        const name = if (eq) |e| arg[0..e] else arg;
+        if (eq != null and isKnownFlag(known, name)) {
+            try self.print(
+                "trk: '{s}' — trk flags never take an =-joined value; pass it as the next argument: {s} {s}\n",
+                .{ arg, name, arg[eq.? + 1 ..] },
+            );
+            return;
+        }
+
+        try self.print("trk: unknown flag '{s}'", .{arg});
+        if (nearestFlag(known, name)) |near| {
+            try self.print(" — did you mean '{s}'?", .{near});
+        }
+        if (verb.len > 0) try self.print(" (trk {s} --help lists the flags it takes)", .{verb});
+        try self.write("\n");
+    }
+
+    fn isKnownFlag(known: []const []const u8, name: []const u8) bool {
+        for (known) |k| if (std.mem.eql(u8, k, name)) return true;
+        return false;
+    }
+
+    /// The closest flag in `known` to `name` within an edit distance of 2, or
+    /// null. Two, not one: it catches `--tags`/`--tag` (the plural, the case
+    /// this was built for) and `--priorty`/`--priority` alike, while still
+    /// being far too tight to suggest `--tag` for `--json`. Compared on the
+    /// full spelling INCLUDING the dashes, so `-tag` (one dash) is a distance-1
+    /// hit on `--tag` rather than a distance-0 tie with everything.
+    fn nearestFlag(known: []const []const u8, name: []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_d: usize = 3;
+        for (known) |k| {
+            const d = editDistance(name, k) orelse continue;
+            if (d < best_d) {
+                best_d = d;
+                best = k;
+            }
+        }
+        return best;
+    }
+
+    /// Levenshtein distance, or null if either side is longer than the row
+    /// buffer (no trk flag comes close; a pasted-garbage "flag" can, and a
+    /// suggestion is worthless there anyway).
+    fn editDistance(a: []const u8, b: []const u8) ?usize {
+        var prev: [64]usize = undefined;
+        var cur: [64]usize = undefined;
+        if (a.len + 1 > prev.len or b.len + 1 > prev.len) return null;
+        for (0..b.len + 1) |j| prev[j] = j;
+        for (a, 0..) |ca, i| {
+            cur[0] = i + 1;
+            for (b, 0..) |cb, j| {
+                const sub = prev[j] + @intFromBool(ca != cb);
+                const del = prev[j + 1] + 1;
+                const ins = cur[j] + 1;
+                cur[j + 1] = @min(sub, @min(del, ins));
+            }
+            @memcpy(prev[0 .. b.len + 1], cur[0 .. b.len + 1]);
+        }
+        return prev[b.len];
+    }
+
     fn flagVal(self: *Cli, args: []const []const u8, i: *usize, flag: []const u8) Error![]const u8 {
         if (i.* + 1 >= args.len) {
             try self.print("trk: {s} needs a value\n", .{flag});
@@ -1356,8 +1493,7 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, args[i], "--no-gitignore")) {
                 write_ignore = false;
             } else {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             }
         }
 
@@ -1484,7 +1620,15 @@ pub const Cli = struct {
             try self.write("trk: add needs a \"<title>\"\n");
             return error.MissingArgument;
         }
-        const title = args[0];
+        // The title is the first BARE token, not `args[0]` (01M1FMMFZ). Taking
+        // args[0] unconditionally meant a misspelled leading flag was swallowed
+        // as the title, and the REAL title then arrived as an unexpected second
+        // positional and got blamed for it — `trk add --tags=a,b "<title>"`
+        // printed `unknown flag '<title>'`, naming the one argument that was
+        // correct. Scanning for the first bare token puts the blame on the token
+        // that actually failed to parse, and makes `trk add --tag ui "<title>"`
+        // (flags first) work as anyone would expect it to.
+        var title: ?[]const u8 = null;
         var body: []const u8 = "";
         // Set when `--body -` read stdin into a fresh allocation (see bodyArg).
         var body_owned = false;
@@ -1501,10 +1645,26 @@ pub const Cli = struct {
         var docs: std.ArrayList([]const u8) = .empty;
         defer docs.deinit(self.gpa);
 
-        var i: usize = 1;
+        // No MCP escape hatch is needed for the scan below, and none exists:
+        // `mcp.zig`'s `buildArgv` already refuses a positional value beginning
+        // with `-` at the boundary ("the value would be parsed as a flag"), so
+        // a title arriving as a typed parameter is non-dash by construction and
+        // the first bare token is always it.
+        var i: usize = 0;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
-            if (std.mem.eql(u8, arg, "--body")) {
+            if (arg.len == 0 or arg[0] != '-') {
+                if (title != null) {
+                    try self.print(
+                        "trk: add takes exactly one positional (the title) — '{s}' is a second one. " ++
+                            "Quote the whole title as ONE argument, and pass everything else as a flag " ++
+                            "(trk add --help)\n",
+                        .{arg},
+                    );
+                    return error.UsageError;
+                }
+                title = arg;
+            } else if (std.mem.eql(u8, arg, "--body")) {
                 const b = try self.bodyArg("--body", try self.flagVal(args, &i, "--body"));
                 body = b.text;
                 body_owned = b.owned;
@@ -1525,10 +1685,15 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
                 verbose = true;
             } else {
-                try self.print("trk: unknown flag '{s}'\n", .{arg});
-                return error.UnknownFlag;
+                return self.unknownFlag(arg);
             }
         }
+
+        const the_title = title orelse {
+            try self.write("trk: add needs a \"<title>\" — every other argument here is a flag.\n" ++
+                "       A title that really does start with '-' has to be reworded; trk has no `--` terminator.\n");
+            return error.MissingArgument;
+        };
 
         // Resolve referenced ids BEFORE minting, so a bad --in/--needs fails
         // without leaving a half-built task in the log.
@@ -1571,7 +1736,7 @@ pub const Cli = struct {
         var short_buf: [ulid.len]u8 = undefined;
         const short = try self.mintShortId(id, &short_buf);
         const tag_slice = tags.items;
-        try self.store.append(.{ .add = .{ .id = id, .title = title, .body = body, .tags = tag_slice, .short = short } });
+        try self.store.append(.{ .add = .{ .id = id, .title = the_title, .body = body, .tags = tag_slice, .short = short } });
         if (priority) |p| try self.store.append(.{ .setPriority = .{ .id = id, .priority = p } });
         if (arc_id) |a| try self.store.append(.{ .in = .{ .task = id, .arc = a, .seq = seq } });
         if (declare_arc) try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = true } });
@@ -1585,7 +1750,7 @@ pub const Cli = struct {
         // `out` (stdout) — `out` is exactly the scriptable ULID and nothing else.
         if (!has_arc) {
             var sb: [ulid.len]u8 = undefined;
-            try self.warn.print(self.gpa, "trk: warning: {s} \"{s}\" is in no arc (pass --in <arc> or --arc)\n", .{ try self.shortId(id, &sb), title });
+            try self.warn.print(self.gpa, "trk: warning: {s} \"{s}\" is in no arc (pass --in <arc> or --arc)\n", .{ try self.shortId(id, &sb), the_title });
         }
         for (tag_slice) |tg| try self.warnDeprecatedArcTag(id, tg);
 
@@ -1636,8 +1801,7 @@ pub const Cli = struct {
             if (std.mem.eql(u8, arg, "--needs")) {
                 try prereqs.append(self.gpa, try self.resolve(try self.flagVal(args, &i, "--needs")));
             } else if (std.mem.startsWith(u8, arg, "--")) {
-                try self.print("trk: unknown flag '{s}'\n", .{arg});
-                return error.UnknownFlag;
+                return self.unknownFlag(arg);
             } else {
                 // The legacy `trk <verb> A B` form. Hard-errored, not accepted:
                 // tolerating it would keep the exact footgun this shape exists
@@ -1711,8 +1875,7 @@ pub const Cli = struct {
             if (std.mem.eql(u8, args[i], "--seq")) {
                 seq = try self.parseI32(try self.flagVal(args, &i, "--seq"));
             } else {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             }
         }
         // A task cannot be a member of itself. Caught explicitly (rather than
@@ -1831,8 +1994,7 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, args[i], "--standing")) {
                 standing = true;
             } else {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             }
         }
         var sb: [ulid.len]u8 = undefined;
@@ -1976,8 +2138,7 @@ pub const Cli = struct {
             if (std.mem.eql(u8, args[i], "--min")) {
                 min_len = try self.parseUsize(try self.flagVal(args, &i, "--min"));
             } else {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             }
         }
 
@@ -2042,8 +2203,7 @@ pub const Cli = struct {
             if (std.mem.eql(u8, args[i], "--holder")) {
                 holder = try self.flagVal(args, &i, "--holder");
             } else if (std.mem.startsWith(u8, args[i], "--")) {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             } else {
                 if (npos == pos.len) {
                     npos += 1;
@@ -2121,8 +2281,7 @@ pub const Cli = struct {
             if (std.mem.eql(u8, args[i], "--holder")) {
                 holder = try self.flagVal(args, &i, "--holder");
             } else if (std.mem.startsWith(u8, args[i], "--")) {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             } else if (id_arg == null) {
                 id_arg = args[i];
             } else {
@@ -2334,8 +2493,7 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, args[i], "--word")) {
                 try words.append(self.gpa, try self.flagVal(args, &i, "--word"));
             } else if (std.mem.startsWith(u8, args[i], "--")) {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             } else {
                 // A bare id-shaped token here can ONLY be a mistake (finding 7,
                 // 01M12ZG5ER): the synopsis renders `--allow-buried-decisions-for
@@ -3090,8 +3248,7 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, args[i], "--not-tag")) {
                 try not_tags.append(self.gpa, try self.flagVal(args, &i, "--not-tag"));
             } else if (std.mem.startsWith(u8, args[i], "--")) {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             } else {
                 try words.append(self.gpa, args[i]);
             }
@@ -3207,8 +3364,7 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, args[i], "--word")) {
                 try words.append(self.gpa, try self.flagVal(args, &i, "--word"));
             } else if (std.mem.startsWith(u8, args[i], "--")) {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             } else {
                 // Bare positional = a search term (shorthand for `--word`).
                 try words.append(self.gpa, args[i]);
@@ -3284,8 +3440,7 @@ pub const Cli = struct {
             if (std.mem.eql(u8, args[i], "--out")) {
                 out_path = try self.flagVal(args, &i, "--out");
             } else {
-                try self.print("trk: unknown flag '{s}'\n", .{args[i]});
-                return error.UnknownFlag;
+                return self.unknownFlag(args[i]);
             }
         }
 
@@ -4447,8 +4602,7 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, arg, "--priority")) {
                 priority = try self.parseI32(try self.flagVal(args, &i, "--priority"));
             } else {
-                try self.print("trk: unknown flag '{s}'\n", .{arg});
-                return error.UnknownFlag;
+                return self.unknownFlag(arg);
             }
         }
 
@@ -4627,8 +4781,7 @@ pub const Cli = struct {
             } else if (std.mem.eql(u8, arg, "--json")) {
                 json = true;
             } else if (std.mem.startsWith(u8, arg, "--")) {
-                try self.print("trk: unknown flag '{s}'\n", .{arg});
-                return error.UnknownFlag;
+                return self.unknownFlag(arg);
             } else {
                 // Positional: the id filter.
                 if (id_filter != null) {

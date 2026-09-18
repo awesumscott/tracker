@@ -466,3 +466,29 @@ test "tree: a server started inside a linked worktree still resolves \"main\" to
     defer s.deinit();
     try testing.expectEqualStrings(r.root, s.main_root.?);
 }
+
+// The CLI's `add` takes its title from the first BARE token so a misspelled
+// leading flag gets blamed instead of the title (01M1FMMFZ). That scan is safe
+// to make unconditional only because MCP refuses a dash-leading positional at
+// the boundary, where the message can say what actually happened — a typed
+// `title` is data, and "unknown flag" would be a lie about it. This arm is what
+// keeps the two halves of that argument from drifting apart.
+test "tools/call: a dash-leading title is refused at the boundary, never reparsed as a flag (01M1FMMFZ)" {
+    var r = try Repo.init(.{});
+    defer r.deinit();
+
+    var add = try r.call("add",
+        \\"tree":"main","title":"--tags=a,b is a title here","arc":true
+    );
+    defer add.deinit();
+    try testing.expect(add.isError());
+    try testing.expect(contains(add.text(), "may not begin with '-'"));
+    try testing.expect(!contains(add.text(), "unknown flag"));
+
+    // And an ordinary title is unaffected by the scan.
+    var ok = try r.call("add",
+        \\"tree":"main","title":"an ordinary title","arc":true
+    );
+    defer ok.deinit();
+    try testing.expect(!ok.isError());
+}

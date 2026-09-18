@@ -4906,3 +4906,129 @@ test "show: an arc prereq's progress counts its compacted members separately, an
     try testing.expect(std.mem.indexOf(u8, f.out.items, "\"arc_progress\":{\"done\":0,\"total\":0,\"compacted\":2}") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "\"arc_progress\":{\"done\":0,\"total\":1,\"compacted\":0}") != null);
 }
+
+// ----- unknown-flag diagnostics (01M1FMMFZ) -----
+
+test "add blames the flag that failed to parse, never the title (01M1FMMFZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The reported line, verbatim in shape: the ONE argument that is correct is
+    // the title, and it used to be the one named. `--tags=a,b` must be.
+    const title = "Fixture title that should not be blamed";
+    try testing.expectEqual(
+        cli.CliError.UnknownFlag,
+        f.runExpectErr(&.{ "add", "--tags=a,b", title }),
+    );
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "--tags=a,b") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, title) == null);
+    // And it names the spelling that was meant — the whole class of error is
+    // reaching for the plural of a repeatable option.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "did you mean '--tag'?") != null);
+
+    // Nothing was minted: the refusal happens before any append.
+    try testing.expectEqual(@as(usize, 0), f.store.count());
+}
+
+test "a near-miss flag is named on every verb, not just add (01M1FMMFZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "next", "--limt", "3" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "did you mean '--limit'?") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "trk next --help") != null);
+
+    // Far enough away to suggest nothing — a wrong guess is worse than none.
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "next", "--frobnicate" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "did you mean") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "--frobnicate") != null);
+}
+
+test "an =-joined value on a REAL flag says so instead of `unknown flag` (01M1FMMFZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "add", "--tag=ui", "T" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "=-joined") != null);
+    // The repair is spelled out, values and all.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "--tag ui") != null);
+}
+
+test "add takes its title from the first BARE token, so flags may come first (01M1FMMFZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{ "add", "--tag", "ui", "Flags first", "--arc" });
+    try testing.expectEqual(@as(usize, 1), f.store.count());
+    const ids = try f.store.allIds(alloc);
+    defer alloc.free(ids);
+    const t = f.store.get(ids[0]).?;
+    try testing.expectEqualStrings("Flags first", t.title);
+    try testing.expectEqual(@as(usize, 1), t.tags.items.len);
+    try testing.expectEqualStrings("ui", t.tags.items[0]);
+    try testing.expect(f.store.isArc(ids[0]));
+}
+
+test "a SECOND bare token on add is an unquoted-title report, not `unknown flag` (01M1FMMFZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The shape a lost quote produces. It is a usage error, and the message has
+    // to say which mistake it was — "unknown flag 'Two'" is exactly the
+    // misdirection this task is about.
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "add", "One", "Two" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "exactly one positional") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "'Two'") != null);
+    try testing.expectEqual(@as(usize, 0), f.store.count());
+}
+
+test "add with no bare token at all reports a MISSING title, not an unknown flag (01M1FMMFZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try testing.expectEqual(cli.CliError.MissingArgument, f.runExpectErr(&.{ "add", "--arc" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "needs a \"<title>\"") != null);
+}
+
+// Every flag in `Verb.flags` has to be documented in that verb's own help text,
+// because the help text is what the diagnostic points the reader at ("trk <verb>
+// --help lists the flags it takes") and what the MCP tool descriptions are built
+// from. Same rule mcp_test.zig enforces for the tool schemas, one level up.
+test "every Verb.flags entry appears in its verb's help text" {
+    for (&cli.Cli.verbs) |*v| {
+        for (v.flags) |fl| {
+            if (std.mem.indexOf(u8, v.text, fl) == null) {
+                std.debug.print("verb '{s}': flag '{s}' is not in its help text\n", .{ v.name, fl });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "a dash-leading token in an ID slot reads as a misspelled flag, not a missing task (01M1FMMFZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    try f.store.append(.{ .add = .{ .id = a, .title = "A" } });
+
+    // `trk edit --titel x` used to answer "no task matches prefix '--titel'",
+    // which sends the reader hunting for a task. No id begins with a dash.
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "edit", "--titel", "x" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "did you mean '--title'?") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "no task matches") == null);
+
+    // Verbs whose only positional is an id are covered by the same route.
+    try testing.expectEqual(cli.CliError.UnknownFlag, f.runExpectErr(&.{ "show", "--jsn" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "did you mean '--json'?") != null);
+
+    // A real id in the same slot is untouched.
+    try f.run(&.{ "show", &a.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "A") != null);
+}
