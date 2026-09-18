@@ -905,6 +905,30 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
 
 ## Settled rulings
 
+- **Ids cited from OUTSIDE the tracker are the caller's to protect; `compact --dry-run` is what trk owes
+  them** (01M1FMNSZ, 2026-09-18). trk's compaction rules were written about task-to-task references —
+  `needs` edges, arcs, citations inside other task bodies — all of which trk can see and reason about.
+  They said nothing about ids cited from files trk cannot see, and which in a real project are
+  load-bearing: a registry column, a source comment, a design doc, a commit message. Measured on the Enix
+  side: four `scenarios/registry.tsv` rows held ids that resolved to nothing, and `git log -S` proved all
+  three ids were honestly cited in the very commits that landed their rows. Not typos — collected work.
+  The cost was specific: seven sibling rows were resolved by READING the archived owner's body to see
+  whether a verification had actually happened; for a GC'd id there was no body to read, so "verified,
+  write-back forgotten" and "never booted" became indistinguishable.
+  - **Most of this is already answered by the tombstone index** (`01M2M2K1J`, above): the id resolves,
+    `trk show` reports it COMPACTED with title and end state, and the footer prints the `git log --all -p`
+    line that brings the body back. What a tombstone deliberately does not keep is the body itself.
+  - **What was still missing is the BEFORE side** — the chance to update an external citation while the
+    task is still there to read. `trk compact --dry-run` names every task the run would collect (id, short,
+    reason, title) and writes nothing. It reads from the same `Store.collectableRows` the real run uses,
+    never a second implementation: a preview whose whole job is to be trusted ahead of a destructive-looking
+    step is worth less than nothing if it can disagree with the step.
+  - **trk does not grep its consumers, and will not.** The rejected shape was an opt-in "cited externally"
+    pin — a tag, or a config-listed glob trk scans before compacting. It would make the tracker know its
+    consumers' file layout to do its own GC, which is the coupling this project spends most of its rules
+    avoiding. The check belongs where the knowledge is; trk's job is to make the moment visible and say
+    plainly that it cannot see those citations.
+
 - **`next`/`list --json` carry the body, unconditionally** (01M1FMN25, 2026-09-18). The emitter dropped
   it, and that made the mechanical full-frontier triage a fan-out mandates — *every* ready task, scripted
   over the whole list, not the top N — impossible to script. The discriminators that decide a task's

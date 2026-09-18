@@ -1137,7 +1137,7 @@ pub const Store = struct {
     /// After the WHOLE fold: every node that never received an `add` is a ghost
     /// (see `ghost_tasks`). Sorted by id so the warning order is stable across
     /// runs — the task map's iteration order is not.
-    fn collectGhostTasks(self: *Store) !void {
+    pub fn collectGhostTasks(self: *Store) !void {
         self.ghost_tasks.clearRetainingCapacity();
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
@@ -1843,6 +1843,47 @@ pub const Store = struct {
         try sub.rename(tmp_name, sub, name, self.io);
     }
 
+    /// Every task this store would collect right now, as the tombstone rows it
+    /// would be entombed as: `isCollectable` (garbage state, or a ghost), its
+    /// direct `in` memberships, and the reason it is going. `now` stamps the
+    /// rows' collection time — `compact` passes the real clock; a preview
+    /// passes `0`, the same "unknown" `Tombstone.ts` a recovered record carries.
+    ///
+    /// Factored out of `compact` so `compact --dry-run` reports EXACTLY the set
+    /// the real run would collect (01M1FMNSZ). A preview computed by a second
+    /// implementation would be worth less than none: its whole job is to be
+    /// trusted before an irreversible-looking step, and a preview that can
+    /// disagree with the run is a preview nobody can act on.
+    ///
+    /// The returned slice is `alloc`-owned; every string and arc slice inside it
+    /// borrows from the store (arena-owned) and dies with it.
+    pub fn collectableRows(self: *Store, alloc: std.mem.Allocator, now: i64) ![]Tombstone {
+        var rows: std.ArrayList(Tombstone) = .empty;
+        errdefer rows.deinit(alloc);
+        const all_ids = try self.sortedTaskIds(self.gpa);
+        defer self.gpa.free(all_ids);
+        for (all_ids) |id| {
+            const t = self.tasks.get(key(id)).?;
+            if (!isCollectable(t)) continue;
+            var arcs: std.ArrayList(Ulid) = .empty;
+            for (self.ins.items) |e| {
+                if (e.task.eql(id)) try arcs.append(self.a(), e.arc);
+            }
+            try rows.append(alloc, .{
+                .id = id,
+                .short = t.short,
+                .title = t.title,
+                // A ghost's `open` is `ensureNode`'s default, not a
+                // judgment — classify it as what it is, never as its state.
+                .reason = if (!t.has_add) "ghost" else t.state.toString(),
+                .arcs = arcs.items,
+                .ts = now,
+                .src = "compact",
+            });
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
     /// Compaction result: summary counts for the CLI one-liner.
     pub const CompactResult = struct {
         /// Number of live (non-dropped) tasks written to the new snapshot.
@@ -1984,31 +2025,10 @@ pub const Store = struct {
         // `.tracker/`, and the only remaining record is git history — which the
         // dangling-id lint proves is recoverable but costs ~31 s per query.
         const tombstoned = blk: {
-            var rows: std.ArrayList(Tombstone) = .empty;
-            defer rows.deinit(self.gpa);
             const now: i64 = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
-            const all_ids = try self.sortedTaskIds(self.gpa);
-            defer self.gpa.free(all_ids);
-            for (all_ids) |id| {
-                const t = self.tasks.get(key(id)).?;
-                if (!isCollectable(t)) continue;
-                var arcs: std.ArrayList(Ulid) = .empty;
-                for (self.ins.items) |e| {
-                    if (e.task.eql(id)) try arcs.append(self.a(), e.arc);
-                }
-                try rows.append(self.gpa, .{
-                    .id = id,
-                    .short = t.short,
-                    .title = t.title,
-                    // A ghost's `open` is `ensureNode`'s default, not a
-                    // judgment — classify it as what it is, never as its state.
-                    .reason = if (!t.has_add) "ghost" else t.state.toString(),
-                    .arcs = arcs.items,
-                    .ts = now,
-                    .src = "compact",
-                });
-            }
-            break :blk (try self.appendTombstones(sub, rows.items)).total();
+            const rows = try self.collectableRows(self.gpa, now);
+            defer self.gpa.free(rows);
+            break :blk (try self.appendTombstones(sub, rows)).total();
         };
 
         var buf: std.ArrayList(u8) = .empty;

@@ -725,8 +725,8 @@ pub const Cli = struct {
         \\  A COMPACTED root gets `show`'s answer, not "no task matches": the record
         \\  plus its graduated members, exit 2 (live 0 / compacted 2 / absent 1).
         },
-        .{ .name = "compact", .run = &cmdCompact, .mutates = true, .tools = &compact_tools, .text =
-        \\trk compact
+        .{ .name = "compact", .run = &cmdCompact, .mutates = true, .tools = &compact_tools, .flags = &.{"--dry-run"}, .text =
+        \\trk compact [--dry-run]
         \\  Rewrite the snapshot + truncate the log, physically GC'ing archived/dropped
         \\  tasks. Orchestrator-only (rewrites the whole snapshot — the merge flashpoint).
         \\  A GHOST id (one the log carries events for but no `add` anywhere) is GC'd
@@ -739,6 +739,13 @@ pub const Cli = struct {
         \\  config's compact.backup_retain (default 10) — ignored by
         \\  .tracker/.gitignore so it never becomes an untracked stray. Never
         \\  compact while fan-out worktrees are in flight.
+        \\  --dry-run: NAME every task this run would collect — id, short, why — and
+        \\  write nothing. Same `collectableRows` the real run uses, never a second
+        \\  implementation that could disagree with it. Use it when anything OUTSIDE
+        \\  the tracker cites task ids (a registry column, a source comment, a design
+        \\  doc): a tombstone keeps the id, title and end state, but NOT the body, and
+        \\  trk cannot see external citations to check them for you.
+        \\  e.g.  trk compact --dry-run
         },
         .{ .name = "archive", .run = &cmdArchive, .mutates = true, .tools = &archive_tools, .flags = &.{ "--out", "--dry-run", "--allow-buried-decisions", "--allow-buried-decisions-for", "--arc", "--tag", "--word" }, .text =
         \\trk archive [<term> | --word <term> ...] [--arc <id>] [--tag <t>] [--out <path>]
@@ -2373,10 +2380,15 @@ pub const Cli = struct {
     /// thing here a human may want to act on, so they are never folded into the
     /// count alone.
     fn cmdCompact(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len != 0) {
-            try self.write("trk: usage: trk compact\n");
-            return error.UsageError;
+        var dry_run = false;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--dry-run")) {
+                dry_run = true;
+            } else {
+                return self.unknownFlag(a);
+            }
         }
+        if (dry_run) return self.compactDryRun();
         const result = self.store.compact() catch |e| {
             if (e == error.CompactVerifyFailed) {
                 try self.print(
@@ -2424,6 +2436,61 @@ pub const Cli = struct {
                     "  .tracker/log.jsonl — the ids still match.\n",
             );
         }
+    }
+
+    /// `trk compact --dry-run` — name every task this compact WOULD collect, and
+    /// write nothing (01M1FMNSZ).
+    ///
+    /// The gap it closes: trk's compaction rules were written about task-to-task
+    /// references — `needs` edges, arcs, citations inside other task bodies — all
+    /// of which trk can see and reason about. They say nothing about ids cited
+    /// from files OUTSIDE the tracker, which trk cannot see and which are, in a
+    /// real project, load-bearing: a registry column, a source comment, a design
+    /// doc, a commit message. Measured: four `scenarios/registry.tsv` rows on the
+    /// Enix side ended up holding ids that resolved to nothing, and `git log -S`
+    /// proved all three ids were honestly cited in the very commits that landed
+    /// their rows. Not typos — collected work.
+    ///
+    /// trk cannot own that problem: it would have to know its consumers. What it
+    /// can do is make the moment VISIBLE and let the caller grep its own tree
+    /// first, which is where the knowledge actually lives. So: a read-only
+    /// listing, on demand, from the same `collectableRows` the real run uses —
+    /// never a second implementation that could disagree with it.
+    ///
+    /// The tombstone index (01M2M2K1J) already made the AFTER side survivable:
+    /// every id below still resolves after the compact, `trk show` reports it
+    /// COMPACTED (exit 2) with title and end-state, and the footer names the
+    /// git command that brings the body back. This is the BEFORE side — the one
+    /// that lets an external citation be updated while the task is still there
+    /// to read.
+    fn compactDryRun(self: *Cli) Error!void {
+        // `compact` re-scans ghosts before deciding; so must this, or the
+        // preview and the run could classify the same id differently.
+        try self.store.collectGhostTasks();
+        const rows = try self.store.collectableRows(self.gpa, 0);
+        defer self.gpa.free(rows);
+
+        if (rows.len == 0) {
+            try self.write("trk: compact --dry-run: nothing to collect — no dropped, archived or ghost task in this store.\n");
+            return;
+        }
+        try self.print("trk: compact --dry-run: {d} task(s) WOULD be collected. Nothing was written.\n", .{rows.len});
+        for (rows) |tb| {
+            try self.print("  {s}  {s:<9}  {s}\n", .{
+                tb.short orelse &tb.id.text,
+                tb.reason,
+                if (tb.title.len != 0) tb.title else "(title not recorded)",
+            });
+            try self.print("      {s}\n", .{&tb.id.text});
+        }
+        try self.write(
+            "  Each id above still RESOLVES after the compact — it is entombed in .tracker/" ++
+                tracker.store.tombstones_name ++ " first,\n" ++
+                "  and `trk show <id>` then reports it COMPACTED (exit 2) with its title and end state.\n" ++
+                "  What a tombstone does NOT keep is the BODY. If anything OUTSIDE the tracker cites one of\n" ++
+                "  these — a registry column, a source comment, a design doc — grep for it now, while the\n" ++
+                "  task is still here to read. trk cannot see those citations, so it cannot check them for you.\n",
+        );
     }
 
     /// Warn (to stderr, never stdout) when `.tracker/.gitattributes` is absent or

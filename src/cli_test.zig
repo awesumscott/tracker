@@ -1498,9 +1498,11 @@ test "trk compact: prints summary line, rejects extra args" {
     try testing.expect(std.mem.indexOf(u8, f.out.items, "live tasks") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "log truncated") != null);
 
-    // Extra args are an error.
+    // A stray token is an error. UnknownFlag, not UsageError: `compact` now
+    // takes a flag (--dry-run), which puts it under the same convention as
+    // cmdArc/cmdIn/migrate-shorts — a token the flag loop cannot place.
     const e = f.runExpectErr(&.{ "compact", "extra" });
-    try testing.expectEqual(error.UsageError, e);
+    try testing.expectEqual(error.UnknownFlag, e);
 }
 
 test "trk compact: a sabotaged write is REFUSED, names the diverged id on stdout, and restores the files" {
@@ -1737,7 +1739,10 @@ test "trk compact: a ghost is GC'd and reported by id, not refused" {
 
     // `--force` is gone with the refusal it existed to bypass.
     const e = f.runExpectErr(&.{ "compact", "--force" });
-    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expectEqual(@as(anyerror, error.UnknownFlag), e);
+    // And it is refused as an unknown flag, not quietly near-matched onto the
+    // one flag compact does take — those two mean opposite things.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "did you mean") == null);
 }
 
 test "trk edit --replace-body -: reads stdin, round-trips byte-stable, never stores a literal dash" {
@@ -5209,4 +5214,74 @@ test "tombstones --rebuild UPGRADES a membership-less record left by the older r
     // And now it settles: a third run has nothing left to improve.
     try f.run(&.{ "tombstones", "--rebuild" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "0 existing record(s) upgraded") != null);
+}
+
+// ----- compact --dry-run (01M1FMNSZ) -----
+
+test "compact --dry-run names exactly what the real run would collect, and writes nothing (01M1FMNSZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const keeper = mintId();
+    const done_one = mintId();
+    const goner = mintId();
+    const ghost = mintId();
+    try f.store.append(.{ .add = .{ .id = keeper, .title = "still open" } });
+    // `done` is NOT collectable — it is a satisfied prereq and the un-graduated
+    // changelog queue. A preview that listed it would be a lie about the run.
+    try f.store.append(.{ .add = .{ .id = done_one, .title = "finished, not graduated" } });
+    try f.store.append(.{ .setState = .{ .id = done_one, .state = .done } });
+    try f.store.append(.{ .add = .{ .id = goner, .title = "graduated work", .short = goner.text[0..9] } });
+    try f.store.append(.{ .setState = .{ .id = goner, .state = .archived } });
+    // A ghost: events about an id that was never `add`ed. Collectable too, and
+    // classified by what it is rather than by its placeholder `open` state.
+    try f.store.append(.{ .setBody = .{ .id = ghost, .body = "residue" } });
+
+    const before = try f.tmp.dir.readFileAlloc(io, ".tracker/log.jsonl", alloc, .unlimited);
+    defer alloc.free(before);
+
+    try f.run(&.{ "compact", "--dry-run" });
+    const preview = try alloc.dupe(u8, f.out.items);
+    defer alloc.free(preview);
+
+    try testing.expect(std.mem.indexOf(u8, preview, "2 task(s) WOULD be collected") != null);
+    try testing.expect(std.mem.indexOf(u8, preview, "graduated work") != null);
+    try testing.expect(std.mem.indexOf(u8, preview, &goner.text) != null);
+    try testing.expect(std.mem.indexOf(u8, preview, &ghost.text) != null);
+    try testing.expect(std.mem.indexOf(u8, preview, "ghost") != null);
+    try testing.expect(std.mem.indexOf(u8, preview, "still open") == null);
+    try testing.expect(std.mem.indexOf(u8, preview, "finished, not graduated") == null);
+    // It says the part a tombstone cannot answer, which is the whole reason the
+    // external-citation problem survives the tombstone index.
+    try testing.expect(std.mem.indexOf(u8, preview, "does NOT keep is the BODY") != null);
+
+    // Nothing was written: not the log, not a snapshot, not a tombstone file.
+    const after = try f.tmp.dir.readFileAlloc(io, ".tracker/log.jsonl", alloc, .unlimited);
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, ".tracker/snapshot.jsonl", .{}));
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, ".tracker/tombstones.jsonl", .{}));
+
+    // And the preview agreed with the run: the same two ids, now actually gone
+    // and actually entombed. This is the assertion the shared `collectableRows`
+    // exists for — a preview that can disagree with the run is unusable.
+    try f.run(&.{"compact"});
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 2), f.store.tombstones.items.len);
+    try testing.expect(f.store.lookupTombstone(&goner.text) == .one);
+    try testing.expect(f.store.lookupTombstone(&ghost.text) == .one);
+    try testing.expect(f.store.get(keeper) != null);
+    try testing.expect(f.store.get(done_one) != null);
+}
+
+test "compact --dry-run on a store with nothing to collect says so (01M1FMNSZ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    try f.run(&.{ "add", "still open" });
+
+    try f.run(&.{ "compact", "--dry-run" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing to collect") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "WOULD be collected") == null);
 }
