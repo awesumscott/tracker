@@ -5,6 +5,7 @@
 //! Disk tests use std.testing.tmpDir (overridable store dir; no absolute paths).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const tracker = @import("tracker.zig");
 const ulid = tracker.ulid;
@@ -3025,6 +3026,121 @@ fn newestBackupRunName(root: std.Io.Dir) ![]u8 {
         }
     }
     return testing.allocator.dupe(u8, newest.?);
+}
+
+// ----- concurrency -----
+
+const race_writers = 8;
+const race_per_writer = 16;
+
+/// One writer in the concurrent-append arm: its own `Store` (own in-memory
+/// fold, own file descriptors — exactly what a separate `trk` process has),
+/// appending a private run of `add` events to the ONE shared log.
+const RaceWriter = struct {
+    store: *Store,
+    ids: []const tracker.Ulid,
+    which: usize,
+    err: ?anyerror = null,
+
+    fn run(self: *RaceWriter) void {
+        for (self.ids, 0..) |id, i| {
+            var buf: [32]u8 = undefined;
+            const title = std.fmt.bufPrint(&buf, "w{d}-{d}", .{ self.which, i }) catch unreachable;
+            self.store.append(.{ .add = .{ .id = id, .title = title } }) catch |e| {
+                self.err = e;
+                return;
+            };
+        }
+    }
+};
+
+// The arm 01M2V2NPA ships with, and the reason the fix is a lock rather than a
+// hope: every pre-existing test here is single-writer, so the defect — an
+// unlocked length-then-pwrite in `persistAppend` — was invisible to all of
+// them. Two writers that both read `end = N` both pwrite at N: the second
+// overwrites the first (event lost), and if the lines differ in length the
+// survivor keeps a tail of the loser (one line holding two JSON objects, which
+// fails the ENTIRE load with NotAnObject, not just that task).
+//
+// Threads, not processes, because `zig build test` spawns nothing — and they
+// are a strictly HARSHER test of the same code path: each writer opens the log
+// itself, so each gets its own open file description, which is the granularity
+// both the race and `flock` operate at, and in-process threads contend far
+// more tightly than N process startups ever stagger into.
+//
+// Both halves are asserted, because they fail independently: all N events
+// PRESENT (the lock did not drop a write) and the log still PARSEABLE (the
+// lock did not let two lines interleave). Against the unfixed `persistAppend`
+// this arm fails; the measured process-level reproducer lost 1 of 32 adds on
+// two of five runs and aborted a writer outright on one of them.
+test "concurrent appends: every event survives and the log stays parseable (01M2V2NPA)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Ids minted UP FRONT on this thread: the race under test is the file
+    // write, and pre-minting keeps id generation out of the measurement (and
+    // guarantees the expected set is known before anything runs).
+    var ids: [race_writers][race_per_writer]tracker.Ulid = undefined;
+    for (&ids) |*row| for (row) |*id| {
+        id.* = mintId();
+    };
+
+    var stores: [race_writers]Store = undefined;
+    var opened: usize = 0;
+    defer for (stores[0..opened]) |*s| s.deinit();
+    while (opened < race_writers) : (opened += 1) {
+        stores[opened] = Store.open(testing.allocator, io, tmp.dir);
+        // Loaded BEFORE any writer starts: a fold running concurrently with an
+        // append would be reading a file mid-write, which is a different
+        // (reader-side) question than the one this arm is about.
+        try stores[opened].load();
+    }
+
+    var writers: [race_writers]RaceWriter = undefined;
+    var threads: [race_writers]std.Thread = undefined;
+    for (&writers, &threads, 0..) |*w, *th, t| {
+        w.* = .{ .store = &stores[t], .ids = &ids[t], .which = t };
+        th.* = try std.Thread.spawn(.{}, RaceWriter.run, .{w});
+    }
+    for (&threads) |*th| th.join();
+    for (&writers) |*w| if (w.err) |e| return e;
+
+    // Half one: the log is still ONE JSON object per line. A fresh fold is the
+    // honest check — it is what every consumer does, and it is what returned
+    // NotAnObject on the corrupted store.
+    var fresh = Store.open(testing.allocator, io, tmp.dir);
+    defer fresh.deinit();
+    try fresh.load();
+
+    // Half two: nothing was silently dropped. Checked per-id, not by count: a
+    // count alone would pass a log that lost one event and duplicated another.
+    try testing.expectEqual(@as(usize, race_writers * race_per_writer), fresh.count());
+    for (&ids, 0..) |row, t| {
+        for (row, 0..) |id, i| {
+            var buf: [32]u8 = undefined;
+            const want = try std.fmt.bufPrint(&buf, "w{d}-{d}", .{ t, i });
+            const got = fresh.get(id) orelse {
+                std.debug.print("lost event: {s}\n", .{want});
+                return error.TestUnexpectedResult;
+            };
+            try testing.expectEqualStrings(want, got.title);
+        }
+    }
+
+    // And the line count matches the event count exactly — the concatenated-
+    // objects shape shows up here as a DEFICIT even when the fold survives it.
+    var sub = try tmp.dir.openDir(io, ".tracker", .{});
+    defer sub.close(io);
+    const bytes = try sub.readFileAlloc(io, tracker.store.log_name, testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    var lines: usize = 0;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |l| {
+        if (l.len != 0) lines += 1;
+    }
+    try testing.expectEqual(@as(usize, race_writers * race_per_writer), lines);
 }
 
 // ----- helpers -----

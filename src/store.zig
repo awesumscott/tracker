@@ -1737,10 +1737,42 @@ pub const Store = struct {
         try codec.encode(&line, self.gpa, ev);
         try line.append(self.gpa, '\n');
 
-        // Open (or create) the log and write at end-of-file. createFile with
-        // truncate=false preserves existing content; we position the write at the
-        // current length for an O(1) append.
-        var f = try sub.createFile(self.io, log_name, .{ .read = true, .truncate = false });
+        // Open (or create) the log and write at end-of-file, UNDER AN
+        // EXCLUSIVE ADVISORY LOCK on the log itself (01M2V2NPA).
+        //
+        // length-then-pwrite is a read-modify-write: two writers that both
+        // read `end = N` both pwrite at N, and the second overwrites the
+        // first — losing an event outright, and, when the two lines differ in
+        // length, leaving the survivor with a tail of the loser glued to it
+        // (one line holding two JSON objects, which fails the whole load with
+        // NotAnObject). Measured: 24 concurrent `trk add` -> 5 lines, 6 of 24
+        // titles, store unloadable. The lock closes that window: it is taken
+        // at open, before `length`, and released by `close` below, so the
+        // whole read-modify-write is serialized against every other trk
+        // writer — including ones in sibling worktrees, since the fan-out
+        // pattern aims every lane's incidental filings at the MAIN checkout's
+        // one log. (merge=union does not help here: it reconciles two
+        // committed COPIES of the file, not two processes writing one file in
+        // one working tree.)
+        //
+        // The lock is on the log's own inode, not a sibling lockfile: it is
+        // the file being mutated, it needs no new on-disk artifact and no
+        // .gitignore entry, and it works unchanged in a store created before
+        // this fix. What it deliberately does NOT cover is a whole-file
+        // REWRITE of log.jsonl by something that does not take the lock —
+        // `compact`'s rename, or a git merge/checkout. Both already carry
+        // that hazard explicitly (see `compact`'s doc comment: orchestrator-
+        // only, serialized, never while worktrees are in flight); a sibling
+        // lockfile would not fix them either, because git does not ask.
+        //
+        // Blocking, not `lock_nonblocking`: a writer that waits its turn is
+        // exactly right here — appends are microseconds — and returning
+        // WouldBlock would just move the loss to the caller.
+        var f = try sub.createFile(self.io, log_name, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+        });
         defer f.close(self.io);
         const end = try f.length(self.io);
         try f.writePositionalAll(self.io, line.items, end);

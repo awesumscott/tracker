@@ -533,6 +533,28 @@ The merge model is **owned** here, because it gates how parallel agents may touc
     orchestrator **re-verifies and re-closes done tasks idempotently** during each per-wave reconcile
     (`trk state done` is append-idempotent, so a redundant close is free). Cross-cuts any union-merged
     append-log a writer mutates but does not stage.
+  - **The merge driver is also not sufficient *within one working tree* — the append itself needs a lock**
+    (01M2V2NPA, 2026-09-18). `merge=union` reconciles two committed **copies** of the file; it says nothing
+    about two processes writing **one** file in **one** tree — which is precisely the case the
+    parallel-write permission above creates, and which the fan-out pattern then maximizes by ruling that a
+    defect a lane *discovers* is filed against the MAIN checkout (deliberately, so an abandoned lane cannot
+    take the filing down with it). Worktree isolation separates lanes' code; it gives their tracker appends
+    no separation at all. `persistAppend` was a bare length-then-pwrite — a read-modify-write — so two
+    writers both read `end = N`, both wrote at `N`, and the second overwrote the first; when the lines
+    differed in length the survivor kept a tail of the loser, producing **one line holding two JSON
+    objects**, which fails the entire load with `NotAnObject`. Measured: 24 concurrent `trk add` → 5 lines,
+    6 of 24 titles, store unloadable. Not a degraded read — every consumer goes down with it. **The
+    ruling:** the whole read-modify-write is taken under an **exclusive advisory lock on `log.jsonl`
+    itself** (`createFile(.{ .lock = .exclusive })`, acquired at open before `length`, released at close;
+    blocking, since an append is microseconds and `WouldBlock` would only move the loss to the caller).
+    The lock is on the log's own inode rather than a sibling lockfile: no new on-disk artifact, no
+    `.gitignore` entry, and it works unchanged in a store created before the fix. It deliberately does not
+    cover a whole-file **rewrite** by something that does not ask for the lock — `compact`'s rename, or a
+    git merge/checkout in a tree where an agent is appending (see the lost-update hazard above) — and a
+    sibling lockfile would not cover those either, because git does not ask. Shipped with a
+    concurrent-writer arm (`store_test.zig`), because every other test in the suite is single-writer and
+    the defect was invisible to all of them: 8 writers × 16 appends, asserting **both** that all 128 events
+    survive and that the log still folds. Against the unfixed append that arm sees 68 of 128.
 - **Merge-*safe* by construction; merge-*free* is still a later goal.** The fold-time acyclic re-check
   (`checkAcyclic` on every `load`) means a textual union-merge of parallel-worktree appends can't silently
   corrupt state or smuggle a cycle, and disjoint-task `setState` events commute — which is exactly why
@@ -873,8 +895,9 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     the verification queue), `done`/`archived`/`dropped`/`blocked` → `claimed`. Every refusal names
     `submitted`. **Not caught:** a deliberate `--holder` lease written where nobody else reads it (a lane's
     worktree) — it merges in as a stranded lease, which `trk stale` surfaces once the citing commit lands;
-    and two writers claiming the same task in the same store within the read-append window (no lock;
-    std-only, append-only).
+    and two writers claiming the same task in the same store within the read-append window (the append
+    itself is now locked — see the merge model — but the lease CHECK still runs against each writer's own
+    pre-append fold, so both can pass it and both appends then land).
   - **Release path: a recorded holder, a conditional release, no expiry.** The lease event carries
     `holder` and its `ts` is the lease's age (`Task.holder`/`lease_ts`, shown by `list`/`show`/`--json`,
     kept by `compact`). `trk release <id>` / `trk release --holder <h>` append a `release` op naming the
