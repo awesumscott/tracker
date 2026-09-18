@@ -612,14 +612,61 @@ The merge model is **owned** here, because it gates how parallel agents may touc
   - **This does not un-GC anything.** The task stays out of the graph, out of `next`, out of every view.
     The index is the difference between forgetting a task and forgetting *that it ever was*.
   - **`trk tombstones --rebuild` is the one-shot migration** for ids compacted before the index existed —
-    the lint's own git-history scan, run once and persisted rather than once per question. It recovers
-    title and end-of-life state from the `add`/`setTitle`/`setState` events themselves (largest `ts` wins,
-    so the answer does not depend on git's walk order), skips anything still live, and is idempotent. It
-    uses `--all` — unlike `trk stale`, which is deliberately ancestry-only — because the question is "did
-    this id ever exist", and an id minted on an unmerged branch still existed; a false *live* would be
-    dangerous, a false *existed* is not, since the record says plainly that it is gone. CLI-only: it is
-    not an MCP tool, both because an orchestrator runs it once and because `readOnlyHint` is derived from
-    a tool's fixed argv and could not have seen a `rebuild: true` argument coming.
+    the lint's own git-history scan, run once and persisted rather than once per question. MEMBERSHIP (does
+    this id get an entry at all) is decided by `model.eventTaskIds` over EVERY event kind history holds for
+    it — one id for a scalar op, two for an edge (`dep`/`undep`/`in`/`unin`), none for `setDocPath`. TITLE
+    and END-OF-LIFE STATE are recovered separately, from just the `add`/`setTitle`/`setShort`/`setState`
+    events (largest `ts` wins, so the answer does not depend on git's walk order) — an id can be, and often
+    is, entombed with neither: `reason` stays `"unknown"` and `title` prints `(not recorded)`.
+    Skips anything still live, and is idempotent. Uses `--all` — unlike `trk stale`, which is deliberately
+    ancestry-only — because the question is "did this id ever exist", and an id minted on an unmerged
+    branch still existed; a false *live* would be dangerous, a false *existed* is not, since the record
+    says plainly that it is gone. CLI-only: it is not an MCP tool, both because an orchestrator runs it once
+    and because `readOnlyHint` is derived from a tool's fixed argv and could not have seen a `rebuild: true`
+    argument coming.
+    - **Membership was originally keyed on the four title-bearing ops alone, and that missed GHOSTS**
+      (2026-09-18, task `01M2N8WMD`). A ghost — an id `compact`'s own live entombment already classifies
+      `"ghost"` (`!t.has_add`, `isCollectable` unconditionally) — is exactly the id class whose committed
+      history can hold NO `add`/`setTitle`/`setShort`/`setState` event at all, only the edges/body/tags
+      that referenced it. The original switch built a `recs` entry only from those four op kinds, so such an
+      id was invisible to the scan outright — not misclassified, absent. Found live on the Enix tracker:
+      `01KVR2E1KTXC65HD5175N373AH`'s full history is exactly one `setBody` and one `dep`, with five live
+      citations in the Enix tree depending on `trk show` answering `COMPACTED` rather than "never existed".
+      Its compaction predates the tombstone index outright, so `--rebuild` is its only path back; fixed by
+      seeding a `recs` entry from `model.eventTaskIds` for every decoded event, independent of the
+      title-recovery switch.
+  - **`trk tombstones --verify` is the STANDING CHECK that catches a regression in the above** (2026-09-18,
+    task `01M2N8WMD`). Before it existed, the only evidence `--rebuild` did its job was `--rebuild`'s own
+    printed count ("N new tombstone(s) recorded") — coverage as reported by the mechanism being checked,
+    which is precisely the shape `docs/debugging.md`'s rule 5 forbids: a check that reads as assurance while
+    resting entirely on the thing it is meant to catch failing. `--verify` re-derives the SAME structural
+    id set `--rebuild` computes (`scanLogHistoryForIds`, shared — one authoritative parse of "what ids does
+    history own", not two that can independently drift) and asserts, against the CURRENT contents of the
+    live store and `tombstones.jsonl` — not against `--rebuild`'s self-report — that (structural set) −
+    (live) − (tombstoned) is EMPTY. A non-empty result exits `error.TombstoneIndexIncomplete`, listing every
+    gap; it never writes (a verify that also repairs stops being a check that can fail). Same cost as
+    `--rebuild` (one `git log --all -p` walk; ~80 s measured on the Enix tracker's larger history, vs. the
+    ~31 s figure `--rebuild`'s own doc cites on a smaller repo) and the same CLI-only, non-MCP reasoning.
+    - **Lives in `trk`, not as an Enix lint row, because `trk` owns the Event model the check depends on.**
+      The alternative — reimplementing "every id an event names" as a second, independent parser (e.g. a
+      shell/jq scan of raw JSON field names, which is what `scripts/dangling-tracker-id-lint.sh` does on the
+      Enix side) — is a proven failure mode here, not a hypothetical one: that lint's own step 2 went through
+      two revisions to reach a correct field-based extraction (2026-09-16, `01M2N6RQJ`), and a naive
+      add-events-only tightening it CONSIDERED would have broken exactly the ghost class this fix addresses.
+      Two implementations of "what does history own" is two places for that knowledge to drift out of sync;
+      one, inside the tool that owns `Event`/`Op` and is already exhaustively switched over every variant
+      (`model.eventTaskIds` has no `else` arm — the compiler refuses to build if a future `Op` variant is
+      left unhandled), is the one that cannot silently fall behind the model it is checking.
+    - **Residual risk, stated rather than hidden:** sharing `scanLogHistoryForIds` means a regression that
+      guts the shared DISCOVERY step itself (not a newly-unhandled `Op` variant, which the exhaustive switch
+      already prevents, but an outright deletion or logic bug in an already-handled arm) would blind
+      `--rebuild` and `--verify` together, the same way the pre-fix code was blind to ghosts in both the
+      entombing and the (nonexistent, at the time) verification. This is an inherent limit of any
+      self-hosted check built from the mechanism it verifies, not specific to this design; the alternative
+      (an independent, drift-prone second parser) has a worse measured failure history. `--verify` fully
+      covers every OTHER incompleteness class: a compaction that predates the index, a bug in
+      `appendTombstones`'s write path, a hand-deleted tombstone line, a future entomb path that forgets to
+      call `appendTombstones` at all.
   - **A refused compact rolls the index back with everything else.** The tombstones are written before the
     round-trip self-verify can fail, so `CompactVerifyFailed` restores `tombstones.jsonl` alongside
     `snapshot.jsonl`/`log.jsonl`. The one error this mechanism must never make is the mirror of the one it

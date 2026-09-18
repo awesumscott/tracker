@@ -949,8 +949,7 @@ test "render: the <summary> teaser is cut at a word boundary and HTML-escaped" {
     // Cut back to the last space before the 72-byte cap, ellipsis appended; `&`
     // and `<` entity-escaped, because inside <summary> the teaser is HTML, not
     // markdown — an unescaped `<` would be swallowed as a tag and eat the rest.
-    try testing.expect(std.mem.indexOf(u8, b.items,
-        "  <details><summary>needs a Foo&lt;Bar> shim &amp; a fallback before the loader resolves the…</summary>\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b.items, "  <details><summary>needs a Foo&lt;Bar> shim &amp; a fallback before the loader resolves the…</summary>\n") != null);
     // The raw, unescaped form never reaches the summary line.
     try testing.expect(std.mem.indexOf(u8, b.items, "<summary>needs a Foo<Bar>") == null);
     // The body itself is still there in full, verbatim.
@@ -2235,9 +2234,9 @@ test "every verb supports --help/-h and add --help mints no task" {
     // The full dispatch set. Kept in lockstep with the `verbs` table via the
     // count assertion below, so a new verb without a help entry is caught.
     const verbs = [_][]const u8{
-        "init",  "add",  "dep",  "undep",  "in",   "unin",    "arc",          "migrate-arcs", "migrate-shorts",
-        "state", "next", "list", "render", "tree", "compact", "archive",      "doc",
-        "show",  "edit", "log",  "stale", "release", "tombstones",   "mcp-serve",
+        "init",  "add",  "dep",   "undep",   "in",         "unin",      "arc",     "migrate-arcs", "migrate-shorts",
+        "state", "next", "list",  "render",  "tree",       "compact",   "archive", "doc",          "show",
+        "edit",  "log",  "stale", "release", "tombstones", "mcp-serve",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -3286,12 +3285,14 @@ test "archive REFUSES when a closing body buries a decision, and nothing is arch
 
     const a = mintId();
     const b = mintId();
-    try f.store.append(.{ .add = .{
-        .id = a,
-        .title = "shipped it",
-        // The work IS done; the DECISION was never this task's scope.
-        .body = "did the work\nOPEN QUESTION: which cadence do we publish on?\n",
-    } });
+    try f.store.append(.{
+        .add = .{
+            .id = a,
+            .title = "shipped it",
+            // The work IS done; the DECISION was never this task's scope.
+            .body = "did the work\nOPEN QUESTION: which cadence do we publish on?\n",
+        },
+    });
     try f.store.append(.{ .add = .{ .id = b, .title = "clean one", .body = "just work" } });
     try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
     try f.store.append(.{ .setState = .{ .id = b, .state = .done } });
@@ -3381,8 +3382,7 @@ test "archive: TODO marker does not fire on docs/TODO.md, TODO.md, or path/TODO 
     // buried decision. Every "TODO" occurrence below is glued to a `/` or a
     // `.<letter>` extension, so none of them should read as the marker.
     const a = mintId();
-    try f.store.append(.{ .add = .{ .id = a, .title = "x", .body =
-        "docs/TODO.md is the projection Scott reads. See also TODO.md and path/TODO for the same file." } });
+    try f.store.append(.{ .add = .{ .id = a, .title = "x", .body = "docs/TODO.md is the projection Scott reads. See also TODO.md and path/TODO for the same file." } });
     try f.store.append(.{ .setState = .{ .id = a, .state = .done } });
 
     try f.run(&.{ "archive", "--dry-run" });
@@ -3407,8 +3407,7 @@ test "archive: TODO marker still refuses a genuine buried TODO, even sharing a l
     var f2 = try Fixture.init(alloc);
     defer f2.deinit();
     const b = mintId();
-    try f2.store.append(.{ .add = .{ .id = b, .title = "y", .body =
-        "the docs/TODO.md render bug leaves a TODO here to decide" } });
+    try f2.store.append(.{ .add = .{ .id = b, .title = "y", .body = "the docs/TODO.md render bug leaves a TODO here to decide" } });
     try f2.store.append(.{ .setState = .{ .id = b, .state = .done } });
     try testing.expectEqual(@as(anyerror, error.UsageError), f2.runExpectErr(&.{"archive"}));
 }
@@ -3422,11 +3421,9 @@ test "archive: --allow-buried-decisions-for <id>:<n>:<digest> exempts only the n
     // discusses the guard's own marker vocabulary as its SUBJECT (no fork of
     // its own), alongside a genuinely unresolved one in a different task.
     const meta = mintId();
-    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body =
-        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
     const real = mintId();
-    try f.store.append(.{ .add = .{ .id = real, .title = "real", .body =
-        "shipped the fix\nOPEN QUESTION: which cadence do we publish on?\n" } });
+    try f.store.append(.{ .add = .{ .id = real, .title = "real", .body = "shipped the fix\nOPEN QUESTION: which cadence do we publish on?\n" } });
     try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
     try f.store.append(.{ .setState = .{ .id = real, .state = .done } });
 
@@ -3477,8 +3474,7 @@ test "archive --allow-buried-decisions-for <id>:<n>:<digest>: a NEW marker line 
     // count (1) no longer matches the actual count (2), so the exemption
     // must NOT apply and the task must stay `done`, never `archived`.
     const meta = mintId();
-    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body =
-        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
     try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
 
     var mb: [ulid.len]u8 = undefined;
@@ -3492,8 +3488,7 @@ test "archive --allow-buried-decisions-for <id>:<n>:<digest>: a NEW marker line 
     {
         var f2 = try Fixture.init(alloc);
         defer f2.deinit();
-        try f2.store.append(.{ .add = .{ .id = meta, .title = "meta", .body =
-            "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
+        try f2.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
         try f2.store.append(.{ .setState = .{ .id = meta, .state = .done } });
         try f2.run(&.{ "archive", "--allow-buried-decisions-for", meta_for1 });
         try testing.expectEqual(tracker.State.archived, f2.store.get(meta).?.state);
@@ -3602,8 +3597,7 @@ test "archive: the decision guard prints a paste-ready --allow-buried-decisions-
     // The digest is only a usable assertion if the operator never has to
     // compute it. A bare refused run must hand back the exact token.
     const meta = mintId();
-    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body =
-        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
     try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
 
     try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{"archive"}));
@@ -3708,8 +3702,8 @@ test "archive: 9+ letter English words are search terms, not ids -- the id refus
     // every word below hard-errored with "looks like a task id, not a search
     // word" on archive's ONLY search surface.
     const words = [_][]const u8{
-        "statement",  "namespace",  "webserver",  "watermark",
-        "regressed",  "parameters", "assessment", "management",
+        "statement", "namespace",  "webserver",  "watermark",
+        "regressed", "parameters", "assessment", "management",
     };
     for (words) |w| {
         const alloc = testing.allocator;
@@ -3822,11 +3816,9 @@ test "archive: decision-guard reporting labels a genuine marker line marker-shap
     // Same shape as 01M12D4EV vs. a real fork: the label is reporting-only,
     // so BOTH still refuse a bare run (no exemption named at all here).
     const meta = mintId();
-    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body =
-        "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
+    try f.store.append(.{ .add = .{ .id = meta, .title = "meta", .body = "trk archive refuses on a scott-decision, OPEN QUESTION, FIX NOTE, your call, or TODO marker." } });
     const real = mintId();
-    try f.store.append(.{ .add = .{ .id = real, .title = "real", .body =
-        "OPEN QUESTION: which cadence do we publish on?" } });
+    try f.store.append(.{ .add = .{ .id = real, .title = "real", .body = "OPEN QUESTION: which cadence do we publish on?" } });
     try f.store.append(.{ .setState = .{ .id = meta, .state = .done } });
     try f.store.append(.{ .setState = .{ .id = real, .state = .done } });
 
@@ -4077,6 +4069,122 @@ test "tombstones --rebuild: recovers an id compacted BEFORE the index existed, a
     // Idempotent: a second run records nothing new.
     try f.run(&.{ "tombstones", "--rebuild" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "0 new tombstone(s) recorded") != null);
+}
+
+test "tombstones --rebuild: recovers a GHOST whose full committed history is setBody+dep only — no add/setTitle/setShort/setState anywhere (01M2N8WMD's exact shape)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // `gone` is NEVER `add`ed — only referenced by a `setBody` and a `dep`
+    // edge to `live`. This is `compact`'s own "ghost" class (`!t.has_add`,
+    // `isCollectable` unconditionally), and it is the real shape of
+    // 01KVR2E1KTXC65HD5175N373AH's committed history, confirmed by a direct
+    // `git log --all -p` read of the Enix tracker (01M2N8WMD): no naming
+    // event ever landed for it, only a body and an edge.
+    const gone = mintId();
+    const live = mintId();
+    try f.store.append(.{ .add = .{ .id = live, .title = "kept" } });
+    try f.store.append(.{ .setBody = .{ .id = gone, .body = "ghost's only recoverable content" } });
+    try f.store.append(.{ .dep = .{ .from = gone, .to = live } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "tracker log before the compact" });
+
+    // `compact` collects `gone` as a ghost (has_add=false) regardless of
+    // state, and — under TODAY's code — would entomb it with reason "ghost"
+    // (verified live by the sibling test above this one). We are about to
+    // ERASE that entombment to simulate the pre-index era, so this run's own
+    // "ghost" classification is not what --rebuild has to work with below.
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // Simulate the PRE-INDEX era, exactly as the sibling test above does:
+    // the compact happened, but (as it would have before 01M2M2K1J) no
+    // tombstone survives for it. RED baseline, asserted not assumed.
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstones.jsonl");
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 0), f.store.tombstones.items.len);
+    try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "show", &gone.text }));
+
+    // The recovery: a ghost's committed history holds no add/setTitle/
+    // setShort/setState event, so the narrow op-switch that predates this fix
+    // would build no `recs` entry for it at all and `--rebuild` would report
+    // it recovered nothing. With `model.eventTaskIds` seeding an entry from
+    // the `setBody`/`dep` events themselves, it is found.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 new tombstone(s) recorded") != null);
+
+    // POSITIVE: resolves as COMPACTED. Reason is "unknown", not "ghost" — the
+    // git-history scan can only recover what a NAMING event says, and this
+    // id's history holds none (its `--rebuild`-time original "ghost" verdict
+    // from `compact` was the very tombstone line this test erased above to
+    // simulate the pre-index era, so it is not available here either — the
+    // real-world case, 01KVR2E1KTXC65HD5175N373AH, is in exactly this state
+    // permanently, its `compact` having predated the index outright). Title
+    // "(not recorded)" for the same reason: a `setBody` is not title-bearing.
+    const e = f.runExpectErr(&.{ "show", &gone.text });
+    try testing.expectEqual(@as(anyerror, error.CompactedId), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "(not recorded)") != null);
+
+    // The live edge target is untouched.
+    try testing.expectEqual(@as(usize, 1), f.store.tombstones.items.len);
+    try testing.expect(f.store.lookupTombstone(&live.text) == .none);
+
+    // Idempotent.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "0 new tombstone(s) recorded") != null);
+}
+
+test "tombstones --verify: FAILS naming the gap while the index is incomplete, PASSES once --rebuild closes it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    const live = mintId();
+    try f.store.append(.{ .add = .{ .id = live, .title = "kept" } });
+    try f.store.append(.{ .setBody = .{ .id = gone, .body = "ghost body" } });
+    try f.store.append(.{ .dep = .{ .from = gone, .to = live } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "tracker log before the compact" });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstones.jsonl");
+    try f.reopen();
+
+    // POSITIVE (of the gap): the index is genuinely incomplete (the ghost is
+    // gone from the live store and entombed nowhere) — `--verify` must FAIL
+    // and name it, never report a bare "OK" over a gap it didn't look for.
+    const e = f.runExpectErr(&.{ "tombstones", "--verify" });
+    try testing.expectEqual(@as(anyerror, error.TombstoneIndexIncomplete), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "verify FAILED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, &gone.text) != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "unknown") != null);
+    // NEGATIVE (paired): the LIVE edge target must never be reported as a
+    // gap — it is still in the live store, so it is not what "neither live
+    // nor entombed" means, and flagging it would be exactly the false
+    // "dangling" verdict 01M2N6RQJ's incident was about, just moved to a new
+    // command.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, &live.text) == null);
+    // It must NEVER write — a verify that also repairs stops being a check
+    // that can fail.
+    try testing.expectEqual(@as(usize, 0), f.store.tombstones.items.len);
+
+    // POSITIVE: once `--rebuild` closes the gap, `--verify` passes clean.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try f.run(&.{ "tombstones", "--verify" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "verify OK") != null);
 }
 
 test "a REFUSED compact restores the tombstone index too — no tombstone for a task that is still live" {
