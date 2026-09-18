@@ -783,6 +783,32 @@ pub const Cli = struct {
         \\        trk edit 01KX6H --append-body "2026-08-23: reproduced on main."
         \\        trk edit 01KX6H --rm-doc none
         },
+        .{ .name = "rule", .run = &cmdRule, .mutates = true, .tools = &rule_tools, .text =
+        \\trk rule <id> <ruling text|->
+        \\  Record a ruling on a `#scott-decision` task and remove that tag IN THE SAME
+        \\  COMMAND — the atomic pairing `trk edit --append-body` cannot guarantee, because
+        \\  `edit` is generic and has no notion that the text it is appending settles the
+        \\  fork the tag exists to flag (01M298M9Z, ruled 2026-09-11: "it is insane that
+        \\  this is a new task as a scott-decision that asks to remove a scott-decision
+        \\  that should have already been removed"). `<ruling text>` is appended to the
+        \\  body exactly like `--append-body` (accepts `-` for stdin); the decision tag
+        \\  (`.tracker/config.json`'s `rule.tag`, default `#scott-decision`) is then
+        \\  removed. Refuses on a task that does not currently carry the tag — `rule` is
+        \\  for closing out a pending fork, not a general body+tag edit; use `trk edit`
+        \\  for that.
+        \\  This does NOT close the task: a ruling sometimes leaves the task alive as the
+        \\  carrier for the ruled work (rename/re-scope it instead), sometimes the task is
+        \\  now done — that is a separate, judgment-based `trk state <id> done`.
+        \\  Still depends on an author reaching for `rule` instead of hand-composing
+        \\  `edit --append-body` + `edit --rm-tag scott-decision` — it cannot stop that,
+        \\  only make the correct action the shorter and more obvious one, and remove the
+        \\  chance of doing half of it. (`trk archive`'s buried-decision guard is the
+        \\  complementary check at the OTHER end of the lifecycle: it catches a decision
+        \\  still discussed in a task's body at ARCHIVE time; `rule` is for a decision
+        \\  that is answered while the task stays OPEN, which archive's guard never sees.)
+        \\  e.g.  trk rule 01M298M9Z "RULED: (a), see docs/design.md"
+        \\        trk show 01M298M9Z --body | trk rule 01M298M9Z -
+        },
         .{ .name = "log", .run = &cmdLog, .tools = &log_tools, .text =
         \\trk log [<id>] [--limit <n>] [--json]
         \\  Event history, most-recent-last: the whole log, or one task's events.
@@ -976,6 +1002,11 @@ pub const Cli = struct {
         .{ .name = "priority", .kind = .integer, .flag = "--priority", .desc = "Lower sorts first; 0 = unset." },
     } }};
 
+    const rule_tools = [_]Tool{.{ .name = "rule", .params = &.{
+        p_id,
+        .{ .name = "text", .kind = .string, .required = true, .desc = "The ruling, appended to the body (like --append-body). Removes #scott-decision." },
+    } }};
+
     const log_tools = [_]Tool{.{ .name = "log", .argv = &.{"--json"}, .params = &.{
         .{ .name = "id", .kind = .string, .desc = "Only this task's events." },
         p_limit,
@@ -1077,6 +1108,8 @@ pub const Cli = struct {
             \\      A body edit must NAME its direction; there is no `--body` (hard error).
             \\      --append-body reads the current body through trk's own log+snapshot fold,
             \\      which an external read-modify-write cannot do correctly.
+            \\  trk rule <id> <ruling text|->   append a ruling and remove #scott-decision, atomically
+            \\      (see `trk rule --help`). Refuses on a task not currently tagged #scott-decision.
             \\  trk log [<id>] [--limit <n>] event history (most-recent-last)
             \\  trk stale                    open or claimed tasks cited in a landed commit but never closed
             \\  trk mcp-serve                serve the verbs as MCP tools over stdio (see `trk mcp-serve --help`)
@@ -4471,6 +4504,55 @@ pub const Cli = struct {
                 try self.print("{s}: -doc {s} (no such ref; no-op)\n", .{ sid, ref.doc_id });
             }
         }
+    }
+
+    /// `trk rule <id> <text>` — record a ruling and remove the decision tag
+    /// (`Config.rule_tag`, default `default_decision_tag` = "scott-decision")
+    /// in one call. See the verb's help text (`.text` above) for the
+    /// rationale; this is deliberately a thin wrapper around the same
+    /// primitives `edit` already exposes (`applyBodyEdit` + an `untag`
+    /// event) — no new event type, no new storage shape. What makes it a
+    /// distinct verb rather than "remember to pass both flags to `edit`" is
+    /// that its OWN code always performs both, so nothing routed through
+    /// `rule` can end up half-done.
+    fn cmdRule(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len < 2) {
+            try self.write("trk: usage: trk rule <id> <ruling text|->\n" ++
+                "  Appends <ruling text> to the body and removes the decision tag, atomically.\n");
+            return error.MissingArgument;
+        }
+        const id = try self.resolve(args[0]);
+        if (args.len > 2) {
+            try self.print("trk: rule takes exactly one ruling-text argument, got {d} extra\n", .{args.len - 2});
+            return error.UsageError;
+        }
+        const tag = self.store.config.rule_tag orelse tracker.store.default_decision_tag;
+        const b = try self.bodyArg("rule", args[1]);
+        defer if (b.owned) self.gpa.free(b.text);
+
+        var sb: [ulid.len]u8 = undefined;
+        const sid = try self.shortId(id, &sb);
+
+        const t = self.store.get(id).?; // resolve() already proved it exists
+        var tagged = false;
+        for (t.tags.items) |tg| {
+            if (std.mem.eql(u8, tg, tag)) {
+                tagged = true;
+                break;
+            }
+        }
+        if (!tagged) {
+            try self.print(
+                "trk: {s} does not carry #{s} -- `rule` is for closing out a PENDING decision " ++
+                    "fork. If you meant to add a note, use `trk edit --append-body`.\n",
+                .{ sid, tag },
+            );
+            return error.UsageError;
+        }
+
+        try self.applyBodyEdit(id, sid, b.text, true);
+        try self.store.append(.{ .untag = .{ .id = id, .tag = tag } });
+        try self.print("{s}: -#{s}\n", .{ sid, tag });
     }
 
     /// True iff `id` currently carries any docref to `doc_id` (section or not).

@@ -1158,3 +1158,68 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     drop the archived-state check → the archived-citation-still-refuses test fails): a genuine unresolved
     fork — no id, or an id naming an archived/nonexistent task — still refuses exactly as before; a
     citation of a genuinely live id is silent and the run archives clean.
+
+- **`trk rule <id> <text>` — record a ruling and remove the decision tag, atomically** (2026-09-18, task
+  `01M298M9Z`, Enix). A `#scott-decision` tag marks a fork awaiting a call only the repo owner can make;
+  `trk list --tag scott-decision` is the pre-dispatch sweep for "what is still waiting on him," and the
+  value of that query is that it stays short. Once the call is made and appended to the body via `trk edit
+  --append-body`, the tag survives — `edit` is generic and has no notion that the text it is appending
+  settles the very fork the tag exists to flag — so a ruled question keeps reappearing in the one query
+  whose entire point is to be trustworthy. Measured in the originating incident: three of one task's
+  rulings (two appended 09-07, one 09-09) were on record and the tag was still there for a fourth session
+  to trip over; eleven stale tags came off in one sweep once someone finally went looking.
+  - **Chosen: a dedicated verb, not a lint on `edit`.** Three shapes were weighed. (1) A `trk rule` verb
+    that performs the append and the untag as one call — this. (2) A lint (in `make lint` or similar) that
+    fails on an open, tagged task whose body carries a "RULED" marker — cheap, but it is the SAME failure
+    class one level down: a free-text marker convention an author can forget to write is exactly as
+    forgettable as the tag it would be catching, and the task that proposed it named its own weakness
+    ("the phrasings differ, so the matcher needs care"). (3) Splitting the decision from its carrier task
+    at ruling time (close the decision task outright, let a separate task carry the resulting work) — this
+    does not by itself remove anything: `01M29P00C`, the concrete case that motivated this entry, was
+    `state: done` and STILL carried `#scott-decision` when this was built, proving that closing (or even
+    archiving) a task is not what strips the tag; (3) just moves WHERE the same forgettable step would need
+    to happen, not whether it does.
+  - **What "atomic" means here, precisely.** Not a filesystem transaction — `trk`'s append-log has no
+    multi-event transactions, and `rule` writes a `setBody` then an `untag` as two ordinary log lines, same
+    as `edit --append-body --rm-tag <t>` would. What's atomic is the CALLER'S action: `rule`'s own code
+    always performs both, so there is no way to invoke it and get only the append — unlike `edit`, which
+    has no opinion on whether a given body edit was a ruling and so never prompts for the untag. This is
+    the same "verb-shaped correctness" trk already uses elsewhere (`release` exists so nobody hand-crafts
+    an untag+lease-clear; `state submitted` exists so nobody hand-picks between `done` and `open`).
+  - **Still depends on an author reaching for `rule`.** It does not make forgetting IMPOSSIBLE: an author
+    can still run `trk edit --append-body "RULED: ..."` and never touch the tag, exactly as before. What
+    changes is the SIZE of the thing that must be remembered — one correctly-named verb instead of two
+    generic flags used together, every time — and that a task cannot end up half-ruled by the verb whose
+    whole job is recording a ruling. This is an ergonomic/discoverability fix, not a hard guarantee; a lint
+    layered on top (option 2, not built here) would close the residual gap for callers who still reach for
+    `edit`, at the cost re-introducing the free-text-marker fragility named above. Left for later if the
+    residual gap proves to matter in practice.
+  - **Refuses on a task not currently tagged** (the configured tag; default `#scott-decision`) — the
+    discriminator between "settle this fork" and "add a note," and the guard against `rule` silently
+    closing out a genuinely open question it was pointed at by mistake (the shape of Enix's `01M12CKRK`: a
+    live, still-undecided fork that must never be untagged by a tool that doesn't know it's still open). The
+    check is structural, not textual: it reads the task's actual `tags`, not the body, so it cannot be
+    fooled by prose that merely mentions the tag word.
+  - **Does not close the task.** A ruling sometimes leaves the task alive as the carrier for the ruled work
+    (rename/re-scope it); sometimes the work is done too. Which is a separate, judgment call — `rule` only
+    removes the ONE thing that is never a judgment call once the ruling exists: the tag that says "still
+    waiting."
+  - **Composes with, rather than duplicates, the buried-decision guard above.** The two sit at opposite
+    ends of a ruled task's lifecycle and neither can see what the other catches: the guard fires at
+    `archive` time and scans body TEXT for marker words in tasks about to be hidden forever; `rule` fires
+    while a task is still OPEN and clears a TAG field. A task `rule` untags but that stays open as a
+    carrier never reaches `archive` at all under this ruling, so the guard never sees it — which is exactly
+    the gap this verb exists to close (nothing at archive time can catch a decision stuck open-but-answered,
+    because archive only ever looks at the done queue). Conversely the guard's own default marker set
+    still lists `scott-decision` as a body-text substring, unrelated to `rule`'s tag check, so a task whose
+    BODY still discusses an unresolved fork in prose is caught there regardless of what `rule` did to any
+    tag.
+  - **`rule.tag` in `config.json`, default `default_decision_tag` ("scott-decision")** — configurable for
+    the same reason `archive.decision_markers` is: `trk` has no opinion on what a repo calls its "needs a
+    human call" tag, and Enix's choice of literal string is a convention, not something the tool should
+    hardcode. The two knobs (`rule.tag`, `archive.decision_markers`) are independent even though their
+    defaults share a literal value.
+  - Sabotage-proven in `cli_test.zig`: drop the `untag` append → the tests asserting the tag is gone fail
+    (`expected 0, found 1`, and a tag-still-present `expect`); drop the not-tagged refusal → the tests
+    asserting `error.UsageError` on an untagged task fail (`expected error.UsageError, found
+    error.TestUnexpectedSuccess`) while the unrelated tests (arg-count validation) stay green either way.
