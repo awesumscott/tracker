@@ -94,6 +94,13 @@ pub const CliError = error{
     /// this into 0 would tell `dangling-tracker-id-lint.sh` a graduated id is
     /// live; folding it into 1 would put it back where it started.
     CompactedId,
+    /// `trk tombstones --verify` found at least one id in `.tracker/log.jsonl`'s
+    /// full git history that is neither live nor entombed — the tombstone
+    /// index is INCOMPLETE. The offending ids are already listed in `out`
+    /// before this is returned; main.zig exits 1 (a plain failure — there is
+    /// no dedicated exit code for this the way `CompactedId` gets one, because
+    /// nothing resolves an id through this path the way `show` does).
+    TombstoneIndexIncomplete,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -795,7 +802,7 @@ pub const Cli = struct {
         \\  e.g.  trk stale
         },
         .{ .name = "tombstones", .run = &cmdTombstones, .mutating_subcommands = &.{"--rebuild"}, .tools = &tombstones_tools, .text =
-        \\trk tombstones [--rebuild] [--json]
+        \\trk tombstones [--rebuild | --verify] [--json]
         \\  The index of tasks `trk compact` physically GC'd (.tracker/tombstones.jsonl).
         \\  Compaction is the only thing that destroys an id: the task, its title and
         \\  its edges leave every file under .tracker/, and without this index
@@ -808,14 +815,23 @@ pub const Cli = struct {
         \\  --rebuild: RECOVER tombstones for ids compacted BEFORE this index existed,
         \\  by replaying .tracker/log.jsonl's full git history (`git log --all -p`) and
         \\  entombing every id it ever carried that is neither live nor already
-        \\  recorded. That is the method scripts/dangling-tracker-id-lint.sh uses to
-        \\  tell historical from dangling — run ONCE and persisted, instead of per
-        \\  query: measured on a 10,574-commit repo it is ~31s and ~162MB of diff,
-        \\  which is fine for a one-shot migration and is exactly why `show` cannot do
-        \\  it live. Idempotent (an id already entombed is skipped); it never touches
-        \\  the log, the snapshot, or any live task. Recovered rows are marked
+        \\  recorded — every id ANY event names (an edge's both endpoints included),
+        \\  not just the ones that happen to carry a title. That is the method
+        \\  scripts/dangling-tracker-id-lint.sh uses to tell historical from
+        \\  dangling — run ONCE and persisted, instead of per query: measured on a
+        \\  10,574-commit repo it is ~31s and ~162MB of diff, which is fine for a
+        \\  one-shot migration and is exactly why `show` cannot do it live.
+        \\  Idempotent (an id already entombed is skipped); it never touches the
+        \\  log, the snapshot, or any live task. Recovered rows are marked
         \\  src=git-history and carry no collection time.
+        \\  --verify: the STANDING CHECK — same git-history walk as --rebuild, but
+        \\  asserts (never repairs) that every id it finds is either live or already
+        \\  entombed. Exits nonzero and lists the gap if not — the check
+        \\  `--rebuild`'s own "N recorded" count cannot give you, because a count is
+        \\  coverage of what it found, not proof it found everything. Read-only,
+        \\  same cost as --rebuild; not for routine/per-commit use.
         \\  e.g.  trk tombstones           trk tombstones --rebuild
+        \\        trk tombstones --verify
         },
         .{ .name = "mcp-serve", .run = &cmdMcpServe, .tools = &cli_only_tools, .text =
         \\trk mcp-serve
@@ -967,12 +983,15 @@ pub const Cli = struct {
 
     const stale_tools = [_]Tool{.{ .name = "stale" }};
 
-    // READ-ONLY over MCP, deliberately: `--rebuild` is not exposed. It is a
-    // one-shot migration that shells out to `git log --all -p` (~31s, ~162MB on
-    // a real repo) and writes the index — an orchestrator runs it once from the
-    // CLI. Exposing it here would also make `readOnlyHint` a lie, since that
-    // hint is derived from `argv` alone and could not see a `rebuild: true`
-    // argument coming.
+    // READ-ONLY over MCP, deliberately: neither `--rebuild` nor `--verify` is
+    // exposed. `--rebuild` is a one-shot migration that shells out to `git log
+    // --all -p` (~31s, ~162MB on a real repo) and writes the index — an
+    // orchestrator runs it once from the CLI; exposing it here would also make
+    // `readOnlyHint` a lie, since that hint is derived from `argv` alone and
+    // could not see a `rebuild: true` argument coming. `--verify` IS read-only
+    // (never writes), but shares `--rebuild`'s full-history-walk cost — an MCP
+    // caller has no reason to expect an ~80s tool call, so it stays a CLI-only,
+    // orchestrator-invoked check for the same reason `--rebuild` is.
     const tombstones_tools = [_]Tool{.{ .name = "tombstones", .argv = &.{"--json"} }};
 
     /// Print one verb's help (from `verbs`), or fall back to the full usage
@@ -2200,7 +2219,8 @@ pub const Cli = struct {
         defer sub.close(self.io);
 
         const bytes = sub.readFileAlloc(self.io, ga, self.gpa, .unlimited) catch {
-            try self.warn.print(self.gpa,
+            try self.warn.print(
+                self.gpa,
                 "trk: warning: {s}/{s} is absent. {s} and {s} are whole-file baselines that " ++
                     "must NOT be union-merged (a raced compact has to surface as a conflict), and " ++
                     "{s} must be. If this repo pins them elsewhere, ignore this; otherwise run " ++
@@ -2230,7 +2250,8 @@ pub const Cli = struct {
                     break;
                 }
             }
-            if (!found) try self.warn.print(self.gpa,
+            if (!found) try self.warn.print(
+                self.gpa,
                 "trk: warning: {s}/{s} has no `{s}` line — re-add it or delete the file and " ++
                     "re-run `trk init`.\n",
                 .{ sd, ga, pin },
@@ -2675,11 +2696,9 @@ pub const Cli = struct {
             const sid = try self.shortId(id, &sb);
             for (task_hits.items) |h| {
                 if (hits == 0) {
-                    try self.warn.print(self.gpa,
-                        "trk: {s}: task bodies about to be archived carry DECISION markers. " ++
-                            "`archived` is hidden from every view, so these lines are graduated out of sight " ++
-                            "with the work:\n",
-                        .{if (mode == .refuse) "refusing" else "note"});
+                    try self.warn.print(self.gpa, "trk: {s}: task bodies about to be archived carry DECISION markers. " ++
+                        "`archived` is hidden from every view, so these lines are graduated out of sight " ++
+                        "with the work:\n", .{if (mode == .refuse) "refusing" else "note"});
                 }
                 hits += 1;
                 if (!is_exempt) fatal += 1;
@@ -2699,7 +2718,8 @@ pub const Cli = struct {
             // whose hits are not already covered, in both .refuse and .preview
             // (under .override nothing is being asserted, so it is noise).
             if (!is_exempt and mode != .override) {
-                try self.warn.print(self.gpa,
+                try self.warn.print(
+                    self.gpa,
                     "      -> after reading the {d} line(s) above, exempt this task with: " ++
                         "--allow-buried-decisions-for {s}:{d}:{x:0>8}\n",
                     .{ task_hits.items.len, sid, task_hits.items.len, actual_digest },
@@ -2708,40 +2728,31 @@ pub const Cli = struct {
         }
         if (hits == 0) return false;
         if (mismatched_tasks > 0) {
-            try self.warn.print(self.gpa,
-                "  {d} task(s) named via --allow-buried-decisions-for no longer carry the declared " ++
-                    "hit set -- a marker line was added, removed, or SWAPPED since that " ++
-                    "<n>:<digest> was named, so the exemption does not apply; re-read the lines and " ++
-                    "re-declare with the value printed above.\n",
-                .{mismatched_tasks});
+            try self.warn.print(self.gpa, "  {d} task(s) named via --allow-buried-decisions-for no longer carry the declared " ++
+                "hit set -- a marker line was added, removed, or SWAPPED since that " ++
+                "<n>:<digest> was named, so the exemption does not apply; re-read the lines and " ++
+                "re-declare with the value printed above.\n", .{mismatched_tasks});
         }
         if (mode == .preview) {
             if (fatal == 0) {
-                try self.warn.print(self.gpa,
-                    "  ({d} line(s), all exempted via --allow-buried-decisions-for -- a real run " ++
-                        "would archive anyway)\n", .{hits});
+                try self.warn.print(self.gpa, "  ({d} line(s), all exempted via --allow-buried-decisions-for -- a real run " ++
+                    "would archive anyway)\n", .{hits});
             } else if (fatal < hits) {
-                try self.warn.print(self.gpa,
-                    "  ({d} line(s), {d} exempted via --allow-buried-decisions-for; a real run would " ++
-                        "still refuse the remaining {d})\n", .{ hits, hits - fatal, fatal });
+                try self.warn.print(self.gpa, "  ({d} line(s), {d} exempted via --allow-buried-decisions-for; a real run would " ++
+                    "still refuse the remaining {d})\n", .{ hits, hits - fatal, fatal });
             } else {
-                try self.warn.print(self.gpa,
-                    "  ({d} line(s); a real run without --allow-buried-decisions would refuse)\n", .{hits});
+                try self.warn.print(self.gpa, "  ({d} line(s); a real run without --allow-buried-decisions would refuse)\n", .{hits});
             }
         } else if (mode == .override) {
-            try self.warn.print(self.gpa,
-                "  ({d} line(s); archiving anyway per --allow-buried-decisions — these are now hidden " ++
-                    "from every view)\n", .{hits});
+            try self.warn.print(self.gpa, "  ({d} line(s); archiving anyway per --allow-buried-decisions — these are now hidden " ++
+                "from every view)\n", .{hits});
         } else if (fatal == 0) {
-            try self.warn.print(self.gpa,
-                "  ({d} line(s), all exempted via --allow-buried-decisions-for — archiving anyway)\n", .{hits});
+            try self.warn.print(self.gpa, "  ({d} line(s), all exempted via --allow-buried-decisions-for — archiving anyway)\n", .{hits});
         } else {
-            try self.warn.print(self.gpa,
-                "  Split each decision out as its own task first (`trk add ...`), then archive.\n" ++
-                    "  To archive just the exempted task(s) anyway: trk archive --allow-buried-decisions-for <id>:<n>:<digest> (each printed above)\n" ++
-                    "  To archive everything anyway: trk archive --allow-buried-decisions\n" ++
-                    "  To change what counts: .tracker/config.json -> archive.decision_markers (a JSON array; [] disables)\n",
-                .{});
+            try self.warn.print(self.gpa, "  Split each decision out as its own task first (`trk add ...`), then archive.\n" ++
+                "  To archive just the exempted task(s) anyway: trk archive --allow-buried-decisions-for <id>:<n>:<digest> (each printed above)\n" ++
+                "  To archive everything anyway: trk archive --allow-buried-decisions\n" ++
+                "  To change what counts: .tracker/config.json -> archive.decision_markers (a JSON array; [] disables)\n", .{});
         }
         return mode == .refuse and fatal > 0;
     }
@@ -3730,8 +3741,7 @@ pub const Cli = struct {
                 if (tb.title.len != 0) tb.title else "(title not recorded)",
             });
         }
-        try buf.print(gpa,
-            "  These are NOT missing members: an arc whose live tree is empty has NOT been shown\n" ++
+        try buf.print(gpa, "  These are NOT missing members: an arc whose live tree is empty has NOT been shown\n" ++
             "  to be unsliced. `trk show <id>` for any of them; the full record is in git history.\n", .{});
     }
 
@@ -4081,7 +4091,8 @@ pub const Cli = struct {
                         // would hand that pipe plausible-looking body bytes. So
                         // stdout stays EMPTY — which `--replace-body -` refuses
                         // outright — and the explanation goes to stderr.
-                        try self.warn.print(self.gpa,
+                        try self.warn.print(
+                            self.gpa,
                             "trk: {s} is COMPACTED — it existed and `trk compact` GC'd it out of the live " ++
                                 "store, so there is no body to read. `trk show {s}` prints what the tombstone " ++
                                 "index kept.\n",
@@ -4731,20 +4742,31 @@ pub const Cli = struct {
 
     // ----------------------------------------------------------- tombstones
 
-    /// `trk tombstones [--rebuild] [--json]` — read, and back-fill, the index of
-    /// ids `compact` physically GC'd (01M2M2K1J). See `store.tombstones_name`.
+    /// `trk tombstones [--rebuild | --verify] [--json]` — read, back-fill, and
+    /// verify the completeness of the index of ids `compact` physically GC'd
+    /// (01M2M2K1J). See `store.tombstones_name`.
     fn cmdTombstones(self: *Cli, args: []const []const u8) Error!void {
         var rebuild = false;
         var json = false;
+        var verify = false;
         for (args) |a| {
             if (std.mem.eql(u8, a, "--rebuild")) {
                 rebuild = true;
             } else if (std.mem.eql(u8, a, "--json")) {
                 json = true;
+            } else if (std.mem.eql(u8, a, "--verify")) {
+                verify = true;
             } else {
-                try self.write("trk: usage: trk tombstones [--rebuild] [--json]\n");
+                try self.write("trk: usage: trk tombstones [--rebuild | --verify] [--json]\n");
                 return error.UsageError;
             }
+        }
+        if (verify) {
+            if (rebuild or json) {
+                try self.write("trk: usage: trk tombstones --verify takes no other flags\n");
+                return error.UsageError;
+            }
+            return self.verifyTombstoneIndex();
         }
         if (rebuild) try self.rebuildTombstones();
 
@@ -4787,9 +4809,30 @@ pub const Cli = struct {
         }
     }
 
-    /// Back-fill the tombstone index from `.tracker/log.jsonl`'s FULL git
-    /// history — the only surviving record of an id compacted before the index
-    /// existed.
+    /// id -> the best record recovered so far from a log-history replay.
+    /// `title`/`reason` each carry the ts of the event they came from, so a
+    /// later `setTitle`/`setState` wins regardless of the order the history
+    /// walk hands them over. An id can (and for a "ghost" — see
+    /// `scanLogHistoryForIds` — routinely does) end up with an entry whose
+    /// `title`/`reason` never move off their zero-value defaults: it was
+    /// referenced (an edge, a `setBody`, a `tag`, ...) but never NAMED by any
+    /// committed event.
+    const RebuildRec = struct {
+        short: ?[]const u8 = null,
+        title: []const u8 = "",
+        title_ts: i64 = -1,
+        reason: []const u8 = "unknown",
+        reason_ts: i64 = -1,
+    };
+
+    /// Replay `.tracker/log.jsonl`'s FULL git history (`git log --all -p`) —
+    /// the only surviving record of an id compacted before the tombstone index
+    /// existed — and return one `RebuildRec` per distinct id ANY event in that
+    /// history OWNS. Shared by `rebuildTombstones` (which entombs the result)
+    /// and `verifyTombstoneIndex` (which only checks it against what is
+    /// already live/entombed): one scan, one notion of "every id history ever
+    /// carried", so the two can never drift into disagreeing about what that
+    /// set is.
     ///
     /// WHY GIT AND NOT THE STORE: there is nothing else left. `compact` excludes
     /// the task from the snapshot and truncates the log, so no file under
@@ -4803,10 +4846,28 @@ pub const Cli = struct {
     /// still existed. A false LIVE would be dangerous; a false EXISTED is not —
     /// the record says plainly that it is gone.
     ///
-    /// Recovers title and state from the events themselves, keeping the value
-    /// with the largest `ts` per id, so the answer does not depend on git's
-    /// newest-first walk order.
-    fn rebuildTombstones(self: *Cli) Error!void {
+    /// MEMBERSHIP is decided by `model.eventTaskIds` — the same "who does this
+    /// event name" rule `compact`'s ghost detector (`!t.has_add`) relies on:
+    /// one id for a scalar op, two for an edge (`dep`/`undep`/`in`/`unin`),
+    /// none for `setDocPath` (it names a doc, not a task). TITLE/REASON
+    /// recovery is a narrower, separate switch over just `add`/`setTitle`/
+    /// `setShort`/`setState` (the only kinds that carry one) — but every id an
+    /// EARLIER version of this function would have silently dropped when its
+    /// history held only non-naming events is still returned here, with those
+    /// fields at their defaults. That gap was not hypothetical:
+    /// `01KVR2E1KTXC65HD5175N373AH`'s full committed history (verified by a
+    /// direct `git log --all -p` read, 01M2N8WMD) is exactly `setBody` + `dep`
+    /// — no `add`/`setTitle`/`setShort`/`setState` event anywhere — which is
+    /// precisely `compact`'s "ghost" class: an id the fold only ever saw
+    /// REFERENCED, never `add`ed. A compaction that predates the tombstone
+    /// index (01M2M2K1J) is the one place a ghost's entombment depends on THIS
+    /// scan recovering it, so membership must not be keyed on the title-
+    /// bearing ops alone.
+    ///
+    /// Strings are allocated out of `ra` (caller-owned; must outlive the
+    /// returned map). The map's own storage is `self.gpa` — the caller frees
+    /// it with `.deinit(self.gpa)`.
+    fn scanLogHistoryForIds(self: *Cli, ra: std.mem.Allocator) Error!std.AutoHashMapUnmanaged([ulid.len]u8, RebuildRec) {
         const log_path = tracker.store.tracker_subdir ++ "/" ++ tracker.store.log_name;
         const result = std.process.run(self.gpa, self.io, .{
             .argv = &.{ "git", "log", "--all", "-p", "--no-color", "--", log_path },
@@ -4829,26 +4890,8 @@ pub const Cli = struct {
             return error.GitLogFailed;
         }
 
-        // id -> the best record seen so far. `title`/`reason` each carry the ts
-        // of the event they came from, so a later `setTitle`/`setState` wins
-        // regardless of the order the history walk hands them over.
-        const Rec = struct {
-            short: ?[]const u8 = null,
-            title: []const u8 = "",
-            title_ts: i64 = -1,
-            reason: []const u8 = "unknown",
-            reason_ts: i64 = -1,
-        };
-        var recs = std.AutoHashMapUnmanaged([ulid.len]u8, Rec){};
-        defer recs.deinit(self.gpa);
-        // Every recovered title/short is copied out of a decoded event that is
-        // freed on the next loop iteration, and there are thousands of them.
-        // One arena freed at the end beats tracking each string: the records
-        // are write-once and all die together, and the rows handed to
-        // `appendTombstones` below borrow from it while it is still alive.
-        var rec_arena = std.heap.ArenaAllocator.init(self.gpa);
-        defer rec_arena.deinit();
-        const ra = rec_arena.allocator();
+        var recs = std.AutoHashMapUnmanaged([ulid.len]u8, RebuildRec){};
+        errdefer recs.deinit(self.gpa);
 
         var lines = std.mem.splitScalar(u8, result.stdout, '\n');
         while (lines.next()) |raw| {
@@ -4859,6 +4902,15 @@ pub const Cli = struct {
             const line = std.mem.trimEnd(u8, raw[1..], " \t\r");
             const ev = codec.decode(self.gpa, line) catch continue;
             defer Store.freeEvent(self.gpa, ev);
+
+            // Every id this event OWNS gets an entry, independent of whether
+            // it also carries a title/state (see the doc comment above).
+            for (model.eventTaskIds(ev)) |maybe_id| {
+                const id = maybe_id orelse continue;
+                const gop = try recs.getOrPut(self.gpa, id.text);
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+            }
+
             switch (ev) {
                 .add => |a| {
                     const gop = try recs.getOrPut(self.gpa, a.id.text);
@@ -4893,6 +4945,23 @@ pub const Cli = struct {
                 else => {},
             }
         }
+        return recs;
+    }
+
+    /// Back-fill the tombstone index from `.tracker/log.jsonl`'s FULL git
+    /// history via `scanLogHistoryForIds`, entombing every recovered id that
+    /// is neither live nor already recorded.
+    fn rebuildTombstones(self: *Cli) Error!void {
+        const log_path = tracker.store.tracker_subdir ++ "/" ++ tracker.store.log_name;
+        // Every recovered title/short is copied out of a decoded event that is
+        // freed on the next loop iteration, and there are thousands of them.
+        // One arena freed at the end beats tracking each string: the records
+        // are write-once and all die together, and the rows handed to
+        // `appendTombstones` below borrow from it while it is still alive.
+        var rec_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer rec_arena.deinit();
+        var recs = try self.scanLogHistoryForIds(rec_arena.allocator());
+        defer recs.deinit(self.gpa);
 
         // Entomb every recovered id that is neither live nor already recorded.
         // `appendTombstones` re-checks the index itself; the live check is here
@@ -4930,6 +4999,91 @@ pub const Cli = struct {
                 "{d} new tombstone(s) recorded, {d} already known or still live.\n",
             .{ recs.count(), log_path, written, recs.count() - written },
         );
+    }
+
+    /// `trk tombstones --verify`: the STANDING CHECK 01M2N8WMD asked for —
+    /// assert, rather than trust, that the tombstone index is COMPLETE.
+    ///
+    /// Computes the same structural id set `scanLogHistoryForIds` computes for
+    /// `--rebuild`, then asserts (structural set) - (live) - (tombstoned) is
+    /// EMPTY. Before this existed, the only thing anyone could check was the
+    /// back-fill's OWN reported count ("N new tombstone(s) recorded") — which
+    /// reads as coverage but proves nothing: a `--rebuild` that silently
+    /// missed a class of ids (exactly what this file's `--rebuild` fix just
+    /// closed) would report a clean run and never be caught by anything
+    /// short of the by-hand cross-check 01M2N8WMD did manually. This is that
+    /// cross-check, made a real command so a regression in `eventTaskIds`
+    /// coverage — or a future op variant nobody remembered to wire in — FAILS
+    /// LOUD instead of degrading back into the silent gap (rule 5,
+    /// docs/debugging.md: a check must be able to fail, and something must
+    /// assert on it).
+    ///
+    /// Read-only: unlike `--rebuild`, never writes `tombstones.jsonl` — a
+    /// verify that could also silently repair would stop being a check that
+    /// FAILS and just become `--rebuild` under another name.
+    ///
+    /// Cost: one `git log --all -p` walk, same as `--rebuild` (~31s on a
+    /// 10,574-commit repo per that command's own measurement; ~80s measured on
+    /// Enix's larger tracker history, 01M2N8WMD) — mechanical but NOT cheap
+    /// enough to run on every `trk` invocation or every commit. See
+    /// `docs/design.md` "Tombstone index completeness" for why this lives here
+    /// (a `trk` subcommand) rather than as an Enix-side lint reimplementing the
+    /// same walk, and why it stays an opt-in command rather than a `next`/
+    /// `list`-style default.
+    fn verifyTombstoneIndex(self: *Cli) Error!void {
+        const log_path = tracker.store.tracker_subdir ++ "/" ++ tracker.store.log_name;
+        var rec_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer rec_arena.deinit();
+        var recs = try self.scanLogHistoryForIds(rec_arena.allocator());
+        defer recs.deinit(self.gpa);
+
+        var missing: std.ArrayList(tracker.store.Tombstone) = .empty;
+        defer missing.deinit(self.gpa);
+        var it = recs.iterator();
+        while (it.next()) |e| {
+            const id = Ulid{ .text = e.key_ptr.* };
+            if (self.store.get(id) != null) continue; // live — not a gap
+            if (self.store.lookupTombstone(&id.text) != .none) continue; // already entombed
+            try missing.append(self.gpa, .{
+                .id = id,
+                .short = e.value_ptr.short,
+                .title = e.value_ptr.title,
+                .reason = e.value_ptr.reason,
+                .arcs = &.{},
+                .ts = 0,
+                .src = "git-history",
+            });
+        }
+
+        if (missing.items.len == 0) {
+            try self.print(
+                "trk: tombstones: verify OK — {d} distinct id(s) in the full history of {s}, " ++
+                    "every one live or entombed.\n",
+                .{ recs.count(), log_path },
+            );
+            return;
+        }
+
+        std.sort.pdq(tracker.store.Tombstone, missing.items, {}, tombstoneIdLessThan);
+        try self.print(
+            "trk: tombstones: verify FAILED — {d} of {d} distinct id(s) in the full history of {s} are " ++
+                "neither live nor entombed (provably existed, provably gone, recorded nowhere):\n",
+            .{ missing.items.len, recs.count(), log_path },
+        );
+        for (missing.items) |tb| {
+            try self.print("  {s}  {s:<9}  {s}\n", .{
+                &tb.id.text,
+                tb.reason,
+                if (tb.title.len != 0) tb.title else "(not recorded)",
+            });
+        }
+        try self.print(
+            "trk: tombstones: run `trk tombstones --rebuild` to entomb them, or investigate why " ++
+                "--rebuild itself isn't (a regression in --rebuild's own id-membership coverage is " ++
+                "exactly what this check exists to catch).\n",
+            .{},
+        );
+        return error.TombstoneIndexIncomplete;
     }
 
     fn tombstoneIdLessThan(_: void, lhs: tracker.store.Tombstone, rhs: tracker.store.Tombstone) bool {
