@@ -315,10 +315,16 @@ them) would be a data-loss footgun of a different kind. Re-running `init` in a r
 file is the migration: idempotent-by-construction, it backfills the missing `.gitignore` without
 touching anything else already there (asserted in `cli_test.zig`).
 
-**The check is narrow on purpose.** `compact` warns (stderr) when a pin is missing, because it is the verb
-that *creates* the two files that must never be union-merged. It cannot verify what is actually in effect:
-this path never shells out to git — `discover.zig` reads `.git` as a plain file for exactly this reason, and
-the two verbs that DO spawn it (`stale`, `tombstones --rebuild`) each do so for a question git alone can
+**The check is narrow on purpose, and it is the closer for `init`'s own non-destructive promise.** `init`
+never overwrites an existing `.tracker/.gitattributes` — correct, since clobbering a repo's attribute choices
+would be worse — but that means a pin *added to the template after a store already exists* (as
+`tombstones.jsonl merge=union` was, in the same commit that added the tombstones index) can never reach that
+store by any `init` re-run. `compact` and `tombstones --rebuild` warn (stderr) when a pin is missing instead,
+because between them they are every verb that writes one of the files these pins govern — `compact` *creates*
+`snapshot.jsonl`/`quarantine.jsonl` and writes `tombstones.jsonl`, `--rebuild` is the other, and can be the
+*first* write ever, in a store that has never run `compact` (01M2N0QW2). It cannot verify what is actually in
+effect: this check itself never shells out to git — `discover.zig` reads `.git` as a plain file for exactly
+this reason, and `stale`'s and `--rebuild`'s own history scans spawn it only for a question git alone can
 answer — and attributes resolve through parent directories, `.git/info/attributes` and `core.attributesFile`
 — reimplementing that resolution would be worse than not checking. So the warning claims only what trk can
 see about its OWN file ("absent, and here is what it would do"), never "your repo is wrong": a repo pinning
