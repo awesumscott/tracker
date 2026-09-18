@@ -5285,3 +5285,78 @@ test "compact --dry-run on a store with nothing to collect says so (01M1FMNSZ)" 
     try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing to collect") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "WOULD be collected") == null);
 }
+
+// ----- list --arc reports compacted members (01M2V2TSA) -----
+
+test "list --arc reports an arc's compacted members; next and render deliberately do not (01M2V2TSA)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const graduated = mintId();
+    const live = mintId();
+    const finished = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Ship v2" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = graduated, .title = "graduated slice" } });
+    try f.store.append(.{ .in = .{ .task = graduated, .arc = arc, .seq = 1 } });
+    try f.store.append(.{ .add = .{ .id = live, .title = "live slice" } });
+    try f.store.append(.{ .in = .{ .task = live, .arc = arc, .seq = 2 } });
+    // A `done` member: proof that `list` already shows closed work, which is
+    // what makes the compacted one's absence an inconsistency and not a policy.
+    try f.store.append(.{ .add = .{ .id = finished, .title = "finished slice" } });
+    try f.store.append(.{ .in = .{ .task = finished, .arc = arc, .seq = 3 } });
+    try f.store.append(.{ .setState = .{ .id = finished, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = graduated, .state = .archived } });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    try f.run(&.{ "list", "--arc", &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "live slice") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "finished slice") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "+1 compacted member(s) not shown") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "names them") != null);
+
+    // --json: the same fact, as a row a consumer filters on one key.
+    try f.run(&.{ "list", "--arc", &arc.text, "--json" });
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+        defer parsed.deinit();
+        const rows = parsed.value.array;
+        var compacted: usize = 0;
+        var seen_graduated = false;
+        for (rows.items) |row| {
+            if (row.object.get("compacted")) |c| {
+                if (c.bool) {
+                    compacted += 1;
+                    if (std.mem.eql(u8, row.object.get("title").?.string, "graduated slice"))
+                        seen_graduated = true;
+                }
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), compacted);
+        try testing.expect(seen_graduated);
+        // Filtering that one key yields exactly the pre-fix output.
+        try testing.expectEqual(@as(usize, 4), rows.items.len);
+    }
+
+    // BOTH DIRECTIONS, the shape 01M29P5T7 used: an arc that never had a
+    // graduated member must read differently from one that did. Otherwise the
+    // footer proves nothing about the arc it is attached to.
+    const quiet = mintId();
+    try f.store.append(.{ .add = .{ .id = quiet, .title = "Never sliced" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = quiet, .declared = true } });
+    try f.run(&.{ "list", "--arc", &quiet.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted member") == null);
+
+    // And the two views Scott scoped OUT stay silent (2026-09-18): `next` is a
+    // ready frontier, `render` projects only not-yet-built work.
+    try f.run(&.{ "next", "--arc", &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted") == null);
+    try f.run(&.{ "render", "--out", "TODO.md" });
+    const md = try f.tmp.dir.readFileAlloc(io, "TODO.md", alloc, .unlimited);
+    defer alloc.free(md);
+    try testing.expect(std.mem.indexOf(u8, md, "compacted") == null);
+}

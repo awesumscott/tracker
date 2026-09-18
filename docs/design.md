@@ -905,6 +905,33 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
 
 ## Settled rulings
 
+- **Only `list --arc` reports an arc's compacted members; `next` and `docs/TODO.md` do not** (01M2V2TSA,
+  Scott's call 2026-09-18). `01M29P5T7` established that a view which ENUMERATES ARC MEMBERS must never
+  present a short-or-empty list as if nothing was ever there — `compact` deletes the `in` edge along with
+  the member it collects (`serializeState`'s `gc_set`; an edge naming a collected id would re-materialize
+  it as a ghost), so a fully-built, graduated arc renders identically to one nobody ever sliced. It fixed
+  `tree` and `show` and left three views behind. The ruling splits them, and not by the invariant:
+  - **`list --arc` gets it, because there it is a self-inconsistency.** `list` ALREADY shows closed work —
+    `done` and `submitted` rows are ordinary output — and a compacted member is the only kind it silently
+    drops. A count plus a pointer to `trk tree <arc>`, not the rows: `tree` already renders the full block
+    in a shape that cannot be skim-read as live work, and a second copy here would be one to keep in step.
+    In `--json` they arrive as extra rows carrying `"compacted": true` — an array has nowhere to put a
+    footer, so the choice is rows or nothing, and nothing would leave the agent-facing half of the same
+    view carrying the defect the human half just stopped carrying. The key is the one `show --json`
+    already uses, so filtering it yields exactly the pre-fix set.
+  - **`next` does not, because it is not that kind of view.** A ready frontier already omits done, blocked
+    and leased members and nobody calls that a silent absence; a graduated member is never an answer to
+    "what can I work on".
+  - **`docs/TODO.md` does not, because the projection's contract excludes it.** `renderMarkdown` states
+    its own domain — only not-yet-built work; `done` graduates to `CHANGELOG.md` via `archive` — and a
+    compacted member is archived-then-collected, the most finished state there is. Annotating it in would
+    put back the one class the projection exists to exclude, and would be a second, drifting copy of what
+    `CHANGELOG.md` already holds in curated form.
+  - *Not recoverable, and deliberately so — do not re-file these:* a COMPACTED DEPENDENT (the tombstone
+    index records no `needs` edges) and a LIVE task's COMPACTED ARC (the live task has no tombstone, and
+    the arc's own record says only what IT was a member of). Both mean recording edges the index
+    intentionally does not carry.
+
 - **Ids cited from OUTSIDE the tracker are the caller's to protect; `compact --dry-run` is what trk owes
   them** (01M1FMNSZ, 2026-09-18). trk's compaction rules were written about task-to-task references —
   `needs` edges, arcs, citations inside other task bodies — all of which trk can see and reason about.

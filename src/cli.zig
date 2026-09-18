@@ -692,6 +692,15 @@ pub const Cli = struct {
         \\  reachability) — the completeness query for "sort everything into arcs";
         \\  mutually exclusive with --arc. --json for machine-readable output (same
         \\  object shape as `next --json`, body included).
+        \\  With --arc, a tail line reports the arc's COMPACTED members by count and
+        \\  points at `trk tree <arc>`, which names them. `list` already shows closed
+        \\  work (done/submitted), and `compact` deletes the `in` edge along with the
+        \\  member it collects — so without this a fully-built, graduated arc lists
+        \\  identically to one nobody ever sliced. In --json they arrive as extra rows
+        \\  carrying \"compacted\": true (an array has nowhere to put a footer); filter
+        \\  on that key for the live-only set. `next` and docs/TODO.md deliberately do
+        \\  NOT report them: `next` is a ready frontier, and TODO.md projects only
+        \\  not-yet-built work.
         \\  e.g.  trk list --state open net           trk list --no-arc
         \\        trk list --state submitted           (the awaiting-verification queue)
         \\        trk list --state claimed             (tasks currently leased)
@@ -3515,10 +3524,61 @@ pub const Cli = struct {
             shown += 1;
         }
         if (json) {
+            // The machine half of the footer below. Rows, not a sibling key:
+            // `list --json` is an ARRAY by contract and a footer has nowhere to
+            // live in one, so the choice is rows or nothing — and nothing leaves
+            // the agent-facing half of this view carrying the exact defect the
+            // human half just stopped carrying. Each row carries
+            // `"compacted": true`, the key `show --json` already uses and that
+            // design.md rules a machine reader should branch on, so a consumer
+            // that wants today's output filters on one key rather than parsing
+            // for an absence.
+            if (arc_id) |a| {
+                const gone = try self.store.compactedMembers(self.gpa, a);
+                defer self.gpa.free(gone);
+                for (gone) |tb| {
+                    if (shown != 0) try self.write(",");
+                    try self.tombstoneJsonOpen(tb);
+                    try self.write("}");
+                    shown += 1;
+                }
+            }
             try self.write("]\n");
-        } else if (shown == 0) {
-            try self.write("(no matching tasks)\n");
+            return;
         }
+        if (shown == 0) try self.write("(no matching tasks)\n");
+        try self.compactedMemberFooter(arc_id);
+    }
+
+    /// `list --arc <id>`'s graduated tail (01M2V2TSA).
+    ///
+    /// `list` is the one member-enumerating view where this is a
+    /// self-inconsistency rather than an extension: it ALREADY lists closed work
+    /// — `done` and `submitted` rows are ordinary output — and a compacted
+    /// member is the only kind it silently drops, because `compact` deletes the
+    /// `in` edge along with the member it collected (`serializeState`'s
+    /// `gc_set`; an edge naming a collected id would re-materialize it as a
+    /// ghost). So an arc that was fully built and graduated reads identically to
+    /// one nobody ever sliced.
+    ///
+    /// A COUNT plus a pointer, not the rows themselves: `trk tree <arc>` already
+    /// renders the full graduated block in a shape that cannot be skim-read as
+    /// live work, and duplicating it here would be a second copy to keep in
+    /// step. `next` and `docs/TODO.md` deliberately get nothing — `next` is a
+    /// ready frontier that already omits done/blocked/leased members without
+    /// anyone calling that a silent absence, and the projection's own contract
+    /// is "only not-yet-built work" (Scott's call, 2026-09-18).
+    fn compactedMemberFooter(self: *Cli, arc_id: ?Ulid) Error!void {
+        const a = arc_id orelse return;
+        const gone = try self.store.compactedMembers(self.gpa, a);
+        defer self.gpa.free(gone);
+        if (gone.len == 0) return;
+        var sb: [ulid.len]u8 = undefined;
+        try self.print(
+            "\n  +{d} compacted member(s) not shown — graduated out of the live store;\n" ++
+                "  `trk tree {s}` names them.\n",
+            .{ gone.len, try self.shortId(a, &sb) },
+        );
     }
 
     /// list one-liner: `<state-marker> <short-id>  <title>  #tags`.
