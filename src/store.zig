@@ -212,6 +212,13 @@ pub const Config = struct {
     /// is `?[]const []const u8` and not a slice with an empty default: absent
     /// and empty must mean different things. Arena-owned.
     decision_markers: ?[]const []const u8 = null,
+    /// `rule.tag` — the tag `trk rule` removes when it records a ruling (see
+    /// `Cli.cmdRule`). null → `default_decision_tag` ("scott-decision"), which
+    /// keeps a repo with no config behaving exactly as it does today. Overridable
+    /// for the same reason `decision_markers` is: `trk` itself has no opinion on
+    /// what a repo calls its "needs a human call" tag, only that `rule` needs to
+    /// know the one string to look for. Arena-owned.
+    rule_tag: ?[]const u8 = null,
     /// `compact.backup_retain` — how many pre-compact backup runs
     /// `.tracker/backup/` keeps before evicting the oldest (see
     /// `Store.compact`, `evictOldBackups`). Defaults to
@@ -223,6 +230,13 @@ pub const Config = struct {
 /// Default `compact.backup_retain` (see `Config.backup_retain`) for a repo
 /// with no config file or no `compact` section.
 pub const default_backup_retain: usize = 10;
+
+/// Default `rule.tag` (see `Config.rule_tag`) for a repo with no config file
+/// or no `rule` section. Shares its literal value with
+/// `default_decision_markers[0]` by convention (both name the same tag), but
+/// the two knobs are independent — a repo may reconfigure one without the
+/// other.
+pub const default_decision_tag: []const u8 = "scott-decision";
 
 /// Markers `trk archive` looks for when no `archive.decision_markers` is
 /// configured. Matched case-insensitively as substrings of a body line. These
@@ -1116,6 +1130,7 @@ pub const Store = struct {
         self.config.archive_routes = self.readArchiveRoutes(root);
         self.config.add_arcless_error = self.readAddArclessError(root);
         self.config.decision_markers = self.readDecisionMarkers(root);
+        self.config.rule_tag = self.readRuleTag(root);
         self.config.backup_retain = self.readBackupRetain(root);
     }
 
@@ -1216,6 +1231,26 @@ pub const Store = struct {
             else => return false,
         };
         return std.mem.eql(u8, s, "error");
+    }
+
+    /// Pull `rule.tag` (a string) from the config root, arena-dup'd. Returns
+    /// null — meaning "use `default_decision_tag`" — when the `rule` section,
+    /// the `tag` key, or its string type is absent. Mirrors `readDecisionMarkers`
+    /// (absent -> default) rather than `readNestedOut` (absent -> stdout): there
+    /// is no "unset" behavior for `rule` to fall back to other than the default
+    /// tag, so null and "not configured" mean the same thing here.
+    fn readRuleTag(self: *Store, root: std.json.ObjectMap) ?[]const u8 {
+        const sv = root.get("rule") orelse return null;
+        const so = switch (sv) {
+            .object => |o| o,
+            else => return null,
+        };
+        const tv = so.get("tag") orelse return null;
+        const s = switch (tv) {
+            .string => |str| str,
+            else => return null,
+        };
+        return self.a().dupe(u8, s) catch null;
     }
 
     /// Pull `<section>.out` (a string) from the config root, arena-dup'd. Returns

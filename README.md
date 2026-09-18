@@ -78,7 +78,7 @@ discovery).
 
 ## Commands
 
-`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · show · next · list · render · tree · log · stale · doc · compact · archive · tombstones · init · mcp-serve`
+`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · rule · show · next · list · render · tree · log · stale · doc · compact · archive · tombstones · init · mcp-serve`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.
@@ -127,6 +127,12 @@ A task carrying a routed tag graduates to that tag's path instead of `archive.ou
 of the configured tags falls back to `archive.out` as before. An explicit `--out` overrides every route
 (one file, full stop). A task matching more than one configured route is a hard error naming the task and
 both routes — see [`docs/design.md`](docs/design.md).
+
+`rule.tag` names the tag `trk rule` looks for and removes (default `"scott-decision"`):
+
+```json
+{ "rule": { "tag": "needs-decision" } }
+```
 
 ## Design
 

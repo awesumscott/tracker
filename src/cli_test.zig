@@ -2427,7 +2427,7 @@ test "every verb supports --help/-h and add --help mints no task" {
     const verbs = [_][]const u8{
         "init",  "add",  "dep",   "undep",   "in",         "unin",      "arc",     "migrate-arcs", "migrate-shorts",
         "state", "next", "list",  "render",  "tree",       "compact",   "archive", "doc",          "show",
-        "edit",  "log",  "stale", "release", "tombstones", "mcp-serve",
+        "edit",  "rule", "log",   "stale",   "release",    "tombstones", "mcp-serve",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -3387,6 +3387,143 @@ test "edit --rm-doc: removes a doc-ref, clears every section ref, and says so wh
     const left = f.store.get(t).?.docrefs.items;
     try testing.expectEqual(@as(usize, 1), left.len);
     try testing.expectEqualStrings("design", left[0].doc_id);
+}
+
+test "rule: SABOTAGE PAIR -- untags+appends a #scott-decision task; refuses (untouched) on one without the tag" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // POSITIVE half: a genuinely pending fork -- rule settles it.
+    const pending = mintId();
+    try f.store.append(.{ .add = .{ .id = pending, .title = "fork", .body = "(a) or (b)?" } });
+    try f.store.append(.{ .tag = .{ .id = pending, .tag = "scott-decision" } });
+    try f.store.append(.{ .tag = .{ .id = pending, .tag = "net" } });
+
+    try f.run(&.{ "rule", &pending.text, "RULED: (a), see design.md" });
+    const p = f.store.get(pending).?;
+    try testing.expectEqualStrings("(a) or (b)?\n\nRULED: (a), see design.md", p.body);
+    for (p.tags.items) |tg| try testing.expect(!std.mem.eql(u8, tg, "scott-decision"));
+    // Untagging is scoped to THIS task -- an unrelated tag survives untouched.
+    var kept_net = false;
+    for (p.tags.items) |tg| {
+        if (std.mem.eql(u8, tg, "net")) kept_net = true;
+    }
+    try testing.expect(kept_net);
+
+    // PAIRED NEGATIVE half: a task genuinely NOT tagged #scott-decision (the
+    // shape of 01M12CKRK -- a real open fork the guard must never silently
+    // close) is refused outright, body and tags untouched.
+    const untagged = mintId();
+    try f.store.append(.{ .add = .{ .id = untagged, .title = "unrelated", .body = "security note" } });
+    try f.store.append(.{ .tag = .{ .id = untagged, .tag = "security" } });
+
+    const e = f.runExpectErr(&.{ "rule", &untagged.text, "RULED: nope" });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    const u = f.store.get(untagged).?;
+    try testing.expectEqualStrings("security note", u.body);
+    try testing.expectEqual(@as(usize, 1), u.tags.items.len);
+    try testing.expectEqualStrings("security", u.tags.items[0]);
+
+    // A SECOND #scott-decision task is untouched by ruling the first --
+    // the removal is per-task, never global.
+    const other = mintId();
+    try f.store.append(.{ .add = .{ .id = other, .title = "other fork" } });
+    try f.store.append(.{ .tag = .{ .id = other, .tag = "scott-decision" } });
+    var still_tagged = false;
+    for (f.store.get(other).?.tags.items) |tg| {
+        if (std.mem.eql(u8, tg, "scott-decision")) still_tagged = true;
+    }
+    try testing.expect(still_tagged);
+}
+
+test "rule: too few or too many positional args is a usage error, task untouched" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t", .body = "orig" } });
+    try f.store.append(.{ .tag = .{ .id = t, .tag = "scott-decision" } });
+
+    try testing.expectEqual(@as(anyerror, error.MissingArgument), f.runExpectErr(&.{"rule"}));
+    try testing.expectEqual(@as(anyerror, error.MissingArgument), f.runExpectErr(&.{ "rule", &t.text }));
+    try testing.expectEqual(
+        @as(anyerror, error.UsageError),
+        f.runExpectErr(&.{ "rule", &t.text, "RULED: a", "extra" }),
+    );
+    try testing.expectEqualStrings("orig", f.store.get(t).?.body);
+    try testing.expectEqual(@as(usize, 1), f.store.get(t).?.tags.items.len);
+}
+
+test "rule: `-` reads the ruling from stdin, same as --append-body" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t" } });
+    try f.store.append(.{ .tag = .{ .id = t, .tag = "scott-decision" } });
+
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "ruling.txt", .data = "RULED: piped\n" });
+    const stdin_file = try f.tmp.dir.openFile(io, "ruling.txt", .{});
+    defer stdin_file.close(io);
+    f.c.stdin = stdin_file;
+
+    try f.run(&.{ "rule", &t.text, "-" });
+    try testing.expectEqualStrings("RULED: piped", f.store.get(t).?.body);
+    try testing.expectEqual(@as(usize, 0), f.store.get(t).?.tags.items.len);
+}
+
+test "rule.tag config: overrides the tag rule looks for and removes" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    try sub.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{ \"rule\": { \"tag\": \"needs-scott\" } }",
+        .flags = .{},
+    });
+    f.store.loadConfig();
+    try testing.expectEqualStrings("needs-scott", f.store.config.rule_tag.?);
+
+    const t = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "t", .body = "orig" } });
+    // The DEFAULT tag no longer satisfies the configured one.
+    try f.store.append(.{ .tag = .{ .id = t, .tag = "scott-decision" } });
+    const e = f.runExpectErr(&.{ "rule", &t.text, "RULED: x" });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expectEqualStrings("orig", f.store.get(t).?.body);
+
+    try f.store.append(.{ .tag = .{ .id = t, .tag = "needs-scott" } });
+    try f.run(&.{ "rule", &t.text, "RULED: x" });
+    try testing.expectEqualStrings("orig\n\nRULED: x", f.store.get(t).?.body);
+    for (f.store.get(t).?.tags.items) |tg| try testing.expect(!std.mem.eql(u8, tg, "needs-scott"));
+}
+
+test "loadConfig parses rule.tag; absent section falls back to the default" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+
+    try sub.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{ \"rule\": { \"tag\": \"needs-scott\" } }",
+        .flags = .{},
+    });
+    f.store.loadConfig();
+    try testing.expect(!f.store.config_malformed);
+    try testing.expectEqualStrings("needs-scott", f.store.config.rule_tag.?);
+
+    try sub.writeFile(io, .{ .sub_path = "config.json", .data = "{}", .flags = .{} });
+    f.store.loadConfig();
+    try testing.expectEqual(@as(?[]const u8, null), f.store.config.rule_tag);
 }
 
 test "undocref survives a reopen and a compact (it is a real event, not a display filter)" {
