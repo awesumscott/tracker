@@ -171,6 +171,11 @@ pub const tombstones_name = "tombstones.jsonl";
 /// `evictOldBackups`).
 pub const backup_subdir = "backup";
 
+/// One `archive.routes` entry (see `Config.archive_routes`): a task carrying
+/// `tag` routes its changelog bullet to `out` instead of `archive_out`.
+/// Arena-owned strings.
+pub const ArchiveRoute = struct { tag: []const u8, out: []const u8 };
+
 /// Persisted per-repo config (`.tracker/config.json`). Purely optional: a repo
 /// with no config file behaves exactly as before (every field null → callers
 /// fall back to their prior default, which is stdout for render/archive). The
@@ -179,8 +184,22 @@ pub const backup_subdir = "backup";
 pub const Config = struct {
     /// `render.out` — where `trk render` writes with no `--out`. null → stdout.
     render_out: ?[]const u8 = null,
-    /// `archive.out` — where `trk archive` writes its draft with no `--out`. null → stdout.
+    /// `archive.out` — where `trk archive` writes its draft with no `--out`,
+    /// and where a task lands that matches none of `archive_routes` below.
+    /// null → stdout.
     archive_out: ?[]const u8 = null,
+    /// `archive.routes` — per-task changelog destinations (01M2F8GBQ). A repo
+    /// can own more than one changelog with a different content policy each —
+    /// e.g. Enix's `docs/CHANGELOG.md` for QEMU-gated adoption work next to
+    /// `annex/prism/CHANGELOG.md` for prism-library work gated by host tests
+    /// + a cross-build, not QEMU. `trk` has no opinion on what the split IS;
+    /// it only guarantees that a task carrying a configured route's tag
+    /// graduates to THAT file, in the SAME `archive` run as everything else,
+    /// rather than silently landing in `archive_out` because that was the
+    /// only destination the tool knew about. Empty when absent — the default
+    /// that keeps a single-changelog repo's behavior byte-for-byte unchanged.
+    /// See `Cli.resolveDestination`.
+    archive_routes: []const ArchiveRoute = &.{},
     /// `add.arcless` — policy when `trk add` mints a task with neither `--in`
     /// nor `--arc`. `false` (default, `"warn"` or absent) prints a warning to
     /// stderr and proceeds; `true` (`"error"`) refuses the add outright. Warn
@@ -1094,6 +1113,7 @@ pub const Store = struct {
         };
         self.config.render_out = self.readNestedOut(root, "render");
         self.config.archive_out = self.readNestedOut(root, "archive");
+        self.config.archive_routes = self.readArchiveRoutes(root);
         self.config.add_arcless_error = self.readAddArclessError(root);
         self.config.decision_markers = self.readDecisionMarkers(root);
         self.config.backup_retain = self.readBackupRetain(root);
@@ -1146,6 +1166,38 @@ pub const Store = struct {
             out.append(self.a(), dup) catch return null;
         }
         return out.toOwnedSlice(self.a()) catch null;
+    }
+
+    /// Pull `archive.routes` (a JSON object `{ "<tag>": "<path>", ... }`) from
+    /// the config root, arena-dup'd. Absent section/key, or a non-object
+    /// value, yields an empty slice — the "no extra destinations configured"
+    /// default that keeps a single-changelog repo's behavior unchanged. A
+    /// non-string value for a given tag is skipped rather than failing the
+    /// whole load, matching every other reader here (a broken config entry
+    /// never blocks a command; it just doesn't route that one tag).
+    fn readArchiveRoutes(self: *Store, root: std.json.ObjectMap) []const ArchiveRoute {
+        const sv = root.get("archive") orelse return &.{};
+        const so = switch (sv) {
+            .object => |o| o,
+            else => return &.{},
+        };
+        const rv = so.get("routes") orelse return &.{};
+        const ro = switch (rv) {
+            .object => |o| o,
+            else => return &.{},
+        };
+        var out: std.ArrayList(ArchiveRoute) = .empty;
+        var it = ro.iterator();
+        while (it.next()) |entry| {
+            const path = switch (entry.value_ptr.*) {
+                .string => |s| s,
+                else => continue,
+            };
+            const tag_dup = self.a().dupe(u8, entry.key_ptr.*) catch return &.{};
+            const path_dup = self.a().dupe(u8, path) catch return &.{};
+            out.append(self.a(), .{ .tag = tag_dup, .out = path_dup }) catch return &.{};
+        }
+        return out.toOwnedSlice(self.a()) catch &.{};
     }
 
     /// Pull `add.arcless` (a string, `"warn"` or `"error"`) from the config
