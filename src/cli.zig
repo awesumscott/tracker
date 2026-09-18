@@ -719,7 +719,9 @@ pub const Cli = struct {
         \\  that was never sliced. Any member found in the tombstone index is listed
         \\  under a `compacted members (N)` heading (root "compacted_members" in --json,
         \\  always present, possibly empty). An arc with no graduated members still
-        \\  renders with no such block.
+        \\  renders with no such block — except in a store with NO tombstone index at
+        \\  all, where the absence is unreadable and a one-line note says to run
+        \\  `trk tombstones --rebuild` instead.
         \\  A COMPACTED root gets `show`'s answer, not "no task matches": the record
         \\  plus its graduated members, exit 2 (live 0 / compacted 2 / absent 1).
         },
@@ -890,9 +892,18 @@ pub const Cli = struct {
         \\  dangling — run ONCE and persisted, instead of per query: measured on a
         \\  10,574-commit repo it is ~31s and ~162MB of diff, which is fine for a
         \\  one-shot migration and is exactly why `show` cannot do it live.
+        \\  It also recovers ARC MEMBERSHIPS from the `in`/`unin` events in the same
+        \\  history (a member iff some `in` survives with no `unin` for the pair) —
+        \\  without them `trk tree <arc>` prints no compacted-members block for
+        \\  anything compacted before the index existed, which is the same silence
+        \\  that block exists to end.
         \\  Idempotent (an id already entombed is skipped); it never touches the
         \\  log, the snapshot, or any live task. Recovered rows are marked
-        \\  src=git-history and carry no collection time.
+        \\  src=git-history and carry no collection time. The ONE exception to
+        \\  "already entombed is skipped": a row that strictly IMPROVES an existing
+        \\  recovered record — memberships where it had none — is re-appended and
+        \\  supersedes it, so a fix to the reconstruction reaches a store that
+        \\  already ran the old one. A src=compact record is never overwritten.
         \\  --verify: the STANDING CHECK — same git-history walk as --rebuild, but
         \\  asserts (never repairs) that every id it finds is either live or already
         \\  entombed. Exits nonzero and lists the gap if not — the check
@@ -3949,7 +3960,21 @@ pub const Cli = struct {
         const gpa = self.gpa;
         const members = try self.store.compactedMembers(gpa, arc);
         defer gpa.free(members);
-        if (members.len == 0) return;
+        if (members.len == 0) {
+            // One state, and only one, where an empty block still cannot be
+            // read (01M2V2TYC): a store with NO tombstone index at all. Then
+            // "no compacted members" and "nothing has ever been recorded here"
+            // are the same silence — which is the exact ambiguity this block
+            // exists to end. Said once, only for an arc (a plain task's tree
+            // has no membership question), and never when the index has
+            // anything in it: after the rebuild learned to recover `in` edges,
+            // a populated index with no hit for this arc is a real answer.
+            if (self.store.tombstones.items.len == 0 and self.store.isArc(arc)) {
+                try buf.print(gpa, "\n  (no tombstone index in this store — if it has ever run `trk compact`,\n" ++
+                    "   run `trk tombstones --rebuild`: graduated members cannot be reported without it.)\n", .{});
+            }
+            return;
+        }
 
         try buf.print(gpa, "\ncompacted members ({d}) — built, closed, and GC'd out of the live store:\n", .{members.len});
         for (members) |tb| {
@@ -5097,6 +5122,10 @@ pub const Cli = struct {
         title_ts: i64 = -1,
         reason: []const u8 = "unknown",
         reason_ts: i64 = -1,
+        /// The arcs this id was a direct member of, reconstructed from the
+        /// `in`/`unin` events in the same history (01M2V2TYC). Allocated out of
+        /// the caller's `ra` arena, like `title`/`short`.
+        arcs: std.ArrayListUnmanaged(Ulid) = .empty,
     };
 
     /// Replay `.tracker/log.jsonl`'s FULL git history (`git log --all -p`) —
@@ -5167,6 +5196,33 @@ pub const Cli = struct {
         var recs = std.AutoHashMapUnmanaged([ulid.len]u8, RebuildRec){};
         errdefer recs.deinit(self.gpa);
 
+        // Membership reconstruction (01M2V2TYC). `compact` records a task's
+        // arcs at the moment it collects it, when the edges are still in the
+        // store — which is why the feature works going FORWARD, and why every
+        // record this scan back-filled before now carried `"arcs":[]` by
+        // construction (measured: 2521 of 2521 on the Enix store). The `in`
+        // edges are right here in the same history the scan already reads end
+        // to end; they just were not being read.
+        //
+        // The rule mirrors the FOLD exactly (`Store.apply`'s `.unin`), and is
+        // NOT the largest-ts last-write-wins used for title/state above: `unin`
+        // records a permanent tombstone for the (task, arc) pair, so a later
+        // `in` for the same pair is blocked regardless of append order. So a
+        // member iff some `in` for the pair exists and no `unin` for it does,
+        // anywhere in history. Two flat pair sets say that without needing the
+        // history in order — just as well, since `git log --all -p` is not in
+        // any order the fold would recognize.
+        //
+        // Direct `in` edges only, matching what `compact` writes — not
+        // reachability-derived membership, which `dep` can create as a side
+        // effect. A tombstone answers "what was this", and `in` is the part
+        // that was DECLARED about it.
+        const Pair = [2 * ulid.len]u8;
+        var in_pairs = std.AutoHashMapUnmanaged(Pair, void){};
+        defer in_pairs.deinit(self.gpa);
+        var unin_pairs = std.AutoHashMapUnmanaged(Pair, void){};
+        defer unin_pairs.deinit(self.gpa);
+
         var lines = std.mem.splitScalar(u8, result.stdout, '\n');
         while (lines.next()) |raw| {
             // Only ADDED diff lines are log content; `-` lines are the same
@@ -5216,10 +5272,37 @@ pub const Cli = struct {
                         gop.value_ptr.reason_ts = s.ts;
                     }
                 },
+                .in => |x| try in_pairs.put(self.gpa, pairKey(x.task, x.arc), {}),
+                .unin => |x| try unin_pairs.put(self.gpa, pairKey(x.task, x.arc), {}),
                 else => {},
             }
         }
+
+        // Every surviving `in` becomes an arc on its task's record.
+        var pit = in_pairs.keyIterator();
+        while (pit.next()) |pk| {
+            if (unin_pairs.contains(pk.*)) continue;
+            const task: [ulid.len]u8 = pk[0..ulid.len].*;
+            const arc: [ulid.len]u8 = pk[ulid.len..][0..ulid.len].*;
+            const gop = try recs.getOrPut(self.gpa, task);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.arcs.append(ra, .{ .text = arc });
+        }
+        // Sorted, because hash-map iteration order would otherwise make the
+        // rebuilt file differ run to run for no reason — and it is committed.
+        var rit = recs.valueIterator();
+        while (rit.next()) |rec| std.sort.pdq(Ulid, rec.arcs.items, {}, Ulid.lessThan);
+
         return recs;
+    }
+
+    /// The (task, arc) key the membership sets above are built on: the two
+    /// 26-char ULID texts concatenated, so an edge is one hashable value.
+    fn pairKey(task: Ulid, arc: Ulid) [2 * ulid.len]u8 {
+        var k: [2 * ulid.len]u8 = undefined;
+        @memcpy(k[0..ulid.len], &task.text);
+        @memcpy(k[ulid.len..], &arc.text);
+        return k;
     }
 
     /// Back-fill the tombstone index from `.tracker/log.jsonl`'s FULL git
@@ -5252,7 +5335,7 @@ pub const Cli = struct {
                 .short = e.value_ptr.short,
                 .title = e.value_ptr.title,
                 .reason = e.value_ptr.reason,
-                .arcs = &.{},
+                .arcs = e.value_ptr.arcs.items,
                 .ts = 0,
                 .src = "git-history",
             });
@@ -5270,8 +5353,9 @@ pub const Cli = struct {
         try self.store.loadTombstones();
         try self.print(
             "trk: tombstones: scanned {d} distinct id(s) in the full history of {s}; " ++
-                "{d} new tombstone(s) recorded, {d} already known or still live.\n",
-            .{ recs.count(), log_path, written, recs.count() - written },
+                "{d} new tombstone(s) recorded, {d} existing record(s) upgraded, " ++
+                "{d} already complete or still live.\n",
+            .{ recs.count(), log_path, written.new, written.upgraded, recs.count() - written.total() },
         );
     }
 

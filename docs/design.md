@@ -694,6 +694,36 @@ The merge model is **owned** here, because it gates how parallel agents may touc
       Its compaction predates the tombstone index outright, so `--rebuild` is its only path back; fixed by
       seeding a `recs` entry from `model.eventTaskIds` for every decoded event, independent of the
       title-recovery switch.
+    - **And it recovered no ARC MEMBERSHIPS at all, so the two fixes composed only going forward**
+      (2026-09-18, task `01M2V2TYC`). `compact` records a task's arcs at the moment it collects it, when
+      the edges are still in the store — which is why `trk tree`'s compacted-members block (`01M29P5T7`)
+      works for anything compacted *after* the index existed. `--rebuild` reconstructed title and
+      end-of-life state and nothing else, so every back-filled record carried `"arcs":[]` **by
+      construction**: measured on the Enix store immediately after the one-time rebuild, 2521 of 2521
+      records, and `trk tree 01M0JN18R` — the very arc whose misreading motivated `01M29P5T7` — printed no
+      block at all. A reader following `01M29P5T7`'s own install note ("run `trk tombstones --rebuild` and
+      the block will fill") would conclude the install failed, or that the arc genuinely had no compacted
+      members: the exact wrong inference that whole line of work exists to prevent, one layer up.
+      - *The fix reads the `in`/`unin` events already in the scanned history.* The rule mirrors the fold
+        (`Store.apply`'s `.unin`) and is **not** the largest-`ts` last-write-wins used for title/state:
+        `unin` writes a permanent tombstone for the `(task, arc)` pair, so a later `in` is blocked
+        regardless of append order. A member iff some `in` for the pair exists and no `unin` for it does,
+        anywhere in history — two flat pair sets, needing no ordering, which is just as well since
+        `git log --all -p` has none the fold would recognize. DIRECT `in` edges only, matching what
+        `compact` writes; reachability-derived membership (which `dep` can create as a side effect) is out
+        of scope for a tombstone, which answers "what was this" and `in` is the part that was *declared*.
+      - *`--rebuild` gained one exception to "an already-entombed id is skipped".* It is idempotent by id,
+        so without this the 2521 membership-less records would stay membership-less forever and the fix
+        would only ever reach stores that had never been rebuilt. A row that STRICTLY IMPROVES an existing
+        record is re-appended and supersedes it (`tombstones.jsonl` is last-line-wins per id, so nothing is
+        rewritten in place). Strictly two cases: a `git-history` record replaced by a `compact` one, and a
+        `git-history` record that gains memberships it had none of. A `compact`-sourced record is never
+        overwritten by a reconstruction, and nothing is overwritten merely for being newer — so a rebuild
+        with nothing to add stays a no-op, and the report distinguishes "N new" from "N upgraded".
+      - *`trk tree` now says when an empty block is unreadable.* In a store with NO tombstone index at all,
+        "this arc had no graduated members" and "nothing has ever been recorded here" are the same silence.
+        One line, printed only in that state and only for an arc, points at `--rebuild`. Once the index has
+        anything in it, an empty block is a real answer and the line is gone.
   - **`trk tombstones --verify` is the STANDING CHECK that catches a regression in the above** (2026-09-18,
     task `01M2N8WMD`). Before it existed, the only evidence `--rebuild` did its job was `--rebuild`'s own
     printed count ("N new tombstone(s) recorded") — coverage as reported by the mechanism being checked,

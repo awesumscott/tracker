@@ -1061,12 +1061,32 @@ pub const Store = struct {
         try buf.print(self.gpa, ",\"ts\":{d}}}\n", .{t.ts});
     }
 
-    /// Append `rows` to `.tracker/tombstones.jsonl`, skipping any id already in
-    /// the index. Returns how many lines were written. The append is a
-    /// read-modify-atomicWrite (same shape as `quarantineGhosts`) so a crash
-    /// cannot leave a half-line behind.
-    pub fn appendTombstones(self: *Store, sub: Io.Dir, rows: []const Tombstone) !usize {
-        if (rows.len == 0) return 0;
+    /// Append `rows` to `.tracker/tombstones.jsonl`. Returns how many lines were
+    /// written. The append is a read-modify-atomicWrite (same shape as
+    /// `quarantineGhosts`) so a crash cannot leave a half-line behind.
+    ///
+    /// An id already in the index is skipped — UNLESS the new row strictly
+    /// improves the record (`supersedes`). That exception is what lets a fix to
+    /// the reconstruction reach a store that already ran the old one
+    /// (01M2V2TYC): `--rebuild` is idempotent by id, so without it the 2521
+    /// membership-less records this file's fix exists to repair would stay
+    /// membership-less forever, and the fix would only ever help stores that
+    /// had never been rebuilt. `loadTombstones` is last-line-wins per id, so an
+    /// appended better record simply supersedes the earlier one on the next
+    /// fold; nothing is rewritten in place.
+    pub const TombstoneWrite = struct {
+        /// Ids the index had never heard of.
+        new: usize = 0,
+        /// Ids already on record whose row this call improved (`supersedes`).
+        upgraded: usize = 0,
+
+        pub fn total(w: TombstoneWrite) usize {
+            return w.new + w.upgraded;
+        }
+    };
+
+    pub fn appendTombstones(self: *Store, sub: Io.Dir, rows: []const Tombstone) !TombstoneWrite {
+        if (rows.len == 0) return .{};
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.gpa);
@@ -1079,15 +1099,39 @@ pub const Store = struct {
         if (out.items.len != 0 and out.items[out.items.len - 1] != '\n')
             try out.append(self.gpa, '\n');
 
-        var written: usize = 0;
+        var w: TombstoneWrite = .{};
         for (rows) |t| {
-            if (self.tombstone_index.contains(key(t.id))) continue;
+            if (self.tombstone_index.get(key(t.id))) |idx| {
+                if (!supersedes(t, self.tombstones.items[idx])) continue;
+                w.upgraded += 1;
+            } else {
+                w.new += 1;
+            }
             try self.emitTombstone(&out, t);
-            written += 1;
         }
-        if (written == 0) return 0;
+        if (w.total() == 0) return w;
         try self.atomicWrite(sub, tombstones_name, out.items);
-        return written;
+        return w;
+    }
+
+    /// Is `new` a strictly better record for this id than `old`? Only two ways,
+    /// both of them "a reconstruction is being replaced by something that knows
+    /// more":
+    ///   * `old` came from `git-history` and `new` from `compact` — the latter
+    ///     was written at the moment of collection, from the live store, and is
+    ///     authoritative about state, arcs and time;
+    ///   * both are reconstructions, and `new` recovered arc memberships that
+    ///     `old` has none of (01M2V2TYC — the old scan recovered title and
+    ///     end-state but never read the `in` edges).
+    /// A `compact`-sourced record is NEVER overwritten by a reconstruction, and
+    /// nothing is overwritten merely for being newer: an equal-or-worse row is
+    /// dropped, so re-running `--rebuild` stays a no-op once it has nothing to
+    /// add.
+    fn supersedes(new: Tombstone, old: Tombstone) bool {
+        const old_recovered = std.mem.eql(u8, old.src, "git-history");
+        if (!old_recovered) return false;
+        if (std.mem.eql(u8, new.src, "compact")) return true;
+        return old.arcs.len == 0 and new.arcs.len > 0;
     }
 
     /// After the WHOLE fold: every node that never received an `add` is a ghost
@@ -1964,7 +2008,7 @@ pub const Store = struct {
                     .src = "compact",
                 });
             }
-            break :blk try self.appendTombstones(sub, rows.items);
+            break :blk (try self.appendTombstones(sub, rows.items)).total();
         };
 
         var buf: std.ArrayList(u8) = .empty;

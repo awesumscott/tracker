@@ -5076,3 +5076,137 @@ test "next/list --json carry the full body, always, escaped (01M1FMN25)" {
         try testing.expect(saw_a and saw_b);
     }
 }
+
+// ----- tombstones --rebuild recovers arc memberships (01M2V2TYC) -----
+
+test "tombstones --rebuild recovers ARC MEMBERSHIPS, so tree's compacted-members block works for pre-index compactions too (01M2V2TYC)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const member = mintId();
+    const dropped_member = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "the arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = member, .title = "graduated slice", .short = member.text[0..9] } });
+    try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 1 } });
+    try f.store.append(.{ .setState = .{ .id = member, .state = .archived } });
+    // A member whose membership was RETRACTED before it graduated. `unin` is a
+    // permanent tombstone in the fold regardless of append order, so the
+    // reconstruction must not resurrect it just because an `in` is in history.
+    try f.store.append(.{ .add = .{ .id = dropped_member, .title = "never really in it" } });
+    try f.store.append(.{ .in = .{ .task = dropped_member, .arc = arc, .seq = 2 } });
+    try f.store.append(.{ .unin = .{ .task = dropped_member, .arc = arc } });
+    try f.store.append(.{ .setState = .{ .id = dropped_member, .state = .archived } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "tracker log before the compact" });
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // The pre-index era, asserted rather than assumed: the compact happened,
+    // no tombstone was ever written, and `tree` says nothing about the member.
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstones.jsonl");
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 0), f.store.tombstones.items.len);
+    try f.run(&.{ "tree", &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members") == null);
+    // And in THAT state — no index at all — the emptiness says so rather than
+    // passing itself off as "this arc had no graduated members".
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "no tombstone index in this store") != null);
+
+    // The recovery. This is what used to come back with "arcs":[] for every row.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try f.run(&.{ "tree", &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members (1)") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "graduated slice") != null);
+    // The `unin`'d one is NOT a member — same rule the fold applies.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "never really in it") == null);
+    // It is still entombed, though: it existed, and `show` must still answer.
+    try testing.expectEqual(
+        @as(anyerror, error.CompactedId),
+        f.runExpectErr(&.{ "show", &dropped_member.text }),
+    );
+
+    // The hint is gone now that the index has something in it: a populated
+    // index with no hit for THIS arc is a real answer, not a silence. Asserted
+    // on a second, never-compacted arc in the same store, which is the only
+    // shape that distinguishes the two.
+    const quiet_arc = mintId();
+    try f.store.append(.{ .add = .{ .id = quiet_arc, .title = "never compacted" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = quiet_arc, .declared = true } });
+    try f.run(&.{ "tree", &quiet_arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "no tombstone index") == null);
+}
+
+test "tombstones --rebuild UPGRADES a membership-less record left by the older reconstruction (01M2V2TYC)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const member = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "the arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = member, .title = "graduated slice" } });
+    try f.store.append(.{ .in = .{ .task = member, .arc = arc, .seq = 1 } });
+    try f.store.append(.{ .setState = .{ .id = member, .state = .archived } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "tracker log before the compact" });
+
+    try f.run(&.{"compact"});
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstones.jsonl");
+    try f.reopen();
+    try f.run(&.{ "tombstones", "--rebuild" });
+
+    // Reproduce EXACTLY what the older `--rebuild` wrote, by taking what the
+    // new one wrote and blanking the memberships. Doing it this way rather than
+    // hand-rolling a line keeps the fixture honest if the record format moves.
+    {
+        const bytes = try f.tmp.dir.readFileAlloc(io, ".tracker/tombstones.jsonl", alloc, .unlimited);
+        defer alloc.free(bytes);
+        var stale: std.ArrayList(u8) = .empty;
+        defer stale.deinit(alloc);
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const open_at = std.mem.indexOf(u8, line, "\"arcs\":[").?;
+            const close_at = std.mem.indexOfScalarPos(u8, line, open_at, ']').?;
+            try stale.appendSlice(alloc, line[0 .. open_at + "\"arcs\":[".len]);
+            try stale.appendSlice(alloc, line[close_at..]);
+            try stale.append(alloc, '\n');
+        }
+        try f.tmp.dir.writeFile(io, .{ .sub_path = ".tracker/tombstones.jsonl", .data = stale.items, .flags = .{} });
+    }
+    try f.reopen();
+
+    // RED baseline: the record is there, the membership is not, and `tree` is
+    // silent — the measured Enix state after the one-time rebuild (2521 records,
+    // every one with "arcs":[]).
+    try testing.expect(f.store.tombstones.items.len != 0);
+    try f.run(&.{ "tree", &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members") == null);
+
+    // Re-running the rebuild repairs it in place of skipping it. Without the
+    // upgrade rule this reports "0 new, 0 upgraded" and the block stays empty
+    // forever — the fix would only ever reach stores that had never rebuilt.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "0 new tombstone(s) recorded") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 existing record(s) upgraded") != null);
+    try f.run(&.{ "tree", &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted members (1)") != null);
+
+    // And now it settles: a third run has nothing left to improve.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "0 existing record(s) upgraded") != null);
+}
