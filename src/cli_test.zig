@@ -2172,6 +2172,120 @@ test "trk archive APPENDS to config archive.out under a dated heading; dry-run n
     }
 }
 
+// --------------------------------------------- 01M2F8GBQ: per-task changelog destinations
+
+test "archive: archive.routes sends a matching-tagged task to its own file; an unmatched task still lands in archive.out" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Shaped after CLAUDE.md's ruled split (Enix): prism-LIBRARY work
+    // (gated by host tests + a cross-build) graduates to its own changelog,
+    // while ordinary Enix-side adoption work graduates to the main one --
+    // in the SAME archive run, with no manual --tag split.
+    const lib = mintId();
+    const adoption = mintId();
+    try f.store.append(.{ .add = .{ .id = lib, .title = "prism library fix", .tags = &.{"prism-lib"} } });
+    try f.store.append(.{ .add = .{ .id = adoption, .title = "wire prism into the WM demo" } });
+    try f.store.append(.{ .setState = .{ .id = lib, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = adoption, .state = .done } });
+
+    f.store.config.archive_out = "docs/CHANGELOG.md";
+    f.store.config.archive_routes = &.{
+        .{ .tag = "prism-lib", .out = "annex/prism/CHANGELOG.md" },
+    };
+
+    try f.run(&.{"archive"});
+    try testing.expectEqual(tracker.State.archived, f.store.get(lib).?.state);
+    try testing.expectEqual(tracker.State.archived, f.store.get(adoption).?.state);
+
+    {
+        const d = try f.tmp.dir.readFileAlloc(io, "annex/prism/CHANGELOG.md", alloc, .unlimited);
+        defer alloc.free(d);
+        try testing.expect(std.mem.indexOf(u8, d, "- prism library fix") != null);
+        try testing.expect(std.mem.indexOf(u8, d, "wire prism") == null);
+    }
+    {
+        const d = try f.tmp.dir.readFileAlloc(io, "docs/CHANGELOG.md", alloc, .unlimited);
+        defer alloc.free(d);
+        try testing.expect(std.mem.indexOf(u8, d, "- wire prism into the WM demo") != null);
+        try testing.expect(std.mem.indexOf(u8, d, "prism library fix") == null);
+    }
+}
+
+test "archive: an explicit --out overrides every configured route -- everything lands in one file" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const lib = mintId();
+    try f.store.append(.{ .add = .{ .id = lib, .title = "prism library fix", .tags = &.{"prism-lib"} } });
+    try f.store.append(.{ .setState = .{ .id = lib, .state = .done } });
+
+    f.store.config.archive_routes = &.{
+        .{ .tag = "prism-lib", .out = "annex/prism/CHANGELOG.md" },
+    };
+
+    try f.run(&.{ "archive", "--out", "ONE.md" });
+    try f.tmp.dir.access(io, "ONE.md", .{});
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "annex/prism/CHANGELOG.md", .{}));
+}
+
+test "archive: a task matching TWO configured routes is a hard error naming both -- nothing is archived" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const both = mintId();
+    const clean = mintId();
+    try f.store.append(.{ .add = .{ .id = both, .title = "ambiguous task", .tags = &.{ "prism-lib", "cabi-lib" } } });
+    try f.store.append(.{ .add = .{ .id = clean, .title = "clean one" } });
+    try f.store.append(.{ .setState = .{ .id = both, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = clean, .state = .done } });
+
+    f.store.config.archive_routes = &.{
+        .{ .tag = "prism-lib", .out = "annex/prism/CHANGELOG.md" },
+        .{ .tag = "cabi-lib", .out = "annex/cabi/CHANGELOG.md" },
+    };
+
+    const e = f.runExpectErr(&.{"archive"});
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "ambiguous task") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "prism-lib") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "cabi-lib") != null);
+    try testing.expectEqual(tracker.State.done, f.store.get(both).?.state);
+    try testing.expectEqual(tracker.State.done, f.store.get(clean).?.state);
+}
+
+test "archive --dry-run with routes: each destination previews separately labeled; no file is touched" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const lib = mintId();
+    const adoption = mintId();
+    try f.store.append(.{ .add = .{ .id = lib, .title = "prism library fix", .tags = &.{"prism-lib"} } });
+    try f.store.append(.{ .add = .{ .id = adoption, .title = "wire prism into the WM demo" } });
+    try f.store.append(.{ .setState = .{ .id = lib, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = adoption, .state = .done } });
+
+    f.store.config.archive_out = "docs/CHANGELOG.md";
+    f.store.config.archive_routes = &.{
+        .{ .tag = "prism-lib", .out = "annex/prism/CHANGELOG.md" },
+    };
+
+    try f.run(&.{ "archive", "--dry-run" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "annex/prism/CHANGELOG.md") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "docs/CHANGELOG.md") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "- prism library fix") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "- wire prism into the WM demo") != null);
+
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "annex/prism/CHANGELOG.md", .{}));
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "docs/CHANGELOG.md", .{}));
+    try testing.expectEqual(tracker.State.done, f.store.get(lib).?.state);
+    try testing.expectEqual(tracker.State.done, f.store.get(adoption).?.state);
+}
+
 test "loadConfig parses render/archive out; malformed sets config_malformed" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
@@ -2196,6 +2310,32 @@ test "loadConfig parses render/archive out; malformed sets config_malformed" {
     f.store.config_malformed = false;
     f.store.loadConfig();
     try testing.expect(f.store.config_malformed);
+}
+
+test "loadConfig parses archive.routes; a non-string value is skipped, not fatal; absent section is empty" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+
+    try sub.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{ \"archive\": { \"out\": \"C.md\", \"routes\": { \"prism-lib\": \"annex/prism/CHANGELOG.md\", \"bad\": 5 } } }",
+        .flags = .{},
+    });
+    f.store.loadConfig();
+    try testing.expect(!f.store.config_malformed);
+    try testing.expectEqual(@as(usize, 1), f.store.config.archive_routes.len);
+    try testing.expectEqualStrings("prism-lib", f.store.config.archive_routes[0].tag);
+    try testing.expectEqualStrings("annex/prism/CHANGELOG.md", f.store.config.archive_routes[0].out);
+
+    // Absent section -> empty, not an error -- the "no extra destinations
+    // configured" default that keeps a single-changelog repo unchanged.
+    try sub.writeFile(io, .{ .sub_path = "config.json", .data = "{}", .flags = .{} });
+    f.store.loadConfig();
+    try testing.expectEqual(@as(usize, 0), f.store.config.archive_routes.len);
 }
 
 test "loadConfig: add.arcless — absent/warn/typo default to false (warn); exactly \"error\" is true" {
@@ -3460,6 +3600,90 @@ test "archive: --allow-buried-decisions-for <id>:<n>:<digest> exempts only the n
         try testing.expectEqual(tracker.State.archived, f.store.get(meta).?.state);
         try testing.expectEqual(tracker.State.archived, f.store.get(real).?.state);
     }
+}
+
+// --------------------------------------------- 01M29VWW9: citation vs. burial
+
+test "archive: a marker line naming a LIVE task id is a CITATION -- silent, no report, no exemption needed" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The fork lives at `carrier`, which stays open when `closing` archives --
+    // so a marker on `closing`'s own line naming `carrier` cannot bury
+    // anything, and the guard must not even report it (01M29VWW9: measured
+    // 19 of 20 audited hits were exactly this shape, e.g. "follow-ons filed:
+    // 01M296E8F (scott-decision)").
+    const carrier = mintId();
+    try f.store.append(.{ .add = .{ .id = carrier, .title = "the live fork", .tags = &.{"scott-decision"} } });
+
+    const closing = mintId();
+    const body = try std.fmt.allocPrint(alloc, "shipped it\nfollow-ons filed: {s} (scott-decision)\n", .{&carrier.text});
+    defer alloc.free(body);
+    try f.store.append(.{ .add = .{ .id = closing, .title = "shipped it", .body = body } });
+    try f.store.append(.{ .setState = .{ .id = closing, .state = .done } });
+
+    try f.run(&.{"archive"});
+    try testing.expectEqual(@as(usize, 0), f.warn.items.len);
+    try testing.expectEqual(tracker.State.archived, f.store.get(closing).?.state);
+    // The cited task is untouched -- a citation, not a consumption.
+    try testing.expectEqual(tracker.State.open, f.store.get(carrier).?.state);
+}
+
+test "archive: a marker line naming an ARCHIVED task id still REFUSES -- an already-hidden id is not a live carrier" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "already graduated" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+
+    const closing = mintId();
+    const body = try std.fmt.allocPrint(alloc, "shipped it\nfollow-ons filed: {s} (scott-decision)\n", .{&gone.text});
+    defer alloc.free(body);
+    try f.store.append(.{ .add = .{ .id = closing, .title = "shipped it", .body = body } });
+    try f.store.append(.{ .setState = .{ .id = closing, .state = .done } });
+
+    const e = f.runExpectErr(&.{"archive"});
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "scott-decision") != null);
+    try testing.expectEqual(tracker.State.done, f.store.get(closing).?.state);
+}
+
+test "archive: a marker line naming a well-formed but NONEXISTENT task id still refuses" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const closing = mintId();
+    // Well-formed (digit-leading, Crockford, 26 chars) but never minted.
+    try f.store.append(.{ .add = .{
+        .id = closing,
+        .title = "shipped it",
+        .body = "shipped it\nOPEN QUESTION: see 01ZZZZZZZZZZZZZZZZZZZZZZZZ for context\n",
+    } });
+    try f.store.append(.{ .setState = .{ .id = closing, .state = .done } });
+
+    const e = f.runExpectErr(&.{"archive"});
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expectEqual(tracker.State.done, f.store.get(closing).?.state);
+}
+
+test "archive: a marker line naming the CLOSING task's OWN id is not a citation of 'elsewhere' -- still refuses" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const closing = mintId();
+    const body = try std.fmt.allocPrint(alloc, "OPEN QUESTION ({s}): which cadence do we publish on?\n", .{&closing.text});
+    defer alloc.free(body);
+    try f.store.append(.{ .add = .{ .id = closing, .title = "shipped it", .body = body } });
+    try f.store.append(.{ .setState = .{ .id = closing, .state = .done } });
+
+    const e = f.runExpectErr(&.{"archive"});
+    try testing.expectEqual(@as(anyerror, error.UsageError), e);
+    try testing.expectEqual(tracker.State.done, f.store.get(closing).?.state);
 }
 
 // --------------------------------------------- finding 4: the count is an ASSERTION

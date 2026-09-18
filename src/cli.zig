@@ -2365,27 +2365,76 @@ pub const Cli = struct {
             return error.UsageError;
         }
 
-        // Build the changelog-bullet draft.
-        var draft: std.ArrayList(u8) = .empty;
-        defer draft.deinit(self.gpa);
-        for (matched.items) |id| try self.appendArchiveBullet(&draft, id);
+        // Build the changelog-bullet draft, GROUPED BY DESTINATION (01M2F8GBQ):
+        // an explicit --out sends every task to one file, same as always;
+        // otherwise each task's own tags are checked against `archive.routes`,
+        // so a task whose gate/home differs from the rest of the batch (e.g. a
+        // prism-library task next to an ordinary Enix-adoption one in the same
+        // done queue) lands in ITS OWN changelog, in this SAME run — no manual
+        // per-tag split, no ritual to remember. A repo with no `archive.routes`
+        // configured always resolves to exactly one group (`archive_out`, or
+        // stdout), which is byte-for-byte the prior single-destination
+        // behavior. Groups are emitted in first-matched order, which is
+        // deterministic because `matched` already is.
+        const Group = struct {
+            out: ?[]const u8,
+            ids: std.ArrayList(Ulid) = .empty,
+            draft: std.ArrayList(u8) = .empty,
+        };
+        var groups: std.ArrayList(Group) = .empty;
+        defer {
+            for (groups.items) |*g| {
+                g.ids.deinit(self.gpa);
+                g.draft.deinit(self.gpa);
+            }
+            groups.deinit(self.gpa);
+        }
+        for (matched.items) |id| {
+            const t = self.store.get(id).?;
+            const dest = try self.resolveDestination(out_path, t);
+            var idx: ?usize = null;
+            for (groups.items, 0..) |g, gidx| {
+                if (optStrEql(g.out, dest)) {
+                    idx = gidx;
+                    break;
+                }
+            }
+            const gi = idx orelse blk: {
+                try groups.append(self.gpa, .{ .out = dest });
+                break :blk groups.items.len - 1;
+            };
+            try groups.items[gi].ids.append(self.gpa, id);
+            try self.appendArchiveBullet(&groups.items[gi].draft, id);
+        }
 
-        // Emit the draft BEFORE flipping state so the records are out even if
-        // the state writes fail partway. A real run APPENDS to the file target
-        // under a dated run heading (a changelog accumulates — truncating here
-        // once destroyed one); --dry-run previews on stdout and never touches
-        // the file. Precedence: explicit --out > config archive.out > stdout.
-        const effective_out = out_path orelse self.store.config.archive_out;
-        if (effective_out != null and !dry_run) {
-            var chunk: std.ArrayList(u8) = .empty;
-            defer chunk.deinit(self.gpa);
-            var ts_buf: [32]u8 = undefined;
-            const ms = Io.Timestamp.now(self.io, .real).toMilliseconds();
-            try chunk.print(self.gpa, "## {s}\n\n", .{fmtTs(ms, &ts_buf)[0..10]});
-            try chunk.appendSlice(self.gpa, draft.items);
-            try self.appendOutFile(effective_out.?, chunk.items);
-        } else {
-            try self.write(draft.items);
+        // Emit every group's draft BEFORE flipping state so the records are
+        // out even if a state write fails partway. A real run APPENDS each
+        // group to ITS file target under a dated run heading (a changelog
+        // accumulates — truncating here once destroyed one); --dry-run
+        // previews on stdout and never touches any file. When routing split
+        // the batch into more than one destination, each stdout preview group
+        // is labeled with its path so a dry run reads as more than one
+        // undifferentiated list — with exactly one group (the common, no
+        // `archive.routes` case) the preview is unlabeled, unchanged from
+        // before this feature existed.
+        var ts_buf: [32]u8 = undefined;
+        const ms = Io.Timestamp.now(self.io, .real).toMilliseconds();
+        const heading_date = fmtTs(ms, &ts_buf)[0..10];
+        for (groups.items) |g| {
+            if (dry_run) {
+                if (groups.items.len > 1) {
+                    try self.print("-- {s} --\n", .{g.out orelse "(stdout)"});
+                }
+                try self.write(g.draft.items);
+            } else if (g.out) |p| {
+                var chunk: std.ArrayList(u8) = .empty;
+                defer chunk.deinit(self.gpa);
+                try chunk.print(self.gpa, "## {s}\n\n", .{heading_date});
+                try chunk.appendSlice(self.gpa, g.draft.items);
+                try self.appendOutFile(p, chunk.items);
+            } else {
+                try self.write(g.draft.items);
+            }
         }
 
         // Flip to archived (unless previewing). Recoverable until `trk compact`.
@@ -2394,15 +2443,49 @@ pub const Cli = struct {
                 try self.store.append(.{ .setState = .{ .id = id, .state = .archived } });
         }
 
-        // A summary only when the draft went to a file (so a stdout draft stays
-        // a clean paste). dry-run-to-stdout shows just the bullets.
-        if (effective_out) |p| {
+        // A summary per destination that actually received a file append (so
+        // a stdout-only draft stays a clean paste, same as before this
+        // feature existed).
+        for (groups.items) |g| {
+            const p = g.out orelse continue;
             if (dry_run) {
-                try self.print("(dry run) {d} done task(s) would be archived; a real run appends to {s}\n", .{ matched.items.len, p });
+                try self.print("(dry run) {d} done task(s) would be archived; a real run appends to {s}\n", .{ g.ids.items.len, p });
             } else {
-                try self.print("archived {d} task(s); appended -> {s}\n", .{ matched.items.len, p });
+                try self.print("archived {d} task(s); appended -> {s}\n", .{ g.ids.items.len, p });
             }
         }
+    }
+
+    /// Resolve where task `t`'s changelog bullet belongs (01M2F8GBQ). An
+    /// explicit `--out` overrides every configured route — the operator asked
+    /// for one file, full stop, the same precedence `render`'s `--out`
+    /// already uses. Otherwise each `archive.routes` entry names a tag and a
+    /// destination; a task carrying that tag routes there. At most one
+    /// configured route may match a given task: two matching is an authoring
+    /// conflict in `.tracker/config.json` (which tag wins is not a runtime
+    /// pick trk should make silently), so it is a hard error naming the task
+    /// and both routes rather than a silent first-match. A task matching no
+    /// route falls back to `archive_out` (or stdout), exactly as before
+    /// `archive.routes` existed.
+    fn resolveDestination(self: *Cli, out_path: ?[]const u8, t: Task) Error!?[]const u8 {
+        if (out_path) |p| return p;
+        var matched: ?[]const u8 = null;
+        var matched_tag: ?[]const u8 = null;
+        for (self.store.config.archive_routes) |route| {
+            if (!hasTag(t, route.tag)) continue;
+            if (matched) |_| {
+                try self.print(
+                    "trk: '{s}' matches two configured archive routes ('{s}' -> {s} and " ++
+                        "'{s}' -> {s}) -- archive.routes in .tracker/config.json must route each " ++
+                        "task to exactly one destination\n",
+                    .{ t.title, matched_tag.?, matched.?, route.tag, route.out },
+                );
+                return error.UsageError;
+            }
+            matched = route.out;
+            matched_tag = route.tag;
+        }
+        return matched orelse self.store.config.archive_out;
     }
 
     /// What the archive run intends to do about a decision-marker hit. Only the
@@ -2518,6 +2601,12 @@ pub const Cli = struct {
             tracker.store.default_decision_markers;
         if (markers.len == 0) return false; // explicitly disabled via config
 
+        // The full live id set, for `lineCitesLiveTask` -- a citation can name
+        // ANY task, not just one in this run's `ids` (which is the DONE subset
+        // about to archive). Fetched once per archive run, not per line.
+        const all_ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(all_ids);
+
         const Hit = struct { marker: []const u8, line: []const u8 };
 
         var hits: usize = 0;
@@ -2538,6 +2627,14 @@ pub const Cli = struct {
                 if (line.len == 0) continue;
                 for (markers) |m| {
                     if (m.len == 0 or !containsMarker(line, m)) continue;
+                    // 01M29VWW9: a marker glued to a LIVE task id names the
+                    // fork's actual carrier -- "follow-ons filed: 01M296E8F
+                    // (scott-decision)" is a citation, not a burial, because
+                    // archiving THIS task cannot lose a fork that lives at
+                    // that other id. Silent: not a hit, no report, no
+                    // exemption needed. A marker with no id, or one naming an
+                    // archived/nonexistent/self id, falls through unchanged.
+                    if (self.lineCitesLiveTask(line, id, all_ids)) break;
                     try task_hits.append(self.gpa, .{ .marker = m, .line = line });
                     break; // one report per line, whichever marker hit first
                 }
@@ -2763,6 +2860,53 @@ pub const Cli = struct {
             if (!is_digit and !is_letter) return false;
         }
         return true;
+    }
+
+    /// True if `line` names a LIVE task id, other than `self_id` -- the
+    /// discriminator `reportBuriedDecisions` uses to tell a CITATION of a fork
+    /// carried elsewhere from a genuine unresolved one (01M29VWW9, measured
+    /// 2026-09-11: 19 of 20 audited marker hits were exactly this shape --
+    /// "follow-ons filed: 01M296E8F (scott-decision)", "RISK 4 ... file a live
+    /// scott-decision if it's genuinely still open"). Scans `line` for
+    /// Crockford-shaped id tokens (split on non-alphanumerics) using the same
+    /// range/alphabet test `looksIdShaped` uses for archive's own positional
+    /// arg, then resolves each one the way `resolve` does -- case-insensitive
+    /// prefix against `all_ids` -- but SILENTLY: no output, no error. A token
+    /// that does not resolve, or resolves ambiguously (more than one task
+    /// shares the prefix), is not a citation; it just doesn't count, and the
+    /// line falls through to the ordinary fatal-hit path. So does a token that
+    /// resolves to `self_id` (citing your own id is not evidence the fork
+    /// lives elsewhere) or to a task whose state is `.archived` (already
+    /// hidden from every view -- exactly the state a real burial produces, so
+    /// it cannot be trusted as a live carrier).
+    fn lineCitesLiveTask(self: *Cli, line: []const u8, self_id: Ulid, all_ids: []const Ulid) bool {
+        var i: usize = 0;
+        while (i < line.len) {
+            if (!std.ascii.isAlphanumeric(line[i])) {
+                i += 1;
+                continue;
+            }
+            var j = i;
+            while (j < line.len and std.ascii.isAlphanumeric(line[j])) : (j += 1) {}
+            const tok = line[i..j];
+            defer i = j;
+            if (!looksIdShaped(tok)) continue;
+            var match: ?Ulid = null;
+            var n_matches: usize = 0;
+            for (all_ids) |cand| {
+                if (prefixMatches(tok, &cand.text)) {
+                    n_matches += 1;
+                    if (match == null) match = cand;
+                }
+            }
+            if (n_matches != 1) continue;
+            const m = match.?;
+            if (m.eql(self_id)) continue;
+            const ct = self.store.get(m) orelse continue;
+            if (ct.state == .archived) continue;
+            return true;
+        }
+        return false;
     }
 
     /// One changelog-draft bullet for a graduated task: `- <title> #tags
@@ -4847,6 +4991,14 @@ fn fmtTs(ms: i64, buf: []u8) []const u8 {
 fn containsId(haystack: []const Ulid, needle: Ulid) bool {
     for (haystack) |h| if (h.eql(needle)) return true;
     return false;
+}
+
+/// Equality over two optional strings: both null, or both non-null and
+/// byte-equal. Used by `cmdArchive`'s destination grouping — two tasks share
+/// a changelog group iff their resolved destinations compare equal here.
+fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// DEPRECATED: the cosmetic pre-`arcDeclare` arc marker. Not a definition of
