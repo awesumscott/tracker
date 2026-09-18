@@ -331,14 +331,35 @@ pub const Cli = struct {
         try self.write("\"");
     }
 
-    /// One task as a JSON object: id (full), short, title, state, priority,
-    /// [seq when an arc context is given], tags. Relations stay in `trk show`.
+    /// One task as a JSON object: id (full), short, title, body, state,
+    /// priority, [seq when an arc context is given], tags. Relations stay in
+    /// `trk show`.
+    ///
+    /// `body` is emitted UNCONDITIONALLY, empty string included (01M1FMN25).
+    /// It was omitted, and that made the mechanical full-frontier triage a
+    /// fan-out mandates — every ready task, scripted, not the top N — impossible
+    /// to script: the discriminators that decide a task's bucket (HOLD, DEFER,
+    /// RULED, "your call", "NOT resolved") are APPENDED, so they sit at the END
+    /// of a long body while the opening paragraphs still read like ordinary
+    /// buildable work. Tags and titles were scriptable; everything else needed a
+    /// `trk show` per candidate, over 280 tasks. trk already had the body in
+    /// hand at that moment — `next`'s own search matches over title+body+tags,
+    /// so the filter read it and the emitter dropped it.
+    ///
+    /// Unconditional, not behind `--with-body`: a flag's failure mode is
+    /// forgetting to pass it, which is the silent omission this fixes, spelled
+    /// differently. Always present, not omitted-when-empty like `holder`/`seq`,
+    /// so a consumer can index it without a guard. And a plain string rather
+    /// than a decision-marker boolean: that vocabulary is the caller's, not
+    /// trk's — trk stays generic and the grep stays where it belongs.
     fn appendTaskJson(self: *Cli, id: Ulid, arc_id: ?Ulid) !void {
         const t = self.store.get(id).?;
         var sb: [ulid.len]u8 = undefined;
         const sid = try self.shortId(id, &sb);
         try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"title\":", .{ &id.text, sid });
         try self.writeJsonString(t.title);
+        try self.write(",\"body\":");
+        try self.writeJsonString(t.body);
         try self.print(",\"state\":\"{s}\",\"priority\":{d}", .{ t.state.toString(), t.priority });
         if (t.holder) |h| {
             try self.write(",\"holder\":");
@@ -655,7 +676,10 @@ pub const Cli = struct {
         \\  exclusion) drops any task carrying that tag — the autonomous-eligible
         \\  bucket (no blocker tag) is one bare command:
         \\    trk next --not-tag metal --not-tag scott-testing --not-tag scott-decision
-        \\  --json emits a machine-readable array.
+        \\  --json emits a machine-readable array, one object per task, carrying the
+        \\  full BODY as well as id/short/title/state/priority/seq?/tags — the whole
+        \\  frontier is then triageable in one call, markers and all, with no
+        \\  follow-up `trk show` per candidate.
         \\  e.g.  trk next           trk next prism windowed
         },
         .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--state", "--tag", "--not-tag", "--limit", "--json", "--word" }, .text =
@@ -666,7 +690,8 @@ pub const Cli = struct {
         \\  exclusion) drops any task carrying that tag. --no-arc lists every task in
         \\  NO arc (by the unified isArc/membership model, including needs-
         \\  reachability) — the completeness query for "sort everything into arcs";
-        \\  mutually exclusive with --arc. --json for machine-readable output.
+        \\  mutually exclusive with --arc. --json for machine-readable output (same
+        \\  object shape as `next --json`, body included).
         \\  e.g.  trk list --state open net           trk list --no-arc
         \\        trk list --state submitted           (the awaiting-verification queue)
         \\        trk list --state claimed             (tasks currently leased)
@@ -1097,7 +1122,7 @@ pub const Cli = struct {
             \\      substring search over title+body+tags. --not-tag (repeatable, ANDed
             \\      exclusion) drops any task carrying that tag. --no-arc lists every task in
             \\      no arc. --json emits a machine-readable array
-            \\      (id/short/title/state/priority/seq?/tags).
+            \\      (id/short/title/body/state/priority/seq?/tags).
             \\  trk render [--out <path>]    the TODO.md markdown projection (--out > config render.out > stdout)
             \\      Header reports an arc-less drift count every regeneration.
             \\  trk tree <arc-or-task>       the ASCII prereq hierarchy

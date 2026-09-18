@@ -875,6 +875,25 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
 
 ## Settled rulings
 
+- **`next`/`list --json` carry the body, unconditionally** (01M1FMN25, 2026-09-18). The emitter dropped
+  it, and that made the mechanical full-frontier triage a fan-out mandates — *every* ready task, scripted
+  over the whole list, not the top N — impossible to script. The discriminators that decide a task's
+  bucket (`HOLD`, `DEFER`, `RULED`, "your call", "NOT resolved") are APPENDED, so they sit at the END of a
+  long body while the opening paragraphs still read like ordinary buildable work. Tags and titles were
+  scriptable; everything else needed a `trk show` per candidate, over 280 tasks — and that step is exactly
+  where tasks already done, already ruled, or blocked on someone else kept turning up. trk already had the
+  body in hand: `next`'s own search matches over title+body+tags, so the filter read it and the emitter
+  dropped it.
+  - *Unconditional, not behind `--with-body`/`--body-tail`.* A flag's failure mode is forgetting to pass
+    it — the silent omission this fixes, spelled differently. Size is not the concern it would be for the
+    human view: `--json`'s consumer is a machine, and a caller who wants less already has `--limit`,
+    `--state`, `--tag`, `--not-tag` and the term search.
+  - *Always present, never omitted-when-empty* (unlike `holder`/`seq`), so a consumer indexes it without a
+    guard.
+  - *A string, not a decision-marker boolean.* The cheapest-looking option was a per-task flag for "the
+    body matches a marker", and it was rejected: that vocabulary belongs to the caller, not to trk. trk
+    stays generic and the grep stays where it belongs.
+
 - **A parse failure names the argument that FAILED, and guesses the spelling** (01M1FMMFZ, 2026-09-18).
   `trk add --tags=a,b "<title>"` printed `unknown flag '<the title>'` — blaming the one argument in the
   line that was correct, and sending the reader to hunt a quoting bug in a long heredoc-written title.

@@ -5032,3 +5032,47 @@ test "a dash-leading token in an ID slot reads as a misspelled flag, not a missi
     try f.run(&.{ "show", &a.text });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "A") != null);
 }
+
+// ----- --json carries the body (01M1FMN25) -----
+
+test "next/list --json carry the full body, always, escaped (01M1FMN25)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const a = mintId();
+    const b = mintId();
+
+    // The shape that made this matter: the discriminator is APPENDED, so it sits
+    // at the tail of a body whose opening still reads like buildable work.
+    const body =
+        "First paragraph reads like ordinary buildable work.\n\nRULED: \"do not\" start this — \\ see above.";
+    try f.store.append(.{ .add = .{ .id = a, .title = "alpha", .body = body } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "beta" } }); // no body at all
+
+    for ([_][]const u8{ "next", "list" }) |verb| {
+        try f.run(&.{ verb, "--json" });
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+        defer parsed.deinit();
+        const arr = parsed.value.array;
+        try testing.expectEqual(@as(usize, 2), arr.items.len);
+
+        var saw_a = false;
+        var saw_b = false;
+        for (arr.items) |row| {
+            const o = row.object;
+            // Present on EVERY row, empty string included — a consumer indexes
+            // it without a guard, which a sometimes-omitted key would not allow.
+            const got = o.get("body") orelse return error.TestUnexpectedResult;
+            if (std.mem.eql(u8, o.get("title").?.string, "alpha")) {
+                saw_a = true;
+                // Round-trips byte-for-byte through the hand-rolled escaper:
+                // newlines, quotes and a backslash all survive.
+                try testing.expectEqualStrings(body, got.string);
+            } else {
+                saw_b = true;
+                try testing.expectEqualStrings("", got.string);
+            }
+        }
+        try testing.expect(saw_a and saw_b);
+    }
+}
