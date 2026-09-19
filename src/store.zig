@@ -188,6 +188,15 @@ pub const Config = struct {
     /// and where a task lands that matches none of `archive_routes` below.
     /// null → stdout.
     archive_out: ?[]const u8 = null,
+    /// `archive.decisions_out` — where a graduating DECISION's record goes
+    /// (01M2VPC6K). null → wherever ordinary work goes, so a repo that does not
+    /// care loses nothing. Matched on the task's NATURE (`isDecision`), never on
+    /// a tag, so nothing has to be tagged and nothing can be forgotten — which
+    /// is what made a tag-keyed decisions route fragile. Exists because a
+    /// repo's changelog can have a ruled content policy ("completed, verified
+    /// code only") that a log of answered QUESTIONS does not belong in.
+    /// Arena-owned.
+    decisions_out: ?[]const u8 = null,
     /// `archive.routes` — per-task changelog destinations (01M2F8GBQ). A repo
     /// can own more than one changelog with a different content policy each —
     /// e.g. a top-level `docs/CHANGELOG.md` for work gated by the main test
@@ -1284,6 +1293,7 @@ pub const Store = struct {
         };
         self.config.render_out = self.readNestedOut(root, "render");
         self.config.archive_out = self.readNestedOut(root, "archive");
+        self.config.decisions_out = self.readNestedKey(root, "archive", "decisions_out");
         self.config.archive_routes = self.readArchiveRoutes(root);
         self.config.add_arcless_error = self.readAddArclessError(root);
         self.config.backup_retain = self.readBackupRetain(root);
@@ -1362,12 +1372,19 @@ pub const Store = struct {
     /// null when the section, the `out` key, or its string type is absent — a
     /// `null` JSON value or a missing key both mean "unset" (fall back to stdout).
     fn readNestedOut(self: *Store, root: std.json.ObjectMap, section: []const u8) ?[]const u8 {
+        return self.readNestedKey(root, section, "out");
+    }
+
+    /// `readNestedOut` generalized to any string key inside a section — same
+    /// absent/wrong-type-is-unset contract, so a broken entry never blocks a
+    /// command.
+    fn readNestedKey(self: *Store, root: std.json.ObjectMap, section: []const u8, key_name: []const u8) ?[]const u8 {
         const sv = root.get(section) orelse return null;
         const so = switch (sv) {
             .object => |o| o,
             else => return null,
         };
-        const ov = so.get("out") orelse return null;
+        const ov = so.get(key_name) orelse return null;
         const s = switch (ov) {
             .string => |str| str,
             else => return null,

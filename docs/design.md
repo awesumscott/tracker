@@ -1058,6 +1058,47 @@ for a stated reason.
   `archive.routes`'s. What stays is evidence attribution — "measured on the Enix tracker, 2026-09-12" is
   where a finding came from, which is provenance rather than vocabulary.
 
+### A ruled decision GRADUATES, and its ruling is what graduates (01M2VPC6K, 2026-09-19)
+
+Filed by the Enix-side agent during its migration, after ruling 14 forks in a day — and it was right, on a
+point the red team had already raised and this design had failed to close.
+
+**The defect.** `rule` sets a decision `done`; `done` is the archive queue; `archive` graduated it and
+`archived` is hidden from every view. So `list --decision` silently became "every fork since the last
+archive run", and the shipped help text claimed the opposite. Worse, and understated in the filing: the
+changelog bullet is built from the TITLE, and a decision's title is the QUESTION — the ruling lives in the
+body. Verified end to end: after `rule` → `archive` → `compact`, the ruling text appeared in **zero bytes**
+of `.tracker/`, the tombstone kept `"title":"which way?"`, and the changelog read `- which way? (…)`. The
+mechanism was publishing the question and destroying the answer.
+
+**The ruling, and why it is not "never archive".** The first answer considered was to exempt decisions from
+`archive` entirely, keeping them `done` and visible forever, on the grounds that a ruling is institutional
+memory. That is true of a minority — the standing kind (*arcs are containers*, *compact keeps done*) — and
+those belong in THIS DOCUMENT, promoted by hand, which is where that class has always lived. Most forks are
+"implement it way A or B", and their answer is legible in the code that resulted; the node has no further
+job once the work lands. Exempting them would trade a fixable bug for a permanent one: a monotonically
+growing pile of spent questions that real work sweeps away around.
+
+So a decision graduates like anything else. What changes is what graduates:
+
+- **`appendArchiveBullet` emits a decision's BODY**, indented under its question, because the ruling is the
+  record. A decision is disposable precisely BECAUSE the answer lands somewhere durable first.
+- **`archive.decisions_out` routes decisions to their own file, keyed on NATURE (`isDecision`), never on a
+  tag.** A tag-keyed decisions route was the obvious shape and the fragile one — it needs discipline the
+  tool cannot verify. Structural routing needs none. Unset falls through to the ordinary destination, so a
+  repo that does not care loses nothing, while one whose changelog doctrine is "completed, verified code
+  only" keeps answered questions out of it.
+- **`list` defaults to REMAINING work**, hiding done/dropped/archived unless asked (`--state done`,
+  `--all`). This is the rule `archived` already followed, applied one state earlier, and the numbers say it
+  was overdue independently of decisions: trk's own default listing was 29 completed rows out of 31 — 94%
+  noise — while `next` and the TODO.md projection were clean because they already filter this way.
+- **`list --decision` stops claiming to be a complete index** of every fork ever raised, because it is not
+  and cannot be.
+
+*Deciding which rulings outlive their node stays a human act.* The tool cannot tell a spent implementation
+fork from a standing constraint, and a flag for it would be one more thing to forget. Promotion to this
+document is the mechanism, and it is deliberate by design.
+
 ### Rejected
 
 - **`rule` clearing the declaration instead of closing the node.** The first draft's shape, and it does not
@@ -1124,9 +1165,11 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   the member it collects (`serializeState`'s `gc_set`; an edge naming a collected id would re-materialize
   it as a ghost), so a fully-built, graduated arc renders identically to one nobody ever sliced. It fixed
   `tree` and `show` and left three views behind. The ruling splits them, and not by the invariant:
-  - **`list --arc` gets it, because there it is a self-inconsistency.** `list` ALREADY shows closed work —
-    `done` and `submitted` rows are ordinary output — and a compacted member is the only kind it silently
-    drops. A count plus a pointer to `trk tree <arc>`, not the rows: `tree` already renders the full block
+  - **`list --arc` gets it, because there it is a self-inconsistency.** `list` can show closed members on
+    request (`--state done`, `--all`) and a compacted member is the only kind it can NEVER show, at any
+    filter. (When this was ruled, `list` showed closed work by DEFAULT; `01M2VPC6K` later made the default
+    remaining-work-only. The inconsistency survives the change, one filter deeper: ask for everything and
+    you still do not get the graduated members.) A count plus a pointer to `trk tree <arc>`, not the rows: `tree` already renders the full block
     in a shape that cannot be skim-read as live work, and a second copy here would be one to keep in step.
     In `--json` they arrive as extra rows carrying `"compacted": true` — an array has nowhere to put a
     footer, so the choice is rows or nothing, and nothing would leave the agent-facing half of the same

@@ -3038,9 +3038,15 @@ test "trk list --no-arc: composes with --state/--tag, mutually exclusive with --
 
     try f.run(&.{ "list", "--no-arc" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan open") != null);
-    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan done") != null); // no --state -> all but archived
+    // Completed work is hidden by default now (01M2VPC6K) — `--all` is the union.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan done") == null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc") == null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "Member") == null);
+
+    try f.run(&.{ "list", "--no-arc", "--all" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan open") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Orphan done") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Arc") == null);
 
     // Composes with --state.
     try f.run(&.{ "list", "--no-arc", "--state", "open" });
@@ -4704,14 +4710,18 @@ test "list --arc reports an arc's compacted members; next and render deliberatel
     try f.run(&.{"compact"});
     try f.reopen();
 
-    try f.run(&.{ "list", "--arc", &arc.text });
+    try f.run(&.{ "list", "--arc", &arc.text, "--all" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "live slice") != null);
+    // `--all`, because completed work is hidden by default (01M2VPC6K). The
+    // `done` member is the point of this assertion: it is what makes the
+    // COMPACTED member's absence an inconsistency rather than a policy — even
+    // asked for explicitly, a compacted member never appears as a row.
     try testing.expect(std.mem.indexOf(u8, f.out.items, "finished slice") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "+1 compacted member(s) not shown") != null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "names them") != null);
 
     // --json: the same fact, as a row a consumer filters on one key.
-    try f.run(&.{ "list", "--arc", &arc.text, "--json" });
+    try f.run(&.{ "list", "--arc", &arc.text, "--json", "--all" });
     {
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
         defer parsed.deinit();
@@ -5180,4 +5190,106 @@ test "migrate-decisions: --from-tag is required (trk ships no project's vocabula
     try f.run(&.{ "migrate-decisions", "--from-tag", "needs-alice" });
     try testing.expectEqual(before + 1, f.store.count());
     try testing.expectEqual(@as(usize, 0), f.store.get(carrier).?.tags.items.len);
+}
+
+// ----- a ruled decision graduates, and the RULING is what graduates (01M2VPC6K) -----
+
+test "archiving a ruled decision publishes the RULING, not just the question" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "real work" } });
+
+    try f.run(&.{ "decision", "way A or way B?", "--blocks", &work.text });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+    try f.run(&.{ "rule", &d.text, "RULED: way A, because B cannot express the standing case." });
+
+    try f.run(&.{ "archive", "--out", "CL.md" });
+    const cl = try f.tmp.dir.readFileAlloc(io, "CL.md", alloc, .unlimited);
+    defer alloc.free(cl);
+
+    // The ANSWER is the record. Before this, the bullet was built from the
+    // title — so archiving a decision published the question and destroyed the
+    // ruling, which is the node's entire value.
+    try testing.expect(std.mem.indexOf(u8, cl, "RULED: way A, because B cannot express") != null);
+    try testing.expect(std.mem.indexOf(u8, cl, "way A or way B?") != null);
+
+    // And it did graduate — decisions are disposable BECAUSE the ruling landed.
+    try f.reopen();
+    try testing.expectEqual(tracker.State.archived, f.store.get(d).?.state);
+}
+
+test "archive.decisions_out routes a decision by NATURE, with no tag to forget" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
+    defer sub.close(io);
+    try sub.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{ \"archive\": { \"out\": \"CHANGELOG.md\", \"decisions_out\": \"DECISIONS.md\" } }",
+        .flags = .{},
+    });
+    f.store.loadConfig();
+
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "shipped work" } });
+    try f.store.append(.{ .setState = .{ .id = work, .state = .done } });
+    try f.run(&.{ "decision", "way A or way B?" });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+    try f.run(&.{ "rule", &d.text, "RULED: way A." });
+
+    try f.run(&.{"archive"});
+    const dec = try f.tmp.dir.readFileAlloc(io, "DECISIONS.md", alloc, .unlimited);
+    defer alloc.free(dec);
+    const chg = try f.tmp.dir.readFileAlloc(io, "CHANGELOG.md", alloc, .unlimited);
+    defer alloc.free(chg);
+
+    // Split on nature alone — neither task carries a tag, and none was needed.
+    try testing.expect(std.mem.indexOf(u8, dec, "way A or way B?") != null);
+    try testing.expect(std.mem.indexOf(u8, dec, "shipped work") == null);
+    try testing.expect(std.mem.indexOf(u8, chg, "shipped work") != null);
+    try testing.expect(std.mem.indexOf(u8, chg, "way A or way B?") == null);
+}
+
+test "list hides completed work by default; --all and --state reach it (01M2VPC6K)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const open_t = mintId();
+    const done_t = mintId();
+    const dropped_t = mintId();
+    try f.store.append(.{ .add = .{ .id = open_t, .title = "still open" } });
+    try f.store.append(.{ .add = .{ .id = done_t, .title = "finished" } });
+    try f.store.append(.{ .setState = .{ .id = done_t, .state = .done } });
+    try f.store.append(.{ .add = .{ .id = dropped_t, .title = "abandoned" } });
+    try f.store.append(.{ .setState = .{ .id = dropped_t, .state = .dropped } });
+
+    try f.run(&.{"list"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "still open") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "finished") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "abandoned") == null);
+
+    // Asked for specifically, they are all still reachable — nothing became
+    // invisible, only un-defaulted.
+    try f.run(&.{ "list", "--state", "done" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "finished") != null);
+    try f.run(&.{ "list", "--all" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "still open") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "finished") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "abandoned") != null);
+
+    // A RULED decision is `done`, so it leaves the default listing the same way
+    // — which is the accumulation this ruling exists to prevent.
+    try f.run(&.{ "decision", "way A or B?" });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+    try f.run(&.{ "list", "--decision" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "way A or B?") != null);
+    try f.run(&.{ "rule", &d.text, "RULED: A." });
+    try f.run(&.{ "list", "--decision" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "way A or B?") == null);
+    try f.run(&.{ "list", "--decision", "--state", "done" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "way A or B?") != null);
 }

@@ -735,18 +735,25 @@ pub const Cli = struct {
         \\  follow-up `trk show` per candidate.
         \\  e.g.  trk next           trk next parser windowed
         },
-        .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--state", "--tag", "--not-tag", "--limit", "--json", "--word" }, .text =
-        \\trk list [--arc <id> | --no-arc] [--decision] [--state <s>] [--tag <t>]
+        .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--decision", "--all", "--state", "--tag", "--not-tag", "--limit", "--json", "--word" }, .text =
+        \\trk list [--arc <id> | --no-arc] [--decision] [--all] [--state <s>] [--tag <t>]
         \\         [--not-tag <t> ...] [--limit <n>] [--json] [<term> | --word <term> ...]
-        \\  Every task (not just the ready frontier), filterable by arc/state/tag and
+        \\  REMAINING work by default — open/blocked/claimed/submitted. Completed
+        \\  states (done/dropped/archived) are hidden unless you ask: --state done is
+        \\  the archive queue, --state archived the graduated set, --all the union.
+        \\  Filterable by arc/state/tag and
         \\  the same bare-term search as `next`. --not-tag (repeatable, ANDed
         \\  exclusion) drops any task carrying that tag. --no-arc lists every task in
         \\  NO arc (by the unified isArc/membership model, including needs-
         \\  reachability) — the completeness query for "sort everything into arcs";
-        \\  mutually exclusive with --arc. --decision lists only declared decisions;
-        \\  pair it with --state open for the PENDING ones, which is the pre-dispatch
-        \\  "what is still waiting on a call" sweep (a declaration is nature and
-        \\  survives the ruling, so --decision alone is every fork ever raised). --json for machine-readable output (same
+        \\  mutually exclusive with --arc. --decision lists only declared decisions —
+        \\  by default the OPEN ones, which is the pre-dispatch "what is still waiting
+        \\  on a call" sweep. A declaration is nature and survives its ruling, so
+        \\  `--decision --state done` is every fork ruled but not yet graduated, and
+        \\  `--decision --all` adds the graduated ones. It is NOT a complete index of
+        \\  every fork ever raised: `archive` graduates a ruled decision like any
+        \\  other finished task, and the RULING (not just the question) is what lands
+        \\  in the changelog — see `trk archive --help`. --json for machine-readable output (same
         \\  object shape as `next --json`, body included).
         \\  With --arc, a tail line reports the arc's COMPACTED members by count and
         \\  points at `trk tree <arc>`, which names them. `list` already shows closed
@@ -826,6 +833,12 @@ pub const Cli = struct {
         \\  (`trk decision`), so archiving the task that raised it cannot bury it.
         \\  For prose written before that existed, `trk migrate-decisions` scans for
         \\  the old markers once and reports them to file as real decisions.
+        \\  A ruled DECISION graduates like any other finished task, and its entry
+        \\  carries the RULING from its body, not just the question in its title —
+        \\  that record is why the node is disposable afterwards. Set
+        \\  archive.decisions_out in .tracker/config.json to send rulings to their own
+        \\  file (routed on the task's NATURE, so nothing needs tagging); unset, they
+        \\  go wherever ordinary work goes.
         \\  The <term> slot is a SEARCH filter, not a task to archive: a bare
         \\  id-shaped token there is a hard error, because it would match nothing and
         \\  report an empty run.
@@ -1048,7 +1061,8 @@ pub const Cli = struct {
     const list_tools = [_]Tool{.{ .name = "list", .argv = &.{"--json"}, .params = &.{
         p_arc_filter,
         .{ .name = "no_arc", .kind = .boolean, .flag = "--no-arc", .desc = "Only tasks in no arc." },
-        .{ .name = "decision", .kind = .boolean, .flag = "--decision", .desc = "Only declared decisions (add state=open for the pending ones)." },
+        .{ .name = "decision", .kind = .boolean, .flag = "--decision", .desc = "Only declared decisions (open ones by default)." },
+        .{ .name = "all", .kind = .boolean, .flag = "--all", .desc = "Include completed states, which the default hides." },
         .{
             .name = "state",
             .kind = .choice,
@@ -2973,6 +2987,15 @@ pub const Cli = struct {
     /// `archive.routes` existed.
     fn resolveDestination(self: *Cli, out_path: ?[]const u8, t: Task) Error!?[]const u8 {
         if (out_path) |p| return p;
+        // A decision routes by NATURE, not by tag (01M2VPC6K). `isDecision` is
+        // structural, so nothing has to be tagged and nothing can be forgotten —
+        // which is what made a tag-keyed decisions route fragile. Unset falls
+        // through to the ordinary destination, so a repo that does not care
+        // loses nothing; a repo whose changelog doctrine is "verified code only"
+        // configures `archive.decisions_out` and keeps rulings out of it.
+        if (self.store.isDecision(t.id)) {
+            if (self.store.config.decisions_out) |d| return d;
+        }
         var matched: ?[]const u8 = null;
         var matched_tag: ?[]const u8 = null;
         for (self.store.config.archive_routes) |route| {
@@ -3042,6 +3065,34 @@ pub const Cli = struct {
     fn appendArchiveBullet(self: *Cli, buf: *std.ArrayList(u8), id: Ulid) Error!void {
         const gpa = self.gpa;
         const t = self.store.get(id).?;
+        // A DECISION's record is its RULING, and the ruling lives in the body —
+        // the title is only the question (01M2VPC6K). Graduating one on the
+        // ordinary bullet published the question and discarded the answer, which
+        // for a decision is the whole value of the node: verified end-to-end,
+        // after rule -> archive -> compact the ruling text was in ZERO bytes of
+        // `.tracker/` and the changelog said `- which way? (01M2VPP4VD)`.
+        //
+        // A decision is disposable BECAUSE the answer lands here. Most forks are
+        // "implement it way A or B", where the code that results carries the
+        // answer and the node has no further job; the few that constrain FUTURE
+        // work get promoted to docs/design.md by hand, which is a judgment no
+        // tool should make. Either way nothing is lost by graduating, provided
+        // the ruling is what graduates.
+        if (self.store.isDecision(id)) {
+            try buf.print(gpa, "- **{s}**\n", .{t.title});
+            if (t.body.len != 0) {
+                var lines = std.mem.splitScalar(u8, t.body, '\n');
+                while (lines.next()) |raw| {
+                    const line = std.mem.trimEnd(u8, raw, " \t\r");
+                    if (line.len == 0) try buf.print(gpa, "\n", .{}) else try buf.print(gpa, "  {s}\n", .{line});
+                }
+            } else {
+                try buf.print(gpa, "  (no ruling recorded)\n", .{});
+            }
+            var db: [ulid.len]u8 = undefined;
+            try buf.print(gpa, "  ({s})\n", .{try self.shortId(id, &db)});
+            return;
+        }
         try buf.print(gpa, "- {s}", .{t.title});
         for (t.tags.items) |tg| try buf.print(gpa, " #{s}", .{tg});
         for (t.docrefs.items) |dr| {
@@ -3301,6 +3352,10 @@ pub const Cli = struct {
         // nature and stays true after a ruling, so `--decision` alone is every
         // decision ever raised, ruled or not.
         var decisions_only = false;
+        // `--all`: include completed states (done/dropped/archived) that the
+        // default hides. The escape hatch for the one-listing-of-everything
+        // case, so nothing becomes unreachable.
+        var show_all = false;
         var state_filter: ?State = null;
         var tag_filter: ?[]const u8 = null;
         var limit: ?usize = null;
@@ -3320,6 +3375,8 @@ pub const Cli = struct {
                 no_arc = true;
             } else if (std.mem.eql(u8, args[i], "--decision")) {
                 decisions_only = true;
+            } else if (std.mem.eql(u8, args[i], "--all")) {
+                show_all = true;
             } else if (std.mem.eql(u8, args[i], "--state")) {
                 const sv = try self.flagVal(args, &i, "--state");
                 state_filter = State.fromString(sv) orelse {
@@ -3366,9 +3423,25 @@ pub const Cli = struct {
             const t = self.store.get(id).?;
             if (state_filter) |sf| {
                 if (t.state != sf) continue;
-            } else if (t.state == .archived) {
-                // Archived = retired to the changelog; hidden unless asked for
-                // explicitly (`--state archived`) so the live list stays clean.
+            } else if (!show_all and !isRemaining(t.state)) {
+                // COMPLETED work is hidden unless asked for (01M2VPC6K). This is
+                // the rule `archived` already followed — "retired to the
+                // changelog; hidden unless asked for explicitly so the live list
+                // stays clean" — applied one state earlier, where the same
+                // reasoning holds and the numbers are worse: measured on trk's
+                // own store the default listing was 29 completed rows out of 31,
+                // i.e. 94% of it was noise, while `next` and the TODO.md
+                // projection were clean because they already filter to remaining
+                // work.
+                //
+                // It matters more now that decisions are nodes: a ruled decision
+                // sits `done` until an archive run graduates it, and rulings
+                // arrive steadily, so without this the default listing trends
+                // toward being mostly answered questions.
+                //
+                // `--state done` is the archive queue (and the natural
+                // pre-archive check), `--state archived` the graduated set, and
+                // `--all` the union for when everything really is wanted.
                 continue;
             }
             if (members) |m| if (!containsId(m, id)) continue;
