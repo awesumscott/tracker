@@ -861,6 +861,192 @@ The merge model is **owned** here, because it gates how parallel agents may touc
 where close/edge authority would become **capability-scoped**; an unscoped API is acceptable only while git
 *is* the authority log.
 
+## Decisions — a fork is a node, not a marker in prose (01M2VD RULED 2026-09-18, NOT YET BUILT)
+
+**Status: ruled, unimplemented.** Everything below is the agreed design; the code still carries the tag +
+body-grep convention it replaces. The implementation arc is tracked in the tracker. Read this before
+touching `reportBuriedDecisions`, `cmdRule`, or anything named `decision_*` in `Config`.
+
+### The problem
+
+"This is a fork only the repo owner can rule on" was a *convention*, in two halves, and both are archaeology:
+
+1. A `#scott-decision` TAG. `store.zig`'s `default_decision_tag` hardcoded that string — the owner's name —
+   as a library default, under a doc comment asserting "`trk` itself has no opinion on it".
+2. `trk archive` grepping each closing body for `scott-decision` / `OPEN QUESTION` / `FIX NOTE` / `your
+   call` / `TODO` and REFUSING the run on any unexempted hit, because `archived` is hidden from every view
+   and graduating a task with an unresolved fork in its body loses the fork permanently.
+
+The guard's false positives were dominated by bodies that quote the markers BECAUSE the markers are their
+subject — including the tasks that built the guard. Queues of 36–62 `done` tasks sat unarchived across
+sessions, and the escape (`--allow-buried-decisions-for <id>:<n>:<digest>`) lived for one process, so the
+same bodies were re-read every run.
+
+**The diagnosis that decides the design: the guard is archaeology because a fork has no representation in
+the model.** It is a string in a body, so intent is destroyed at authoring time and every downstream
+mechanism is left guessing at it. Sharpening the guess — a better classifier, a persisted clearance, a
+per-task exemption — is remediation of a loss that should never have happened. Capture the intent as
+structure when it is written, and the guessing has nothing left to do.
+
+Secondary, and why this is a trk mechanism rather than one project's convention: every project reinvents
+this independently, and the owner's name must not appear anywhere in the tool.
+
+### The mechanism
+
+- **A decision is a DECLARED PROPERTY of a task**, exactly parallel to `arcDeclare`. New event
+  `decisionDeclare { id, declared: bool, ts }`. Not a new node type: it inherits states, `show`, `--json`,
+  edges, tombstones and compaction, the same way an arc root is an ordinary task that has been declared.
+- **Declaration is NATURE, not lifecycle.** An arc stays an arc when it is done; a decision stays a
+  decision when it is ruled. The declaration is retracted only by `--undo`, never by resolving. *Resolution
+  is STATE.* This is the joint the first draft got wrong (see "Rejected" below).
+- **No `owner` field.** In a single-human repo it is a constant, so it carries no information; and real
+  multi-user support would need actual identity and would likely rework the lease's `holder` at the same
+  time, so a bare string here is a weaker version of a system we would design differently. A project that
+  needs to distinguish uses an ordinary tag — the same line trk draws everywhere else about not knowing its
+  consumers.
+- **Blocking is the existing `dep` edge.** `trk decision "<q>" --blocks <id>` writes `dep{from: id, to: D}`:
+  the work needs the ruling, which is a prerequisite relation without stretching the word. Repeatable — a
+  decision can gate work that did not raise it. The existing satisfaction rule maps unchanged: a ruled
+  decision is `done` and satisfies; `dropped` ("moot, not deciding") also unblocks, which is correct and
+  worth naming.
+- **Provenance is a NEW edge `raises { task, decision }`**, with an `unraises` fold-time tombstone mirroring
+  `undep`/`unin` (union-merge needs order-independent removal, and a mis-attributed origin must be
+  correctable rather than only overwritable). Many-to-many in both directions: several tasks legitimately
+  hit the same fork, and one task raises several. `unraises` must not `ensureNode`, exactly as `undep` does
+  not, or a removal could mint a ghost.
+  - *Why an edge and not prose in the raiser's body:* a body is a `setBody` LWW scalar, so recording it
+    there is a read-modify-write on a task other lanes may be appending to — two concurrent
+    `--append-body`s lose one, which is the six-lost-bodies class this doc already documents. An edge is
+    additive and commutes. (An earlier justification — "structured relations survive compaction better" —
+    is only half true now that the tombstone index makes a body citation of a compacted id RESOLVE, and
+    should not be relied on.)
+  - *Why not a `from: ?Ulid` field on the declaration:* it is single-valued where the relation is
+    many-to-many, it is lost on `--undo` + re-declare, it makes a declare event reference a second task and
+    so needs a special case in `model.eventTaskIds` — the one function `compact`'s ghost detector and the
+    tombstone rebuild both depend on — and it makes provenance the only second-class relation in a model
+    where every relation is an edge.
+- **`raises` is EXCLUDED from the combined acyclic graph** (`needs` ∪ reversed `in`). It encodes no waiting,
+  so it cannot close a self-wait, and `combinedReaches`/`checkAcyclic` must not walk it. (The first draft
+  claimed the exclusion was *forced*, because "T needs D and T raised D" would otherwise be a cycle. That is
+  wrong: it holds only if provenance were spelled as a `dep`. With `raises` as its own kind the question
+  never arises. The exclusion is correct, but by the argument above, not that one.)
+- **`trk rule <id> <text>` resolves: append the ruling AND `setState done`, unconditionally, and REFUSE on a
+  task that is not a declared decision.** That refusal is the direct analogue of today's "refuses on a task
+  not currently tagged". The old doctrine — a ruling deliberately does not close, because the task may be
+  the carrier for the ruled work — does not survive, and does not need to: after migration (below) a
+  decision node is never a carrier.
+- **Write-time refusals** (`Store.append`, where `in` already refuses an undeclared arc): a task may not be
+  both an arc and a decision, and a decision may not be `claimed` or `submitted`. A decision is not work;
+  without the second refusal an agent leases a question and `stale`/`release` start tracking it.
+- **`next` excludes declared decisions structurally**, the way standing arcs are excluded — but see the
+  views ruling below, because exclusion alone trades one problem for a worse one.
+
+### The views (without these, exclusion is a regression)
+
+Excluding decisions from `next` while they block work via `dep` produces a frontier that goes empty with
+nothing explaining why. The old `--not-tag scott-decision` was at least opt-in, and a tagged task still
+appeared in a bare `next`. So the exclusion ships with all of:
+
+- **`trk list --decision`** — the pre-dispatch sweep ("what is still waiting on a call"), replacing
+  `trk list --tag scott-decision`. This query is the one the whole feature serves; without it the mechanism
+  has no reader.
+- **A `next` tail** naming withheld work — "N ready task(s) withheld: they wait on M pending decision(s);
+  `trk list --decision`" — in the shape `list --arc`'s compacted-members tail already uses (01M2V2TSA).
+  That ruling declined to give `next` a tail on the grounds that a graduated member is never an answer to
+  "what can I work on"; a PENDING DECISION is the answer to "why is nothing ready", so it does not apply.
+  `--json` has no footer and rows would contradict the exclusion, so machine readers use `list --decision`.
+- **A distinct marker in `render` and `tree`.** `membersOf` closes over `needs`, so a decision filed with
+  `--blocks T` joins T's arc by reachability and would otherwise render in `docs/TODO.md` and `tree` as an
+  ordinary `[ ]` bullet — a question indistinguishable from a slice, in the projection whose whole contract
+  is not-yet-built work.
+- **`trk decision` takes `--in`**, and does NOT inherit the raiser's arcs. Inference is what this codebase
+  keeps deleting. A decision filed with an explicit `--in` DOES gate its arc's close-out via `arcDrained`,
+  which is intended — a fork about the arc blocks "is the goal achieved" — and is visible through the tail
+  above.
+
+### What is DELETED, not demoted
+
+Once a fork is structured, new work has nothing to scan for; a body scan only ever fires on prose written
+before the mechanism existed. That is a one-time FINDER, not a standing guard, and its home is the
+migration. So `archive` loses the guard outright rather than being demoted to an advisory:
+`reportBuriedDecisions`, `isMarkerShaped`, `hitDigest`, `AllowFor`, `lineCitesLiveTask`, both
+`--allow-buried-decisions` flags and their digest protocol, `Config.decision_markers`,
+`default_decision_markers`, `Config.rule_tag` and `default_decision_tag` all go.
+
+Deleting is more honest than demoting. This doc's own argument against a warning is that it scrolls past in
+a bulk run and what it failed to stop is permanent — an advisory would supply assurance without protection.
+And the guard's measured behaviour was to block queues for weeks and then be worked around, which is
+friction rather than protection.
+
+**The residual cost, stated rather than buried:** a person who writes a prose fork AFTER migration and
+archives it loses it, with nothing to catch them. Accepted. The structured path exists, and a tool cannot
+force prose to be structure.
+
+### Migration
+
+`trk migrate-decisions --from-tag <tag>`, modelled on `migrate-arcs`/`migrate-shorts`, and re-runnable —
+which is also how lanes forked from a pre-migration base are handled (they keep appending the legacy tag;
+the orchestrator re-runs migration after integrating). No default tag: trk ships no name.
+
+It does two things, and **it never guesses which sentence is the fork**:
+
+1. **Splits each legacy tagged task**, because those tasks are CARRIERS — work and fork in one body — and
+   declaring one a decision would let `rule` close unbuilt work. Migration mints a decision node per tagged
+   task, wires `raises{original, D}`, leaves the original alone as work, and removes the tag. D is a
+   scaffold the human writes the actual question into; no body text is copied or parsed. This is what lets
+   `rule` be unconditional, with no `--keep-open` flag and no behaviour keyed on the target's nature.
+2. **Scans bodies for the legacy markers and REPORTS them** — the prose forks that were never tagged, which
+   nothing else can find. It files nothing from a scan; the operator reads the report and runs
+   `trk decision`. This is the body-grep's only remaining appearance anywhere in trk, and it is opt-in,
+   one-shot and human-reviewed, which is what makes archaeology acceptable here and not in `archive`.
+
+### Compaction and tombstones
+
+The silent-loss class, so it lands with the implementation and not after:
+
+- `serializeState` emits `decisionDeclare{true}` for live declared ids (as it does `arcDeclare`) and emits
+  `raises` edges skipping `gc_set` endpoints.
+- `taskFingerprint` includes the declaration bit and the task's owned `raises` edges. **Without this a
+  compact that silently drops them passes the round-trip verify** — precisely the class 01M0YESW6 exists to
+  catch.
+- `model.eventTaskIds` reports both endpoints of `raises`/`unraises`, which is what lets `quarantineGhosts`
+  and `scanLogHistoryForIds` see the edge. `scalarTarget` must NOT include the new ops: they are
+  additive/LWW-bool and are never watermark-withheld, exactly like `arcDeclare`.
+- **The tombstone carries `raised` on the TASK side** — T's record lists the decisions T raised — not the
+  decision side. The case that matters is T archived+compacted while D is still live: `serializeState`
+  drops every edge with a collected endpoint, so D would lose its provenance. `show D` then does the
+  reverse lookup `compactedMembers` already does for arcs. `collectableRows` records it at collection time,
+  mirroring `arcs`.
+- `tombstones --rebuild` reconstructs `raises` from history by the same surviving-pair rule it uses for
+  `in`/`unin` (a pair is live iff some `raises` exists and no `unraises` does), and `supersedes` gains a
+  third case — "gained raises it had none of" — or the upgrade never reaches an already-rebuilt store.
+  That is the 01M2V2TYC lesson, applied in advance this time.
+
+### Forward compatibility
+
+The new ops are SKIPPABLE, per the codec's unknown-op contract, matching `arcStanding`. A binary that
+predates them sees a decision as an ordinary open task and surfaces it in `next` — the "falsely ready"
+direction this doc elsewhere calls unsafe, so it is an explicit, recorded exception rather than an
+oversight. A wasted dispatch is corrected by the agent's first read of the body; bricking every read of the
+store is worse. The stale-binary window was closed OPERATIONALLY here (one other session, restarted after
+install), not structurally — do not read this as a guarantee.
+
+### Rejected
+
+- **`rule` clearing the declaration instead of closing the node.** The first draft's shape, and it does not
+  compose with `dep`-based blocking: `cmdRule` never sets state, so after a ruling the `dep` would still not
+  be satisfied and the work would stay blocked pending a second, forgettable `trk state done` — the exact
+  failure `rule` was built to eliminate, reintroduced one op later. Worse, the now-undeclared decision would
+  surface in `next` as ready work: a question with its answer appended, handed out as a task.
+- **An `owner` field.** See above.
+- **Per-task persisted clearances / a sharper marker classifier / narrowing the refusal to colon-glued
+  "marker-shaped" hits.** All remediation of the authoring-time loss rather than repair of it. The
+  classifier point specifically: `isMarkerShaped` requires the marker be colon-glued to content, so a real
+  fork written "FIX NOTE — do X" reads as prose, and narrowing the refusal to marker-shaped would bury it
+  silently.
+- **`in` (arc membership) as the provenance link.** A decision in an arc is held by `arcDrained`, and the
+  fix would be an arc special case in `next`, which this doc forbids.
+
 ## Backend: host file now; datastore later, with a caution
 
 One source, but **no vtable** — the host **file backend** is a concrete struct (`Store` in `store.zig`):

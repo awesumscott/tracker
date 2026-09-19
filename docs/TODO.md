@@ -5,6 +5,142 @@
 
 > Arc-less drift: 2 remaining task(s) belong to no arc (`trk list --no-arc`).
 
+## Decisions: a fork becomes a declared node, replacing the #scott-decision tag and archive's body-grep guard  (01M2VFTG4)
+
+<details><summary>RULED 2026-09-18 (Scott). Design: docs/design.md, section "Decisions…</summary>
+
+RULED 2026-09-18 (Scott). Design: docs/design.md, section "Decisions — a fork is a node, not a marker in prose". Read it before starting any slice; it carries the rejected alternatives and the reasoning, and several slices are silent-data-loss class if their details are skipped.
+
+WHY: a fork had no representation in the model — it was a string in a body — so intent was destroyed at authoring time and every downstream mechanism (the tag, archive's marker grep, the digest exemptions) was left guessing at it. This captures it as structure when it is written, and deletes the guessing.
+
+Red-teamed before writing. Findings that changed the design, all verified against source: (1) `cmdRule` never sets state, so the first draft's "rule clears the declaration" would have left the blocking `dep` unsatisfied AND surfaced the answered question in `next` as work; (2) `membersOf` closes over `needs`, so a `--blocks` decision joins the raiser's arc by reachability and would render in TODO.md and tree as an ordinary bullet; (3) the first draft's claim that excluding `raises` from the acyclic graph was FORCED by a cycle was wrong — the exclusion is right, the argument was not.
+
+Scott's rulings on the three open questions: migration splits legacy carriers (so `rule` is unconditional and needs no --keep-open); archive's guard is DELETED outright, not demoted, with the body scan moving into the migration as a one-shot finder; forward-compat is skippable, with the stale-binary window closed operationally.
+
+SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-positive rate; this removes its subject.
+
+</details>
+
+
+- [ ] `01M2VFV82` (seq 1) Events + fold: decisionDeclare, raises, unraises #decisions
+
+  <details><summary>model.zig: three new ops. `decisionDeclare { id, declared: bool, ts }`…</summary>
+
+  model.zig: three new ops. `decisionDeclare { id, declared: bool, ts }` mirrors `arcDeclare` exactly (single-task LWW bool, idempotent, commutative across disjoint tasks). `raises { task, decision, ts }` + `unraises { task, decision, ts }` mirror `in`/`unin`: a fold-time tombstone map, unconditional, so removal is order-independent under union-merge.
+
+  json_codec.zig: encode + decode, deterministic key order, hand-rolled as the rest is.
+
+  store.zig `apply`: fold rules. `unraises` must NOT ensureNode — same as `undep` — or a removal mints a ghost.
+  store.zig `append` write-time refusals: a task may not be both an arc and a decision (refuse either declare against the other, the way `in` refuses an undeclared arc), and a decision may not be `claimed` or `submitted` (a decision is not work; without this an agent leases a question and stale/release start tracking it).
+
+  `model.eventTaskIds` reports BOTH endpoints of raises/unraises — that is what lets quarantineGhosts and scanLogHistoryForIds see the edge. `scalarTarget` must NOT include the new ops: additive/LWW-bool, never watermark-withheld, like arcDeclare.
+
+  `raises` is excluded from the combined acyclic graph — combinedReaches and checkAcyclic must not walk it. It encodes no waiting.
+
+  Tests: union-merge commutativity for all three (both orders converge), the two refusals, and that an unraises tombstone blocks a later raises for the same pair regardless of fold order.
+
+  </details>
+
+- [ ] `01M2VFV83` (seq 2) Verbs: trk decision, rule closes unconditionally, list --decision #decisions
+
+  <details><summary>`trk decision "&lt;question>" --from &lt;id> [--blocks &lt;id> ...] [--in &lt;arc>]…</summary>
+
+  `trk decision "<question>" --from <id> [--blocks <id> ...] [--in <arc>] [--tag t] [--body s]` — mints the node, declares it, writes raises{from, D} and a dep{blocks, D} per --blocks. Resolve --from/--blocks ids BEFORE minting (cmdAdd's no-half-built-task rule). Does NOT inherit the raiser's arcs; --in is explicit.
+
+  `trk rule <id> <text>`: append the ruling AND setState done, unconditionally. REFUSE on a task that is not a declared decision — the direct analogue of today's "refuses on a task not currently tagged". Drop the tag-removal path and Config.rule_tag with it.
+
+  `trk list --decision` — the pre-dispatch sweep replacing `list --tag scott-decision`. This is the query the whole mechanism serves; the exclusion in slice 3 is a regression without it.
+
+  Every flag must appear in the verb's help text (mcp_test asserts it).
+
+  </details>
+
+- [ ] `01M2VFV84` (seq 3) Views: next excludes decisions, and says what it withheld; render/tree mark them #decisions
+
+  <details><summary>`Store.next`: skip declared decisions, the way standing arcs are…</summary>
+
+  `Store.next`: skip declared decisions, the way standing arcs are skipped.
+
+  WITHOUT THE REST OF THIS SLICE THAT IS A REGRESSION, not a fix: a decision excluded from next while blocking work via dep makes the frontier go empty with nothing explaining why. The old --not-tag was at least opt-in and the tagged task still appeared in a bare next.
+
+  - next tail: "N ready task(s) withheld: they wait on M pending decision(s); trk list --decision", in the shape list --arc's compacted-members tail uses (01M2V2TSA). That ruling declined a tail for next because a graduated member is never an answer to "what can I work on" — a PENDING DECISION is the answer to "why is nothing ready", so it does not apply.
+  - --json gets no footer (an array has nowhere to put one) and no rows (that would contradict the exclusion): machine readers use list --decision. Say so in help.
+  - render + tree: membersOf closes over needs, so a --blocks decision joins the raiser's arc by REACHABILITY and would render as an ordinary [ ] bullet — a question indistinguishable from a slice, in the projection whose contract is not-yet-built work. Needs a distinct marker or grouping in both.
+  - cmdAdd's arcless warning will fire for every decision filed without --in; decide and handle.
+
+  Test both directions: an arc with a pending decision must read differently from one without, in next, render and tree.
+
+  </details>
+
+- [ ] `01M2VFW5F` (seq 4) Compaction + tombstones: the silent-loss slice #decisions
+
+  <details><summary>Every item here fails SILENTLY if skipped. Lands with the mechanism,…</summary>
+
+  Every item here fails SILENTLY if skipped. Lands with the mechanism, not after.
+
+  - serializeState: emit decisionDeclare{true} for live declared ids (as it does arcDeclare); emit raises edges skipping gc_set endpoints.
+  - taskFingerprint: include the declaration bit and the task's owned raises edges. WITHOUT THIS a compact that silently drops them PASSES the round-trip verify — exactly the class 01M0YESW6 exists to catch.
+  - Tombstone carries `raised` on the TASK side (T's record lists the decisions T raised), NOT on the decision side. The case that matters is T archived+compacted while D is still live: serializeState drops every edge with a collected endpoint, so D loses its provenance unless T's tombstone holds it. `show D` then does the reverse lookup compactedMembers already does for arcs.
+  - collectableRows records it at collection time, mirroring arcs.
+  - tombstones --rebuild: reconstruct raises by the same surviving-pair rule used for in/unin (live iff some raises exists and no unraises does, anywhere in history).
+  - `supersedes` gains a third case, "gained raises it had none of", or the upgrade never reaches an already-rebuilt store. That is the 01M2V2TYC lesson applied in advance — do not skip it.
+
+  </details>
+
+- [ ] `01M2VFX25` (seq 5) Delete archive's decision-marker guard and the whole config surface around it #decisions
+
+  <details><summary>DELETED, not demoted: reportBuriedDecisions, isMarkerShaped, hitDigest,…</summary>
+
+  DELETED, not demoted: reportBuriedDecisions, isMarkerShaped, hitDigest, AllowFor, lineCitesLiveTask, --allow-buried-decisions and --allow-buried-decisions-for with their digest protocol, Config.decision_markers, default_decision_markers, Config.rule_tag, default_decision_tag.
+
+  Why deleting beats demoting to an advisory: design.md's own argument is that a warning inside a bulk archive run scrolls past and what it failed to stop is permanent — an advisory supplies assurance without protection. And the guard's measured behaviour was to block queues for weeks and then be worked around, which is friction, not protection.
+
+  The body scan does not vanish, it MOVES — into migrate-decisions as a one-shot, opt-in, human-reviewed finder (slice 6). That is what makes archaeology acceptable there and not here.
+
+  Accepted residual, stated in design.md rather than buried: someone who writes a prose fork AFTER migration and archives it loses it, with nothing to catch them.
+
+  default_decision_markers[0] is the string 'scott-decision' — the owner's name — so it has to go regardless of this slice's other arguments.
+
+  Delete the tests that assert the guard's behaviour, and check cli_test's allowFor helper and every arm using it.
+
+  </details>
+
+- [ ] `01M2VFX26` (seq 6) trk migrate-decisions --from-tag <tag>: split carriers, report prose forks #decisions
+
+  <details><summary>Modelled on migrate-arcs/migrate-shorts. Re-runnable — which is also…</summary>
+
+  Modelled on migrate-arcs/migrate-shorts. Re-runnable — which is also how lanes forked from a pre-migration base are handled: they keep appending the legacy tag, so the orchestrator re-runs migration after integrating. No default tag; trk ships no name.
+
+  Two jobs, and it NEVER guesses which sentence is the fork:
+
+  1. SPLIT each legacy tagged task. Those tasks are CARRIERS (work and fork in one body), so declaring one a decision would let `rule` close unbuilt work. Mint a decision node per tagged task, wire raises{original, D}, leave the original alone as work, remove the tag. D is a scaffold the human writes the question into — copy no body text, parse none. THIS IS WHAT LETS `rule` BE UNCONDITIONAL (no --keep-open, no behaviour keyed on the target's nature).
+
+  2. SCAN bodies for the legacy markers and REPORT them — the prose forks that were never tagged, which nothing else can find. File nothing from a scan; the operator reads the report and runs `trk decision`.
+
+  Idempotent: a second run finds no tags. A tagged-and-already-declared task is fine (LWW re-declare + untag).
+
+  Config.rule_tag is being deleted in slice 5 — decide whether a repo that set it gets a warning on the orphaned key, since loadConfig ignores unknown keys silently.
+
+  CLI-only, not an MCP tool, with the comment the verb table requires.
+
+  </details>
+
+- [ ] `01M2VFX27` (seq 7) MCP + help-text wiring for the decisions mechanism #decisions
+
+  <details><summary>mcp_test's 'tool specs stay in lockstep' asserts every tool flag…</summary>
+
+  mcp_test's 'tool specs stay in lockstep' asserts every tool flag appears in the verb's help text, positionals are string/choice, and list/int/bool params carry flags. So:
+
+  - verbs entry for `decision`: .mutates = true, .flags listing --from --blocks --in --tag --body, a tools entry with the question as a required positional. buildArgv refuses a dash-leading positional, so a question starting with '-' has to be reworded — same rule as add's title.
+  - `list` gains a --decision param.
+  - `next`'s help loses the --not-tag scott-decision incantation line but must keep --not-tag itself documented. NOTE: that incantation has three terms and this deletes ONE; --not-tag metal --not-tag scott-testing survives, and scott-testing carries the owner's name as much as scott-decision did. Out of scope here, worth filing.
+  - rule_tools' description and rule's help text both name #scott-decision; both go.
+  - migrate-decisions is CLI-only.
+  - show/--json: decision: true, plus raises/raised_by. tree/render need the marker from slice 3.
+
+  </details>
+
+
 ## Arc-less
 
 - [ ] `01M2V2TB9` trk archive has refused for two consecutive sessions and the done queue is 36 deep: the decision-marker guard's false positives are dominated by tasks that quote the markers BECAUSE the markers are their subject -- including the tasks that built the guard #tooling #tracker #scott-decision
@@ -162,6 +298,18 @@
 
 
   === MIGRATED FROM ENIX TRACKER 2026-09-18 (Scott: "move any other trk-related tasks within enix's tracker over to the trk repo"). Original Enix id: 01M16BBSF, which now holds a pointer to this record. Any pre-migration citation of 01M16BBSF in Enix commits, docs or task bodies refers to THIS task.
+
+
+
+  === SUPERSEDED 2026-09-18 by arc 01M2VFTG4 ("Decisions: a fork becomes a declared node"), ruled by Scott and recorded in docs/design.md.
+
+  This task asked how to tune the marker guard's false-positive rate: narrow the refusal to marker-shaped hits, exempt per-task, exempt by tag, or teach it the self-referential shape. All four are remediation of a loss that happens earlier — a fork has no representation in the model, so intent is destroyed at authoring time and the guard is left guessing at it from prose.
+
+  The ruling removes the subject rather than tuning it. A fork becomes a declared node captured at authoring time; archive's guard is DELETED outright (not demoted to an advisory), and the body scan moves into `trk migrate-decisions` as a one-shot, human-reviewed finder for prose forks written before the mechanism existed.
+
+  Two findings from this task's own analysis carried into the ruling: (a) the prose/marker classifier is reporting-only for a reason — `isMarkerShaped` requires the marker be colon-glued to content, so a genuine fork written "FIX NOTE — do X" reads as prose and narrowing the refusal to marker-shaped would bury it silently; (b) `default_decision_markers[0]` is the literal string 'scott-decision', so it had to go regardless.
+
+  Its stated remainder — an Enix binary rollout — no longer applies: this repo builds and installs its own.
 
   </details>
 
