@@ -5450,3 +5450,104 @@ test "trk decision: a decision cannot be leased, submitted, or made an arc" {
     );
     try testing.expect(std.mem.indexOf(u8, f.out.items, "cannot also be an arc") != null);
 }
+
+// ----- decisions in the views (01M2VFV84) -----
+
+test "next excludes decisions AND says what it withheld; both halves, because exclusion alone is a regression" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "the display fix" } });
+
+    try f.run(&.{ "decision", "does TODO.md want the annotation?", "--from", &work.text, "--blocks", &work.text });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+
+    try f.run(&.{"next"});
+    // The question is not offered as work...
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "does TODO.md want") == null);
+    // ...and neither is the work it blocks...
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the display fix") == null);
+    // ...but the frontier does NOT go silently empty. This is the half that
+    // makes the exclusion an improvement rather than a hidden hole: the old
+    // --not-tag convention was opt-in and left the fork visible in a bare next.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 task(s) withheld") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 pending decision(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "list --decision --state open") != null);
+
+    // Ruling it releases the work and the tail goes away — no second command.
+    try f.run(&.{ "rule", &d.text, "RULED: list --arc only" });
+    try f.run(&.{"next"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the display fix") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "withheld") == null);
+    // A RULED decision still never surfaces: exclusion tracks the declaration,
+    // which is nature and survives the ruling.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "does TODO.md want") == null);
+}
+
+test "the withheld tail counts only work blocked SOLELY by decisions, and is silent otherwise" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const also_waiting = mintId();
+    const unfinished = mintId();
+    try f.store.append(.{ .add = .{ .id = also_waiting, .title = "waits on both" } });
+    try f.store.append(.{ .add = .{ .id = unfinished, .title = "ordinary unfinished work" } });
+    try f.store.append(.{ .dep = .{ .from = also_waiting, .to = unfinished } });
+
+    try f.run(&.{ "decision", "a fork", "--blocks", &also_waiting.text });
+
+    try f.run(&.{"next"});
+    // `also_waiting` is blocked by BOTH a decision and unfinished work, so
+    // ruling the fork would not release it — claiming it as withheld-by-decision
+    // would overstate what a ruling buys.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "withheld") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "ordinary unfinished work") != null);
+
+    // And with no decisions in play at all the tail never appears.
+    var g = try Fixture.init(alloc);
+    defer g.deinit();
+    const plain = mintId();
+    try g.store.append(.{ .add = .{ .id = plain, .title = "just work" } });
+    try g.run(&.{"next"});
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "withheld") == null);
+}
+
+test "a decision reads as [?] in list, tree and TODO.md — never as an ordinary work bullet" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const arc = mintId();
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Ship v2" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = work, .title = "the display fix" } });
+    try f.store.append(.{ .in = .{ .task = work, .arc = arc, .seq = 1 } });
+
+    // No --in: this decision reaches the arc purely by needs-REACHABILITY
+    // (membersOf closes over needs), which is exactly the path that would have
+    // put a question into TODO.md looking like a slice.
+    try f.run(&.{ "decision", "does TODO.md want the annotation?", "--from", &work.text, "--blocks", &work.text });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+
+    try f.run(&.{"list"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[?] ") != null);
+
+    try f.run(&.{ "tree", &arc.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[?]") != null);
+
+    try f.run(&.{ "render", "--out", "TODO.md" });
+    const md = try f.tmp.dir.readFileAlloc(io, "TODO.md", alloc, .unlimited);
+    defer alloc.free(md);
+    // It IS in the projection (reachability put it there) — the point is that
+    // it does not read as buildable work.
+    try testing.expect(std.mem.indexOf(u8, md, "does TODO.md want") != null);
+    try testing.expect(std.mem.indexOf(u8, md, "[?]") != null);
+
+    // Once ruled it is `done` and reads like anything else finished: the marker
+    // tracks "awaiting a call", not the declaration.
+    try f.run(&.{ "rule", &d.text, "RULED: no" });
+    try f.run(&.{ "list", "--state", "done" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[?]") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "[x]") != null);
+}

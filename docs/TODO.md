@@ -22,23 +22,6 @@ SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-po
 </details>
 
 
-- [ ] `01M2VFV84` (seq 3) Views: next excludes decisions, and says what it withheld; render/tree mark them #decisions
-
-  <details><summary>`Store.next`: skip declared decisions, the way standing arcs are…</summary>
-
-  `Store.next`: skip declared decisions, the way standing arcs are skipped.
-
-  WITHOUT THE REST OF THIS SLICE THAT IS A REGRESSION, not a fix: a decision excluded from next while blocking work via dep makes the frontier go empty with nothing explaining why. The old --not-tag was at least opt-in and the tagged task still appeared in a bare next.
-
-  - next tail: "N ready task(s) withheld: they wait on M pending decision(s); trk list --decision", in the shape list --arc's compacted-members tail uses (01M2V2TSA). That ruling declined a tail for next because a graduated member is never an answer to "what can I work on" — a PENDING DECISION is the answer to "why is nothing ready", so it does not apply.
-  - --json gets no footer (an array has nowhere to put one) and no rows (that would contradict the exclusion): machine readers use list --decision. Say so in help.
-  - render + tree: membersOf closes over needs, so a --blocks decision joins the raiser's arc by REACHABILITY and would render as an ordinary [ ] bullet — a question indistinguishable from a slice, in the projection whose contract is not-yet-built work. Needs a distinct marker or grouping in both.
-  - cmdAdd's arcless warning will fire for every decision filed without --in; decide and handle.
-
-  Test both directions: an arc with a pending decision must read differently from one without, in next, render and tree.
-
-  </details>
-
 - [ ] `01M2VFW5F` (seq 4) Compaction + tombstones: the silent-loss slice #decisions
 
   <details><summary>Every item here fails SILENTLY if skipped. Lands with the mechanism,…</summary>

@@ -699,8 +699,15 @@ pub const Cli = struct {
         \\  Bare <term>s (or --word <term>; repeatable, ANDed) are a case-insensitive
         \\  substring search over title+body+tags. --not-tag <t> (repeatable, ANDed
         \\  exclusion) drops any task carrying that tag — the autonomous-eligible
-        \\  bucket (no blocker tag) is one bare command:
-        \\    trk next --not-tag metal --not-tag scott-testing --not-tag scott-decision
+        \\  bucket is then one bare command:
+        \\    trk next --not-tag metal --not-tag scott-testing
+        \\  DECISIONS are excluded structurally, not by tag: a fork is a question, not
+        \\  buildable work, so it never enters the frontier and no --not-tag term is
+        \\  needed for it. When work is held back waiting on an unruled fork, a tail
+        \\  line says how much and points at `trk list --decision --state open` — the
+        \\  exclusion would otherwise make `next` go empty with no explanation.
+        \\  --json carries no such tail (an array has nowhere to put one) and no
+        \\  decision rows: ask `trk list --decision --state open` instead.
         \\  --json emits a machine-readable array, one object per task, carrying the
         \\  full BODY as well as id/short/title/state/priority/seq?/tags — the whole
         \\  frontier is then triageable in one call, markers and all, with no
@@ -3454,10 +3461,54 @@ pub const Cli = struct {
             shown += 1;
         }
         if (json) {
+            // No footer and no rows: an array has nowhere to put a tail, and
+            // adding decision rows would contradict the exclusion that just
+            // kept them out. A machine reader asks `list --decision --state
+            // open` instead — said in `next --help`, not left to be discovered.
             try self.write("]\n");
-        } else if (shown == 0) {
-            try self.write("(nothing ready)\n");
+            return;
         }
+        if (shown == 0) try self.write("(nothing ready)\n");
+        try self.withheldByDecisionsTail();
+    }
+
+    /// Say what `next` withheld because it is waiting on an unruled fork
+    /// (01M2VFV84).
+    ///
+    /// Without this, excluding decisions from the frontier is a REGRESSION
+    /// dressed as a fix: a decision that blocks work makes `next` print
+    /// `(nothing ready)` with nothing explaining why, where the old
+    /// `--not-tag <tag>` convention was at least opt-in and left the fork
+    /// visible in a bare `next`.
+    ///
+    /// The `list --arc` compacted-members tail (01M2V2TSA) declined to give
+    /// `next` a tail of its own, on the grounds that a graduated member is never
+    /// an answer to "what can I work on". That reasoning does not reach here: a
+    /// PENDING DECISION is precisely the answer to "why is nothing ready".
+    fn withheldByDecisionsTail(self: *Cli) Error!void {
+        var n_decisions: usize = 0;
+        const withheld = try self.store.blockedOnDecisions(self.gpa, &n_decisions);
+        defer self.gpa.free(withheld);
+        if (withheld.len == 0) return;
+        try self.print(
+            "\n  {d} task(s) withheld: waiting on {d} pending decision(s).\n" ++
+                "  `trk list --decision --state open` to see them; `trk rule <id> \"<the ruling>\"` releases the work.\n",
+            .{ withheld.len, n_decisions },
+        );
+    }
+
+    /// `stateMarker`, except a DECISION gets `[?]` (01M2VFV84).
+    ///
+    /// `membersOf` closes over `needs`, so a decision filed `--blocks T` joins
+    /// T's arc by reachability and lands in `render`'s TODO.md and in `tree`
+    /// under T. Without a distinct marker it renders as an ordinary `[ ]`
+    /// bullet — a question indistinguishable from a slice, in the projection
+    /// whose entire contract is not-yet-built WORK. `[?]` only while it is still
+    /// open: a ruled decision is `done` and reads `[x]` like anything else, so
+    /// the marker tracks "awaiting a call", not the declaration.
+    fn markerFor(self: *Cli, id: Ulid, st: State) []const u8 {
+        if (st == .open and self.store.isDecision(id)) return "[?]";
+        return stateMarker(st);
     }
 
     /// `<short-id>  [<arc-seq>/<prio>]  <title>` — `next`/`list` one-liner.
@@ -3653,7 +3704,7 @@ pub const Cli = struct {
     fn printListLine(self: *Cli, id: Ulid) !void {
         const t = self.store.get(id).?;
         var sb: [ulid.len]u8 = undefined;
-        try self.print("{s} {s}  {s}", .{ stateMarker(t.state), try self.shortId(id, &sb), t.title });
+        try self.print("{s} {s}  {s}", .{ self.markerFor(id, t.state), try self.shortId(id, &sb), t.title });
         for (t.tags.items) |tg| try self.print("  #{s}", .{tg});
         if (t.holder) |h| {
             var tb: [32]u8 = undefined;
@@ -3836,7 +3887,7 @@ pub const Cli = struct {
         const t = self.store.get(id).?;
         var sb: [ulid.len]u8 = undefined;
         const sid = try self.shortId(id, &sb);
-        const checkbox = stateCheckbox(t.state);
+        const checkbox = self.markerFor(id, t.state);
         const seq = self.seqFor(id, arc);
         switch (listing) {
             .plain => try buf.print(gpa, "- {s} `{s}`", .{ checkbox, sid }),
@@ -4105,7 +4156,7 @@ pub const Cli = struct {
         const rt = self.store.get(root).?;
         var rsb: [ulid.len]u8 = undefined;
         const rsid = try self.shortId(root, &rsb);
-        try buf.print(gpa, "{s} {s} {s}\n", .{ stateMarker(rt.state), rsid, rt.title });
+        try buf.print(gpa, "{s} {s} {s}\n", .{ self.markerFor(root, rt.state), rsid, rt.title });
         try visited.put(gpa, root.text, {});
 
         // Children = arc members (direct `in root`) ++ direct prereqs of root.
@@ -4274,7 +4325,7 @@ pub const Cli = struct {
         const connector = if (last) "└─ " else "├─ ";
 
         const already = visited.contains(id.text);
-        try buf.print(gpa, "{s}{s}{s} {s} {s}", .{ prefix.items, connector, stateMarker(t.state), sid, t.title });
+        try buf.print(gpa, "{s}{s}{s} {s} {s}", .{ prefix.items, connector, self.markerFor(id, t.state), sid, t.title });
         if (already) {
             try buf.print(gpa, " (\u{2191} seen)\n", .{}); // ↑ seen — do not re-expand
             return;
@@ -5953,11 +6004,6 @@ fn stateMarker(s: State) []const u8 {
         .claimed => "[c]",
         .submitted => "[s]",
     };
-}
-
-/// Same set, used in the markdown bullet (kept identical for consistency).
-fn stateCheckbox(s: State) []const u8 {
-    return stateMarker(s);
 }
 
 /// Sort children of a tree root by (arc-seq under that root, id) for a stable,

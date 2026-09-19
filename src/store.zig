@@ -3022,6 +3022,54 @@ pub const Store = struct {
         return self.standing_arcs.contains(key(id));
     }
 
+    /// Tasks that are ready in every respect EXCEPT that they wait on at least
+    /// one still-open decision, paired with how many distinct such decisions are
+    /// pending across them (01M2VFV84).
+    ///
+    /// This is what stops `next`'s decision exclusion from being a silent hole.
+    /// The old tag convention was opt-in (`--not-tag`), and a tagged fork still
+    /// appeared in a bare `next`; excluding structurally is strictly better only
+    /// if the frontier says what it withheld. Caller owns the slice.
+    pub fn blockedOnDecisions(self: *Store, alloc: std.mem.Allocator, n_decisions: *usize) ![]Ulid {
+        var out: std.ArrayList(Ulid) = .empty;
+        errdefer out.deinit(alloc);
+        var seen_decisions = std.AutoHashMapUnmanaged(Key, void){};
+        defer seen_decisions.deinit(self.gpa);
+
+        var it = self.tasks.iterator();
+        while (it.next()) |entry| {
+            const t = entry.value_ptr.*;
+            if (!t.state.isEligible()) continue;
+            if (self.isDecision(t.id)) continue;
+            if (self.isArc(t.id) and (self.isStanding(t.id) or !self.arcDrained(t.id))) continue;
+
+            // Only tasks whose ONLY unmet prereqs are open decisions: a task
+            // also waiting on ordinary unfinished work is not withheld BY the
+            // decision, and saying so would overstate what a ruling releases.
+            var blocked_by_decision = false;
+            var blocked_by_other = false;
+            for (self.needs.items) |e| {
+                if (!e.from.eql(t.id)) continue;
+                const pre = self.tasks.get(key(e.to)) orelse {
+                    blocked_by_other = true;
+                    continue;
+                };
+                if (pre.state.satisfiesPrereq()) continue;
+                if (self.isDecision(e.to)) {
+                    blocked_by_decision = true;
+                    try seen_decisions.put(self.gpa, key(e.to), {});
+                } else {
+                    blocked_by_other = true;
+                }
+            }
+            if (blocked_by_decision and !blocked_by_other) try out.append(alloc, t.id);
+        }
+        n_decisions.* = seen_decisions.count();
+        const slice = try out.toOwnedSlice(alloc);
+        std.sort.pdq(Ulid, slice, {}, Ulid.lessThan);
+        return slice;
+    }
+
     /// Is `id` a declared DECISION — a fork awaiting a ruling?
     ///
     /// True for a RULED decision too: declaration is nature, not lifecycle, the
@@ -3199,6 +3247,18 @@ pub const Store = struct {
         while (it.next()) |entry| {
             const t = entry.value_ptr.*;
             if (!t.state.isEligible()) continue; // only `open` is eligible
+
+            // A DECISION is a question, not buildable work, so it never enters
+            // the ready frontier — the structural replacement for the
+            // `--not-tag <decision-tag>` incantation callers used to have to
+            // remember (01M2VFV84). Excluded regardless of state, exactly like a
+            // standing arc: a ruled decision must not surface either.
+            //
+            // Exclusion alone would be a REGRESSION, not a fix: a decision that
+            // blocks work via `needs` would make the frontier go empty with
+            // nothing explaining why. `Cli.cmdNext` therefore reports what was
+            // withheld and why — see `pendingDecisionsBlocking`.
+            if (self.isDecision(t.id)) continue;
 
             if (self.isArc(t.id)) {
                 // A standing arc (a perpetual category, not a completable goal)
