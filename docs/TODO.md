@@ -22,24 +22,6 @@ SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-po
 </details>
 
 
-- [ ] `01M2VFX25` (seq 5) Delete archive's decision-marker guard and the whole config surface around it #decisions
-
-  <details><summary>DELETED, not demoted: reportBuriedDecisions, isMarkerShaped, hitDigest,…</summary>
-
-  DELETED, not demoted: reportBuriedDecisions, isMarkerShaped, hitDigest, AllowFor, lineCitesLiveTask, --allow-buried-decisions and --allow-buried-decisions-for with their digest protocol, Config.decision_markers, default_decision_markers, Config.rule_tag, default_decision_tag.
-
-  Why deleting beats demoting to an advisory: design.md's own argument is that a warning inside a bulk archive run scrolls past and what it failed to stop is permanent — an advisory supplies assurance without protection. And the guard's measured behaviour was to block queues for weeks and then be worked around, which is friction, not protection.
-
-  The body scan does not vanish, it MOVES — into migrate-decisions as a one-shot, opt-in, human-reviewed finder (slice 6). That is what makes archaeology acceptable there and not here.
-
-  Accepted residual, stated in design.md rather than buried: someone who writes a prose fork AFTER migration and archives it loses it, with nothing to catch them.
-
-  default_decision_markers[0] is the string 'scott-decision' — the owner's name — so it has to go regardless of this slice's other arguments.
-
-  Delete the tests that assert the guard's behaviour, and check cli_test's allowFor helper and every arm using it.
-
-  </details>
-
 - [ ] `01M2VFX26` (seq 6) trk migrate-decisions --from-tag <tag>: split carriers, report prose forks #decisions
 
   <details><summary>Modelled on migrate-arcs/migrate-shorts. Re-runnable — which is also…</summary>
