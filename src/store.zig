@@ -323,9 +323,21 @@ pub const Tombstone = struct {
     /// `"unknown"` for a record recovered from history that carried no
     /// `setState` (see `Cli.cmdTombstones`'s rebuild).
     reason: []const u8 = "unknown",
-    /// The arcs it was a member of when it was collected. Empty for a recovered
-    /// record — a history scan reconstructs tasks, not edges.
+    /// The arcs it was a member of when it was collected.
     arcs: []const Ulid = &.{},
+    /// The DECISIONS this task had raised when it was collected (01M2VFW5F).
+    ///
+    /// On the TASK side, not the decision side, and that direction is the whole
+    /// point: the case that loses information is a raiser archived+compacted
+    /// while the decision it raised is still LIVE. `serializeState` drops every
+    /// edge with a collected endpoint (a surviving edge to a collected id would
+    /// re-materialize it as a ghost on the next load), so without this the live
+    /// decision silently loses its provenance. `show <decision>` then finds its
+    /// raisers by the same reverse lookup `compactedMembers` does for arcs.
+    /// A record on the decision's own side would only help once the decision
+    /// itself was collected — by which time it is ruled and the provenance is
+    /// archaeology.
+    raised: []const Ulid = &.{},
     /// When `compact` collected it (ms epoch); `0` = unknown (recovered).
     ts: i64 = 0,
     /// `"compact"` — written at the moment of collection — or `"git-history"`,
@@ -1037,6 +1049,20 @@ pub const Store = struct {
             },
             else => {},
         };
+        // Absent on every record written before `raised` existed — decoded as
+        // empty, exactly like `arcs` on a pre-index record, so an old file
+        // still loads.
+        if (root.get("raised")) |v| switch (v) {
+            .array => |arr| {
+                var raised: std.ArrayList(Ulid) = .empty;
+                for (arr.items) |el| switch (el) {
+                    .string => |str| try raised.append(self.a(), ulid.parse(str) catch continue),
+                    else => {},
+                };
+                t.raised = raised.items;
+            },
+            else => {},
+        };
         return t;
     }
 
@@ -1095,6 +1121,24 @@ pub const Store = struct {
         return out.toOwnedSlice(gpa);
     }
 
+    /// Every COMPACTED task that had raised `decision` — the reverse lookup the
+    /// task-side `Tombstone.raised` field exists for (01M2VFW5F). Exactly the
+    /// shape `compactedMembers` uses for arcs, and for the same reason: a
+    /// compacted raiser's `raises` edge is gone from the live graph, so a still-
+    /// live decision can only recover its provenance from the entombed side.
+    pub fn compactedRaisers(self: *const Store, gpa: std.mem.Allocator, decision: Ulid) ![]const *const Tombstone {
+        var out: std.ArrayList(*const Tombstone) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.tombstones.items) |*t| {
+            for (t.raised) |d| {
+                if (!d.eql(decision)) continue;
+                try out.append(gpa, t);
+                break;
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
     /// Case-insensitive "is `pfx` a prefix of `text`" (ids are upper-case
     /// canonical Crockford). Same rule as `Cli.prefixMatches`; duplicated here
     /// rather than shared because the store must not depend on the CLI.
@@ -1122,6 +1166,13 @@ pub const Store = struct {
             if (i != 0) try buf.append(self.gpa, ',');
             try buf.append(self.gpa, '"');
             try buf.appendSlice(self.gpa, &arc.text);
+            try buf.append(self.gpa, '"');
+        }
+        try buf.appendSlice(self.gpa, "],\"raised\":[");
+        for (t.raised, 0..) |d, i| {
+            if (i != 0) try buf.append(self.gpa, ',');
+            try buf.append(self.gpa, '"');
+            try buf.appendSlice(self.gpa, &d.text);
             try buf.append(self.gpa, '"');
         }
         try buf.appendSlice(self.gpa, "],\"src\":");
@@ -1199,7 +1250,14 @@ pub const Store = struct {
         const old_recovered = std.mem.eql(u8, old.src, "git-history");
         if (!old_recovered) return false;
         if (std.mem.eql(u8, new.src, "compact")) return true;
-        return old.arcs.len == 0 and new.arcs.len > 0;
+        if (old.arcs.len == 0 and new.arcs.len > 0) return true;
+        // Third case, added with `raised` (01M2VFW5F) and for the same reason
+        // the second one exists: `--rebuild` is idempotent by id, so without it
+        // a record written by an earlier reconstruction would stay
+        // provenance-less forever and the fix would only ever reach stores that
+        // had never been rebuilt. That was the 01M2V2TYC lesson; applying it in
+        // advance this time.
+        return old.raised.len == 0 and new.raised.len > 0;
     }
 
     /// After the WHOLE fold: every node that never received an `add` is a ghost
@@ -1953,10 +2011,15 @@ pub const Store = struct {
             for (self.ins.items) |e| {
                 if (e.task.eql(id)) try arcs.append(self.a(), e.arc);
             }
+            var raised: std.ArrayList(Ulid) = .empty;
+            for (self.raises_edges.items) |e| {
+                if (e.task.eql(id)) try raised.append(self.a(), e.decision);
+            }
             try rows.append(alloc, .{
                 .id = id,
                 .short = t.short,
                 .title = t.title,
+                .raised = raised.items,
                 // A ghost's `open` is `ensureNode`'s default, not a
                 // judgment — classify it as what it is, never as its state.
                 .reason = if (!t.has_add) "ghost" else t.state.toString(),

@@ -4717,6 +4717,53 @@ pub const Cli = struct {
             }
         }
 
+        // Decisions: what this task raised, or — if it IS one — who raised it.
+        // Only printed when there is something to say, so an ordinary task's
+        // `show` is unchanged.
+        if (self.store.isDecision(id)) {
+            try self.write("\nDECISION — a fork awaiting a ruling");
+            if (t.state.satisfiesPrereq()) try self.print(" (ruled: {s})", .{t.state.toString()});
+            try self.write("\n");
+            const raisers = try self.store.raisersOf(self.gpa, id);
+            defer self.gpa.free(raisers);
+            const gone = try self.store.compactedRaisers(self.gpa, id);
+            defer self.gpa.free(gone);
+            if (raisers.len == 0 and gone.len == 0) {
+                try self.write("  raised by: (not recorded)\n");
+            } else {
+                try self.write("  raised by:\n");
+                for (raisers) |r| {
+                    var rb: [ulid.len]u8 = undefined;
+                    try self.print("    {s}  {s}\n", .{ try self.shortId(r, &rb), self.store.get(r).?.title });
+                }
+                // A raiser that has since been compacted still answers, from
+                // the task-side `raised` field on its tombstone — the reason
+                // that field is on the task side at all.
+                for (gone) |tb| try self.print("    compacted: {s}  {s}\n", .{
+                    tb.short orelse &tb.id.text,
+                    if (tb.title.len != 0) tb.title else "(title not recorded)",
+                });
+            }
+            if (!t.state.satisfiesPrereq())
+            {
+                var idb: [ulid.len]u8 = undefined;
+                try self.print("  resolve with: trk rule {s} \"<the ruling>\"\n", .{try self.shortId(id, &idb)});
+            }
+        } else {
+            const raised = try self.store.raisedBy(self.gpa, id);
+            defer self.gpa.free(raised);
+            if (raised.len != 0) {
+                try self.write("\ndecisions raised by this task:\n");
+                for (raised) |d| {
+                    var db: [ulid.len]u8 = undefined;
+                    const dt = self.store.get(d).?;
+                    try self.print("  {s} {s}  {s}\n", .{
+                        self.markerFor(d, dt.state), try self.shortId(d, &db), dt.title,
+                    });
+                }
+            }
+        }
+
         // Doc-refs
         try self.write("\ndoc-refs:\n");
         if (t.docrefs.items.len == 0) {
@@ -4740,6 +4787,10 @@ pub const Cli = struct {
         try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"title\":", .{ &id.text, try self.shortId(id, &sb) });
         try self.writeJsonString(t.title);
         try self.print(",\"state\":\"{s}\",\"priority\":{d}", .{ t.state.toString(), t.priority });
+        // `decision` only when true, matching how `compacted` marks a tombstone:
+        // a machine reader branches on a key rather than on the absence of one,
+        // and an ordinary task's object is unchanged.
+        if (self.store.isDecision(id)) try self.write(",\"decision\":true");
         if (t.holder) |h| {
             try self.write(",\"holder\":");
             try self.writeJsonString(h);
@@ -4752,6 +4803,39 @@ pub const Cli = struct {
         }
         try self.write("],\"body\":");
         try self.writeJsonString(t.body);
+
+        // Provenance, both directions, always present so a consumer indexes
+        // without a guard: `raises` on a task, `raised_by` on a decision.
+        try self.write(",\"raises\":[");
+        {
+            const raised = try self.store.raisedBy(self.gpa, id);
+            defer self.gpa.free(raised);
+            for (raised, 0..) |d, n| {
+                if (n != 0) try self.write(",");
+                try self.print("\"{s}\"", .{&d.text});
+            }
+        }
+        try self.write("],\"raised_by\":[");
+        {
+            const raisers = try self.store.raisersOf(self.gpa, id);
+            defer self.gpa.free(raisers);
+            var n: usize = 0;
+            for (raisers) |r| {
+                if (n != 0) try self.write(",");
+                n += 1;
+                try self.print("\"{s}\"", .{&r.text});
+            }
+            // A raiser that has since been compacted still answers, from the
+            // task-side `raised` on its tombstone.
+            const gone = try self.store.compactedRaisers(self.gpa, id);
+            defer self.gpa.free(gone);
+            for (gone) |tb| {
+                if (n != 0) try self.write(",");
+                n += 1;
+                try self.print("\"{s}\"", .{&tb.id.text});
+            }
+        }
+        try self.write("]");
 
         try self.write(",\"prereqs\":[");
         {
@@ -5548,6 +5632,10 @@ pub const Cli = struct {
         /// `in`/`unin` events in the same history (01M2V2TYC). Allocated out of
         /// the caller's `ra` arena, like `title`/`short`.
         arcs: std.ArrayListUnmanaged(Ulid) = .empty,
+        /// The decisions this id raised, reconstructed from the `raises`/
+        /// `unraises` events in the same history by the identical
+        /// surviving-pair rule (01M2VFW5F).
+        raised: std.ArrayListUnmanaged(Ulid) = .empty,
     };
 
     /// Replay `.tracker/log.jsonl`'s FULL git history (`git log --all -p`) —
@@ -5644,6 +5732,13 @@ pub const Cli = struct {
         defer in_pairs.deinit(self.gpa);
         var unin_pairs = std.AutoHashMapUnmanaged(Pair, void){};
         defer unin_pairs.deinit(self.gpa);
+        // `raises`/`unraises` follow the IDENTICAL rule, for the identical
+        // reason: `unraises` is a permanent fold tombstone for the pair, so a
+        // later `raises` is blocked regardless of append order (01M2VFW5F).
+        var raises_pairs = std.AutoHashMapUnmanaged(Pair, void){};
+        defer raises_pairs.deinit(self.gpa);
+        var unraises_pairs = std.AutoHashMapUnmanaged(Pair, void){};
+        defer unraises_pairs.deinit(self.gpa);
 
         var lines = std.mem.splitScalar(u8, result.stdout, '\n');
         while (lines.next()) |raw| {
@@ -5696,6 +5791,8 @@ pub const Cli = struct {
                 },
                 .in => |x| try in_pairs.put(self.gpa, pairKey(x.task, x.arc), {}),
                 .unin => |x| try unin_pairs.put(self.gpa, pairKey(x.task, x.arc), {}),
+                .raises => |x| try raises_pairs.put(self.gpa, pairKey(x.task, x.decision), {}),
+                .unraises => |x| try unraises_pairs.put(self.gpa, pairKey(x.task, x.decision), {}),
                 else => {},
             }
         }
@@ -5710,10 +5807,25 @@ pub const Cli = struct {
             if (!gop.found_existing) gop.value_ptr.* = .{};
             try gop.value_ptr.arcs.append(ra, .{ .text = arc });
         }
+        // Every surviving `raises` becomes a `raised` entry on its RAISER's
+        // record — the task side, matching where the tombstone keeps it.
+        var qit = raises_pairs.keyIterator();
+        while (qit.next()) |pk| {
+            if (unraises_pairs.contains(pk.*)) continue;
+            const task: [ulid.len]u8 = pk[0..ulid.len].*;
+            const decision: [ulid.len]u8 = pk[ulid.len..][0..ulid.len].*;
+            const gop = try recs.getOrPut(self.gpa, task);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.raised.append(ra, .{ .text = decision });
+        }
+
         // Sorted, because hash-map iteration order would otherwise make the
         // rebuilt file differ run to run for no reason — and it is committed.
         var rit = recs.valueIterator();
-        while (rit.next()) |rec| std.sort.pdq(Ulid, rec.arcs.items, {}, Ulid.lessThan);
+        while (rit.next()) |rec| {
+            std.sort.pdq(Ulid, rec.arcs.items, {}, Ulid.lessThan);
+            std.sort.pdq(Ulid, rec.raised.items, {}, Ulid.lessThan);
+        }
 
         return recs;
     }
@@ -5758,6 +5870,7 @@ pub const Cli = struct {
                 .title = e.value_ptr.title,
                 .reason = e.value_ptr.reason,
                 .arcs = e.value_ptr.arcs.items,
+                .raised = e.value_ptr.raised.items,
                 .ts = 0,
                 .src = "git-history",
             });

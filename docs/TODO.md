@@ -22,27 +22,6 @@ SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-po
 </details>
 
 
-- [ ] `01M2VFW5F` (seq 4) Compaction + tombstones: the silent-loss slice #decisions
-
-  <details><summary>Every item here fails SILENTLY if skipped. Lands with the mechanism,…</summary>
-
-  Every item here fails SILENTLY if skipped. Lands with the mechanism, not after.
-
-  - serializeState: emit decisionDeclare{true} for live declared ids (as it does arcDeclare); emit raises edges skipping gc_set endpoints.
-  - taskFingerprint: include the declaration bit and the task's owned raises edges. WITHOUT THIS a compact that silently drops them PASSES the round-trip verify — exactly the class 01M0YESW6 exists to catch.
-  - Tombstone carries `raised` on the TASK side (T's record lists the decisions T raised), NOT on the decision side. The case that matters is T archived+compacted while D is still live: serializeState drops every edge with a collected endpoint, so D loses its provenance unless T's tombstone holds it. `show D` then does the reverse lookup compactedMembers already does for arcs.
-  - collectableRows records it at collection time, mirroring arcs.
-  - tombstones --rebuild: reconstruct raises by the same surviving-pair rule used for in/unin (live iff some raises exists and no unraises does, anywhere in history).
-  - `supersedes` gains a third case, "gained raises it had none of", or the upgrade never reaches an already-rebuilt store. That is the 01M2V2TYC lesson applied in advance — do not skip it.
-
-
-
-  SCOPE NOTE 2026-09-18: slice 1 already landed the serializeState emission (decisionDeclare + raises, skipping gc_set endpoints) and the taskFingerprint additions, because leaving them to a later slice would mean an installable binary whose compact silently drops decisions — the exact loss class this slice is named for. Verified by removing the emission and watching compact REFUSE itself with CompactVerifyFailed rather than losing the data.
-
-  WHAT REMAINS HERE: the tombstone half only — `raised` on the TASK side of the record, collectableRows recording it at collection time, tombstones --rebuild reconstructing raises/unraises by the surviving-pair rule, and supersedes' third case.
-
-  </details>
-
 - [ ] `01M2VFX25` (seq 5) Delete archive's decision-marker guard and the whole config surface around it #decisions
 
   <details><summary>DELETED, not demoted: reportBuriedDecisions, isMarkerShaped, hitDigest,…</summary>

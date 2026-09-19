@@ -5551,3 +5551,122 @@ test "a decision reads as [?] in list, tree and TODO.md — never as an ordinary
     try testing.expect(std.mem.indexOf(u8, f.out.items, "[?]") == null);
     try testing.expect(std.mem.indexOf(u8, f.out.items, "[x]") != null);
 }
+
+// ----- decisions survive compaction (01M2VFW5F) -----
+
+test "a compacted RAISER's provenance survives on the task side, and a live decision can still find it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The case the task-side `raised` field exists for: the raiser graduates
+    // and is collected while the decision it raised is STILL LIVE.
+    // `serializeState` drops every edge with a collected endpoint, so without
+    // the tombstone recording it on the raiser's own record, the surviving
+    // decision silently loses all trace of where it came from.
+    const raiser = mintId();
+    try f.store.append(.{ .add = .{ .id = raiser, .title = "the display fix", .short = raiser.text[0..9] } });
+    try f.run(&.{ "decision", "does TODO.md want the annotation?", "--from", &raiser.text });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+
+    try f.store.append(.{ .setState = .{ .id = raiser, .state = .archived } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // The raiser is gone from the live graph...
+    try testing.expect(f.store.get(raiser) == null);
+    // ...the decision is still live, and still knows who asked.
+    try testing.expect(f.store.get(d) != null);
+    const live_raisers = try f.store.raisersOf(alloc, d);
+    defer alloc.free(live_raisers);
+    try testing.expectEqual(@as(usize, 0), live_raisers.len); // the edge died with the raiser
+    const gone = try f.store.compactedRaisers(alloc, d);
+    defer alloc.free(gone);
+    try testing.expectEqual(@as(usize, 1), gone.len);
+    try testing.expect(gone[0].id.eql(raiser));
+
+    try f.run(&.{ "show", &d.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "DECISION") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted:") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the display fix") != null);
+
+    try f.run(&.{ "show", &d.text, "--json" });
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("decision").?.bool);
+    try testing.expectEqual(@as(usize, 1), parsed.value.object.get("raised_by").?.array.items.len);
+}
+
+test "tombstones --rebuild recovers `raised` too, and UPGRADES a record written without it (01M2VFW5F)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const raiser = mintId();
+    const retracted = mintId();
+    try f.store.append(.{ .add = .{ .id = raiser, .title = "the raiser", .short = raiser.text[0..9] } });
+    try f.run(&.{ "decision", "a live fork", "--from", &raiser.text });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+    // A provenance edge that was RETRACTED: `unraises` is a permanent tombstone
+    // for the pair, so the reconstruction must not resurrect it just because a
+    // `raises` exists somewhere in history — the same rule as `in`/`unin`.
+    try f.store.append(.{ .add = .{ .id = retracted, .title = "mis-attributed" } });
+    try f.store.append(.{ .raises = .{ .task = retracted, .decision = d } });
+    try f.store.append(.{ .unraises = .{ .task = retracted, .decision = d } });
+    try f.store.append(.{ .setState = .{ .id = raiser, .state = .archived } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "before the compact" });
+
+    try f.run(&.{"compact"});
+    // Reproduce a record written by a reconstruction that predates `raised`, by
+    // blanking the field the real one just wrote.
+    {
+        const bytes = try f.tmp.dir.readFileAlloc(io, ".tracker/tombstones.jsonl", alloc, .unlimited);
+        defer alloc.free(bytes);
+        var stale: std.ArrayList(u8) = .empty;
+        defer stale.deinit(alloc);
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const open_at = std.mem.indexOf(u8, line, "\"raised\":[").?;
+            const close_at = std.mem.indexOfScalarPos(u8, line, open_at, ']').?;
+            try stale.appendSlice(alloc, line[0 .. open_at + "\"raised\":[".len]);
+            try stale.appendSlice(alloc, line[close_at..]);
+            // src=compact would be authoritative and never upgraded; the state
+            // being repaired is a git-history reconstruction.
+            const out = try std.mem.replaceOwned(u8, alloc, stale.items, "\"src\":\"compact\"", "\"src\":\"git-history\"");
+            defer alloc.free(out);
+            stale.clearRetainingCapacity();
+            try stale.appendSlice(alloc, out);
+            try stale.append(alloc, '\n');
+        }
+        try f.tmp.dir.writeFile(io, .{ .sub_path = ".tracker/tombstones.jsonl", .data = stale.items, .flags = .{} });
+    }
+    try f.reopen();
+
+    // RED baseline: the record exists, the provenance does not.
+    const before = try f.store.compactedRaisers(alloc, d);
+    defer alloc.free(before);
+    try testing.expectEqual(@as(usize, 0), before.len);
+
+    // The rebuild repairs it in place instead of skipping it by id.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 existing record(s) upgraded") != null);
+    const after = try f.store.compactedRaisers(alloc, d);
+    defer alloc.free(after);
+    try testing.expectEqual(@as(usize, 1), after.len);
+    try testing.expect(after[0].id.eql(raiser));
+
+    // The retracted edge was NOT resurrected.
+    for (f.store.tombstones.items) |tb| {
+        if (tb.id.eql(retracted)) try testing.expectEqual(@as(usize, 0), tb.raised.len);
+    }
+
+    // And it settles: nothing left to improve.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "0 existing record(s) upgraded") != null);
+}
