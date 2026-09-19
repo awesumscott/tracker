@@ -624,6 +624,27 @@ pub const Cli = struct {
         \\  e.g.  trk decision "does TODO.md want the annotation?" --from 01M2V2TSA --blocks 01M2V2TSA
         \\        trk decision "should trk support multi-user?"
         },
+        .{ .name = "migrate-decisions", .run = &cmdMigrateDecisions, .mutates = true, .tools = &cli_only_tools, .flags = &.{ "--from-tag", "--dry-run" }, .text =
+        \\trk migrate-decisions --from-tag <tag> [--dry-run]
+        \\  One-shot migration off a legacy decision CONVENTION (a tag plus forks
+        \\  written in prose) onto the mechanism. No default tag: the convention is
+        \\  your repo's, not trk's.
+        \\  SPLITS each task carrying <tag>. Those are CARRIERS — work and fork in one
+        \\  body — so declaring one a decision outright would let `rule` close unbuilt
+        \\  work. Instead it mints a decision node, wires `raises` back to the
+        \\  original, leaves the original as work, and strips the tag. The decision is
+        \\  a SCAFFOLD: no body text is copied or parsed, because only you know which
+        \\  sentence is the fork. Retitle it, then wire what waits on it with `trk dep`.
+        \\  REPORTS prose forks: body lines matching the legacy markers (OPEN QUESTION,
+        \\  FIX NOTE, your call, TODO, plus <tag> itself) on tasks with no tag. It
+        \\  files NOTHING from that scan. This is the only body scan left in trk, and
+        \\  the only one there will be — `archive` no longer scans at all, so nothing
+        \\  else will ever find these.
+        \\  Re-runnable, and idempotent: a second run finds no tags. Re-run it after
+        \\  integrating a lane that forked from a pre-migration base, since such a lane
+        \\  keeps appending the old tag. --dry-run reports without writing.
+        \\  e.g.  trk migrate-decisions --from-tag scott-decision --dry-run
+        },
         .{ .name = "migrate-arcs", .run = &cmdMigrateArcs, .mutates = true, .tools = &cli_only_tools, .text =
         \\trk migrate-arcs
         \\  One-time (but idempotent/re-runnable) migration, two passes: (1) for every
@@ -2123,6 +2144,148 @@ pub const Cli = struct {
     /// Safe to re-run: pass 1 finds nothing once tags are stripped, pass 2
     /// finds nothing once every in-edge target carries a declaration — both
     /// are structural idempotency, not a separate "already migrated" check.
+    /// `trk migrate-decisions --from-tag <tag> [--dry-run]` — graduate a repo's
+    /// legacy decision CONVENTION into the mechanism (01M2VFX26).
+    ///
+    /// Two jobs, and it NEVER guesses which sentence of a body is the fork.
+    ///
+    /// 1. SPLIT each task carrying `<tag>`. Those tasks are CARRIERS — work and
+    ///    fork in one body — so simply declaring one a decision would let `rule`
+    ///    close unbuilt work. Instead it mints a decision node, wires
+    ///    `raises{original, D}`, leaves the original alone as work, and strips
+    ///    the tag. D is a SCAFFOLD: its title names the task it came from and
+    ///    its body is empty, for a human to write the actual question into. No
+    ///    body text is copied or parsed. This split is precisely what lets
+    ///    `cmdRule` be unconditional — no `--keep-open`, no behaviour keyed on
+    ///    the target's nature.
+    ///
+    /// 2. REPORT prose forks: body lines matching the legacy markers
+    ///    (`store.legacy_decision_markers`, plus `<tag>` itself) on tasks that
+    ///    carry no tag. Those are the forks nothing else can find, and nothing
+    ///    else ever will — `archive`'s guard is gone. It FILES NOTHING from a
+    ///    scan; the operator reads the report and runs `trk decision`. That this
+    ///    scan is opt-in, one-shot and human-reviewed is exactly what makes
+    ///    archaeology acceptable here and not on every archive run.
+    ///
+    /// Re-runnable, which is also how lanes forked from a pre-migration base are
+    /// handled: they keep appending the legacy tag, so the orchestrator re-runs
+    /// this after integrating. A second run finds no tags and is a no-op.
+    ///
+    /// No default tag: trk ships no project's vocabulary.
+    fn cmdMigrateDecisions(self: *Cli, args: []const []const u8) Error!void {
+        var from_tag: ?[]const u8 = null;
+        var dry_run = false;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--from-tag")) {
+                from_tag = try self.flagVal(args, &i, "--from-tag");
+            } else if (std.mem.eql(u8, args[i], "--dry-run")) {
+                dry_run = true;
+            } else {
+                return self.unknownFlag(args[i]);
+            }
+        }
+        const tag = from_tag orelse {
+            try self.write(
+                "trk: migrate-decisions needs --from-tag <tag> — the tag THIS repo used to mark a fork\n" ++
+                    "       awaiting a call (e.g. `--from-tag scott-decision`). trk ships no default: the\n" ++
+                    "       convention is the repo's, not the tool's.\n",
+            );
+            return error.MissingArgument;
+        };
+
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+
+        // Pass 1: split the tagged carriers.
+        var split: usize = 0;
+        for (ids) |id| {
+            const t = self.store.get(id).?;
+            if (!hasTag(t, tag)) continue;
+            // Already split by an earlier run (idempotence): the carrier keeps
+            // no tag, so this only fires on a tag re-added by a merged lane.
+            var sb: [ulid.len]u8 = undefined;
+            const sid = try self.shortId(id, &sb);
+            if (dry_run) {
+                try self.print("would split {s}  {s}\n", .{ sid, t.title });
+                split += 1;
+                continue;
+            }
+
+            var title_buf: std.ArrayList(u8) = .empty;
+            defer title_buf.deinit(self.gpa);
+            try title_buf.print(self.gpa, "Decision raised by {s}: {s}", .{ sid, t.title });
+
+            const d = ulid.mint(self.io);
+            var db: [ulid.len]u8 = undefined;
+            const short = try self.mintShortId(d, &db);
+            try self.store.append(.{ .add = .{ .id = d, .title = title_buf.items, .short = short } });
+            try self.store.append(.{ .decisionDeclare = .{ .id = d, .declared = true } });
+            try self.store.append(.{ .raises = .{ .task = id, .decision = d } });
+            try self.store.append(.{ .untag = .{ .id = id, .tag = tag } });
+
+            var db2: [ulid.len]u8 = undefined;
+            try self.print("split {s}  {s}\n      -> decision {s} (write the question into it)\n", .{
+                sid, t.title, try self.shortId(d, &db2),
+            });
+            split += 1;
+        }
+
+        // Pass 2: find prose forks. REPORT ONLY — the tool cannot know which
+        // sentence is the fork, and guessing is the failure this whole
+        // mechanism exists to end.
+        var markers: std.ArrayList([]const u8) = .empty;
+        defer markers.deinit(self.gpa);
+        try markers.appendSlice(self.gpa, tracker.store.legacy_decision_markers);
+        try markers.append(self.gpa, tag);
+
+        var prose_tasks: usize = 0;
+        var prose_lines: usize = 0;
+        for (ids) |id| {
+            const t = self.store.get(id).?;
+            if (t.body.len == 0) continue;
+            if (self.store.isDecision(id)) continue; // already structured
+            var hits: usize = 0;
+            var lines = std.mem.splitScalar(u8, t.body, '\n');
+            while (lines.next()) |raw| {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (line.len == 0) continue;
+                for (markers.items) |m| {
+                    if (m.len == 0 or !containsIgnoreCase(line, m)) continue;
+                    if (hits == 0) {
+                        var sb: [ulid.len]u8 = undefined;
+                        try self.print("\nprose fork? {s}  {s}\n", .{ try self.shortId(id, &sb), t.title });
+                        prose_tasks += 1;
+                    }
+                    hits += 1;
+                    prose_lines += 1;
+                    try self.print("    {s}\n", .{line});
+                    break;
+                }
+            }
+        }
+
+        try self.print(
+            "\ntrk: migrate-decisions: {d} tagged task(s) {s}; {d} line(s) across {d} task(s) look like a fork in prose.\n",
+            .{ split, if (dry_run) "would be split" else "split", prose_lines, prose_tasks },
+        );
+        if (prose_tasks != 0) {
+            try self.write(
+                "  Those are REPORTED, never filed: only you know which sentence is the fork, and\n" ++
+                    "  guessing is the failure this mechanism exists to end. For each real one:\n" ++
+                    "    trk decision \"<the question>\" --from <id> [--blocks <id>]\n" ++
+                    "  Nothing else will find these again — `archive` no longer scans bodies.\n",
+            );
+        }
+        if (split != 0 and !dry_run) {
+            try self.write(
+                "  Each split decision is a SCAFFOLD: write the real question into it with\n" ++
+                    "  `trk edit <id> --title \"<the question>\"`, and wire what waits on it with\n" ++
+                    "  `trk dep <blocked-id> --needs <decision-id>`.\n",
+            );
+        }
+    }
+
     fn cmdMigrateArcs(self: *Cli, args: []const []const u8) Error!void {
         if (args.len != 0) {
             try self.write("trk: migrate-arcs takes no arguments\n");
@@ -5618,6 +5781,22 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 fn hasArcTag(t: Task) bool {
     for (t.tags.items) |tg| {
         if (std.mem.startsWith(u8, tg, "arc:")) return true;
+    }
+    return false;
+}
+
+/// Case-insensitive substring search — the legacy marker match `trk
+/// migrate-decisions` scans bodies with. Case-insensitive because the prose it
+/// is looking for was written by hand over months ("FIX NOTE", "Fix note",
+/// "fix note" all appear).
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    outer: while (i + needle.len <= haystack.len) : (i += 1) {
+        for (needle, haystack[i..][0..needle.len]) |n, h| {
+            if (std.ascii.toUpper(n) != std.ascii.toUpper(h)) continue :outer;
+        }
+        return true;
     }
     return false;
 }

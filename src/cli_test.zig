@@ -2422,7 +2422,7 @@ test "every verb supports --help/-h and add --help mints no task" {
         "init",  "add",  "dep",   "undep",   "in",         "unin",      "arc",     "migrate-arcs", "migrate-shorts",
         "state", "next", "list",  "render",  "tree",       "compact",   "archive", "doc",          "show",
         "edit",  "rule", "log",   "stale",   "release",    "tombstones", "mcp-serve",
-        "decision",
+        "decision", "migrate-decisions",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -5071,4 +5071,113 @@ test "tombstones --rebuild recovers `raised` too, and UPGRADES a record written 
     // And it settles: nothing left to improve.
     try f.run(&.{ "tombstones", "--rebuild" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "0 existing record(s) upgraded") != null);
+}
+
+// ----- trk migrate-decisions (01M2VFX26) -----
+
+test "migrate-decisions splits a tagged CARRIER without guessing which sentence is the fork" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const carrier = mintId();
+    try f.store.append(.{ .add = .{
+        .id = carrier,
+        .title = "the display fix",
+        .body = "Built it. OPEN QUESTION: does TODO.md want the annotation?",
+        .short = carrier.text[0..9],
+    } });
+    try f.store.append(.{ .tag = .{ .id = carrier, .tag = "scott-decision" } });
+    try f.store.append(.{ .tag = .{ .id = carrier, .tag = "ui" } });
+
+    try f.run(&.{ "migrate-decisions", "--from-tag", "scott-decision" });
+
+    // The CARRIER stays work, untouched apart from losing the tag. Declaring it
+    // a decision outright would let `rule` close unbuilt work.
+    const c = f.store.get(carrier).?;
+    try testing.expect(!f.store.isDecision(carrier));
+    try testing.expectEqualStrings("Built it. OPEN QUESTION: does TODO.md want the annotation?", c.body);
+    try testing.expectEqual(tracker.State.open, c.state);
+    for (c.tags.items) |tg| try testing.expect(!std.mem.eql(u8, tg, "scott-decision"));
+    var kept_ui = false;
+    for (c.tags.items) |tg| {
+        if (std.mem.eql(u8, tg, "ui")) kept_ui = true;
+    }
+    try testing.expect(kept_ui);
+
+    // A decision node now exists, declared, and wired back by provenance.
+    const raised = try f.store.raisedBy(alloc, carrier);
+    defer alloc.free(raised);
+    try testing.expectEqual(@as(usize, 1), raised.len);
+    const d = raised[0];
+    try testing.expect(f.store.isDecision(d));
+    // A SCAFFOLD: no body text copied, nothing parsed out of the carrier. The
+    // title points back at where it came from so a human can retitle it.
+    try testing.expectEqualStrings("", f.store.get(d).?.body);
+    try testing.expect(std.mem.indexOf(u8, f.store.get(d).?.title, "the display fix") != null);
+
+    // Idempotent: the tag is gone, so a second run splits nothing.
+    try f.run(&.{ "migrate-decisions", "--from-tag", "scott-decision" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "0 tagged task(s) split") != null);
+    const raised2 = try f.store.raisedBy(alloc, carrier);
+    defer alloc.free(raised2);
+    try testing.expectEqual(@as(usize, 1), raised2.len);
+}
+
+test "migrate-decisions REPORTS prose forks and files nothing from the scan" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const prose = mintId();
+    const clean = mintId();
+    try f.store.append(.{ .add = .{
+        .id = prose,
+        .title = "other work",
+        // Not colon-glued: the shape the old guard's classifier called
+        // "prose-shaped" and would have let through if its refusal had ever
+        // been narrowed. The finder is case-insensitive over hand-written prose.
+        .body = "Done.\nfix note — the seq ordering under a standing arc is still wrong.",
+    } });
+    try f.store.append(.{ .add = .{ .id = clean, .title = "ordinary", .body = "nothing to see" } });
+
+    const before = f.store.count();
+    try f.run(&.{ "migrate-decisions", "--from-tag", "scott-decision" });
+
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "prose fork?") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "seq ordering under a standing arc") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "other work") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "ordinary") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "REPORTED, never filed") != null);
+
+    // FILES NOTHING. Only a human knows which sentence is the fork, and
+    // guessing is the failure the whole mechanism exists to end.
+    try testing.expectEqual(before, f.store.count());
+    try testing.expect(!f.store.isDecision(prose));
+}
+
+test "migrate-decisions: --from-tag is required (trk ships no project's vocabulary), and --dry-run writes nothing" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const carrier = mintId();
+    try f.store.append(.{ .add = .{ .id = carrier, .title = "carrier" } });
+    try f.store.append(.{ .tag = .{ .id = carrier, .tag = "needs-alice" } });
+
+    try testing.expectEqual(
+        cli.CliError.MissingArgument,
+        f.runExpectErr(&.{"migrate-decisions"}),
+    );
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "trk ships no default") != null);
+
+    // Any repo's own tag works — the vocabulary is the caller's.
+    const before = f.store.count();
+    try f.run(&.{ "migrate-decisions", "--from-tag", "needs-alice", "--dry-run" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "would split") != null);
+    try testing.expectEqual(before, f.store.count());
+    try testing.expectEqual(@as(usize, 1), f.store.get(carrier).?.tags.items.len);
+
+    try f.run(&.{ "migrate-decisions", "--from-tag", "needs-alice" });
+    try testing.expectEqual(before + 1, f.store.count());
+    try testing.expectEqual(@as(usize, 0), f.store.get(carrier).?.tags.items.len);
 }

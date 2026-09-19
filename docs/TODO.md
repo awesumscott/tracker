@@ -22,26 +22,6 @@ SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-po
 </details>
 
 
-- [ ] `01M2VFX26` (seq 6) trk migrate-decisions --from-tag <tag>: split carriers, report prose forks #decisions
-
-  <details><summary>Modelled on migrate-arcs/migrate-shorts. Re-runnable — which is also…</summary>
-
-  Modelled on migrate-arcs/migrate-shorts. Re-runnable — which is also how lanes forked from a pre-migration base are handled: they keep appending the legacy tag, so the orchestrator re-runs migration after integrating. No default tag; trk ships no name.
-
-  Two jobs, and it NEVER guesses which sentence is the fork:
-
-  1. SPLIT each legacy tagged task. Those tasks are CARRIERS (work and fork in one body), so declaring one a decision would let `rule` close unbuilt work. Mint a decision node per tagged task, wire raises{original, D}, leave the original alone as work, remove the tag. D is a scaffold the human writes the question into — copy no body text, parse none. THIS IS WHAT LETS `rule` BE UNCONDITIONAL (no --keep-open, no behaviour keyed on the target's nature).
-
-  2. SCAN bodies for the legacy markers and REPORT them — the prose forks that were never tagged, which nothing else can find. File nothing from a scan; the operator reads the report and runs `trk decision`.
-
-  Idempotent: a second run finds no tags. A tagged-and-already-declared task is fine (LWW re-declare + untag).
-
-  Config.rule_tag is being deleted in slice 5 — decide whether a repo that set it gets a warning on the orphaned key, since loadConfig ignores unknown keys silently.
-
-  CLI-only, not an MCP tool, with the comment the verb table requires.
-
-  </details>
-
 - [ ] `01M2VFX27` (seq 7) MCP + help-text wiring for the decisions mechanism #decisions
 
   <details><summary>mcp_test's 'tool specs stay in lockstep' asserts every tool flag…</summary>
