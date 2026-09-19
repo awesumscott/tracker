@@ -618,7 +618,7 @@ test "encode/decode round-trip add" {
     const id = try ulid.parse(&ulid.mintAt(testing.io, 100).text);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
-    const tags = [_][]const u8{ "wm", "metal" };
+    const tags = [_][]const u8{ "alpha", "beta" };
     try encode(&buf, gpa, .{ .add = .{ .id = id, .title = "T", .body = "b\"q\"", .tags = &tags, .ts = 100 } });
 
     const ev = try decode(gpa, buf.items);

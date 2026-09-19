@@ -190,9 +190,9 @@ pub const Config = struct {
     archive_out: ?[]const u8 = null,
     /// `archive.routes` — per-task changelog destinations (01M2F8GBQ). A repo
     /// can own more than one changelog with a different content policy each —
-    /// e.g. Enix's `docs/CHANGELOG.md` for QEMU-gated adoption work next to
-    /// `annex/prism/CHANGELOG.md` for prism-library work gated by host tests
-    /// + a cross-build, not QEMU. `trk` has no opinion on what the split IS;
+    /// e.g. a top-level `docs/CHANGELOG.md` for work gated by the main test
+    /// suite, next to a vendored sub-library's own changelog for work gated
+    /// differently. `trk` has no opinion on what the split IS;
     /// it only guarantees that a task carrying a configured route's tag
     /// graduates to THAT file, in the SAME `archive` run as everything else,
     /// rather than silently landing in `archive_out` because that was the

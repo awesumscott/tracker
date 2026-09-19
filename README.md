@@ -116,11 +116,11 @@ heading (a changelog accumulates), so its target can safely be the changelog its
 Precedence for the output path: explicit `--out` > config value > stdout. A repo with no config behaves
 exactly as if the fields were unset.
 
-A repo that owns more than one changelog — e.g. a QEMU-gated main changelog next to a host-tested
-library's own — routes per task via `archive.routes`, keyed by tag:
+A repo that owns more than one changelog — a main one next to a vendored library's own, say, each gated
+by a different test suite — routes per task via `archive.routes`, keyed by tag:
 
 ```json
-{ "archive": { "out": "docs/CHANGELOG.md", "routes": { "prism-lib": "annex/prism/CHANGELOG.md" } } }
+{ "archive": { "out": "docs/CHANGELOG.md", "routes": { "sublib": "vendor/sublib/CHANGELOG.md" } } }
 ```
 
 A task carrying a routed tag graduates to that tag's path instead of `archive.out`; a task matching none

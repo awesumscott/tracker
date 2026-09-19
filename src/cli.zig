@@ -719,9 +719,9 @@ pub const Cli = struct {
         \\  arc is marked --standing (`trk arc`), in which case it never surfaces.
         \\  Bare <term>s (or --word <term>; repeatable, ANDed) are a case-insensitive
         \\  substring search over title+body+tags. --not-tag <t> (repeatable, ANDed
-        \\  exclusion) drops any task carrying that tag — the autonomous-eligible
-        \\  bucket is then one bare command:
-        \\    trk next --not-tag metal --not-tag scott-testing
+        \\  exclusion) drops any task carrying that tag. Whatever blocker tags a repo
+        \\  uses, its autonomous-eligible bucket is then one bare command:
+        \\    trk next --not-tag <blocker-tag> --not-tag <other-blocker-tag>
         \\  DECISIONS are excluded structurally, not by tag: a fork is a question, not
         \\  buildable work, so it never enters the frontier and no --not-tag term is
         \\  needed for it. When work is held back waiting on an unruled fork, a tail
@@ -733,7 +733,7 @@ pub const Cli = struct {
         \\  full BODY as well as id/short/title/state/priority/seq?/tags — the whole
         \\  frontier is then triageable in one call, markers and all, with no
         \\  follow-up `trk show` per candidate.
-        \\  e.g.  trk next           trk next prism windowed
+        \\  e.g.  trk next           trk next parser windowed
         },
         .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--state", "--tag", "--not-tag", "--limit", "--json", "--word" }, .text =
         \\trk list [--arc <id> | --no-arc] [--decision] [--state <s>] [--tag <t>]
@@ -2871,9 +2871,10 @@ pub const Cli = struct {
         // Build the changelog-bullet draft, GROUPED BY DESTINATION (01M2F8GBQ):
         // an explicit --out sends every task to one file, same as always;
         // otherwise each task's own tags are checked against `archive.routes`,
-        // so a task whose gate/home differs from the rest of the batch (e.g. a
-        // prism-library task next to an ordinary Enix-adoption one in the same
-        // done queue) lands in ITS OWN changelog, in this SAME run — no manual
+        // so a task whose gate/home differs from the rest of the batch (a
+        // sub-library task gated differently from the main tree's, say, sitting
+        // in the same done queue) lands in ITS OWN changelog, in this SAME run —
+        // no manual
         // per-tag split, no ritual to remember. A repo with no `archive.routes`
         // configured always resolves to exactly one group (`archive_out`, or
         // stdout), which is byte-for-byte the prior single-destination
@@ -3144,7 +3145,7 @@ pub const Cli = struct {
         var limit: ?usize = null;
         var json = false;
         // Search terms: repeated `--word` AND bare positionals, ANDed — so
-        // `trk next prism` is "the ready frontier, prism only".
+        // `trk next parser` is "the ready frontier, parser only".
         var words: std.ArrayList([]const u8) = .empty;
         defer words.deinit(self.gpa);
         // `--not-tag <t>` (repeatable, ANDed exclusion): drop any task carrying
@@ -5823,7 +5824,7 @@ fn hasAnyTag(t: Task, tags: []const []const u8) bool {
 }
 
 /// True iff `word` appears (case-insensitively) in the task's title, body, or
-/// any tag. Tags are included so `--word prism` catches `#arc:display-prism`.
+/// any tag. Tags are included so `--word parser` catches `#arc:parser-rewrite`.
 fn wordMatches(t: Task, word: []const u8) bool {
     if (containsSubCI(t.title, word)) return true;
     if (containsSubCI(t.body, word)) return true;
