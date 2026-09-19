@@ -138,6 +138,8 @@ pub fn main(init: std.process.Init) !u8 {
             error.UndeclaredArc,
             error.ClaimRequiresOpen,
             error.HolderRequired,
+            error.DecisionNotWork,
+            error.DecisionNotArc,
             error.LeaseHolderMismatch,
             error.GitLogFailed,
             error.CompactVerifyFailed,

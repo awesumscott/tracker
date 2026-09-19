@@ -22,25 +22,6 @@ SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-po
 </details>
 
 
-- [ ] `01M2VFV82` (seq 1) Events + fold: decisionDeclare, raises, unraises #decisions
-
-  <details><summary>model.zig: three new ops. `decisionDeclare { id, declared: bool, ts }`…</summary>
-
-  model.zig: three new ops. `decisionDeclare { id, declared: bool, ts }` mirrors `arcDeclare` exactly (single-task LWW bool, idempotent, commutative across disjoint tasks). `raises { task, decision, ts }` + `unraises { task, decision, ts }` mirror `in`/`unin`: a fold-time tombstone map, unconditional, so removal is order-independent under union-merge.
-
-  json_codec.zig: encode + decode, deterministic key order, hand-rolled as the rest is.
-
-  store.zig `apply`: fold rules. `unraises` must NOT ensureNode — same as `undep` — or a removal mints a ghost.
-  store.zig `append` write-time refusals: a task may not be both an arc and a decision (refuse either declare against the other, the way `in` refuses an undeclared arc), and a decision may not be `claimed` or `submitted` (a decision is not work; without this an agent leases a question and stale/release start tracking it).
-
-  `model.eventTaskIds` reports BOTH endpoints of raises/unraises — that is what lets quarantineGhosts and scanLogHistoryForIds see the edge. `scalarTarget` must NOT include the new ops: additive/LWW-bool, never watermark-withheld, like arcDeclare.
-
-  `raises` is excluded from the combined acyclic graph — combinedReaches and checkAcyclic must not walk it. It encodes no waiting.
-
-  Tests: union-merge commutativity for all three (both orders converge), the two refusals, and that an unraises tombstone blocks a later raises for the same pair regardless of fold order.
-
-  </details>
-
 - [ ] `01M2VFV83` (seq 2) Verbs: trk decision, rule closes unconditionally, list --decision #decisions
 
   <details><summary>`trk decision "&lt;question>" --from &lt;id> [--blocks &lt;id> ...] [--in &lt;arc>]…</summary>
@@ -84,6 +65,12 @@ SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-po
   - collectableRows records it at collection time, mirroring arcs.
   - tombstones --rebuild: reconstruct raises by the same surviving-pair rule used for in/unin (live iff some raises exists and no unraises does, anywhere in history).
   - `supersedes` gains a third case, "gained raises it had none of", or the upgrade never reaches an already-rebuilt store. That is the 01M2V2TYC lesson applied in advance — do not skip it.
+
+
+
+  SCOPE NOTE 2026-09-18: slice 1 already landed the serializeState emission (decisionDeclare + raises, skipping gc_set endpoints) and the taskFingerprint additions, because leaving them to a later slice would mean an installable binary whose compact silently drops decisions — the exact loss class this slice is named for. Verified by removing the emission and watching compact REFUSE itself with CompactVerifyFailed rather than losing the data.
+
+  WHAT REMAINS HERE: the tombstone half only — `raised` on the TASK side of the record, collectableRows recording it at collection time, tombstones --rebuild reconstructing raises/unraises by the surviving-pair rule, and supersedes' third case.
 
   </details>
 

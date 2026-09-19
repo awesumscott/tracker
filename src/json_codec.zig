@@ -34,6 +34,9 @@
 //!   {"op":"arcStanding","id":"<ulid>","standing":true|false,"ts":0}
 //!   {"op":"setShort","id":"<ulid>","short":"...","ts":0}
 //!   {"op":"release","id":"<ulid>","holder":"...","ts":0}
+//!   {"op":"decisionDeclare","id":"<ulid>","declared":true|false,"ts":0}
+//!   {"op":"raises","task":"<ulid>","decision":"<ulid>","ts":0}
+//!   {"op":"unraises","task":"<ulid>","decision":"<ulid>","ts":0}
 //! A `setState` to the lease (`"leased"`) carries `"holder":"..."`; no other
 //! state writes the key, and decode ignores it on any other state.
 //!
@@ -302,6 +305,30 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, d.ts);
         },
+        .decisionDeclare => |d| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, d.id.slice());
+            try writeKey(buf, gpa, "declared", &first);
+            try writeBool(buf, gpa, d.declared);
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, d.ts);
+        },
+        .raises => |d| {
+            try writeKey(buf, gpa, "task", &first);
+            try writeJsonString(buf, gpa, d.task.slice());
+            try writeKey(buf, gpa, "decision", &first);
+            try writeJsonString(buf, gpa, d.decision.slice());
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, d.ts);
+        },
+        .unraises => |d| {
+            try writeKey(buf, gpa, "task", &first);
+            try writeJsonString(buf, gpa, d.task.slice());
+            try writeKey(buf, gpa, "decision", &first);
+            try writeJsonString(buf, gpa, d.decision.slice());
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, d.ts);
+        },
         .setShort => |s| {
             try writeKey(buf, gpa, "id", &first);
             try writeJsonString(buf, gpa, s.id.slice());
@@ -554,6 +581,21 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
             .standing = getBoolDefault(obj, "standing", false),
             .ts = getIntDefault(obj, "ts", 0),
         } },
+        .decisionDeclare => return .{ .decisionDeclare = .{
+            .id = try getUlid(obj, "id"),
+            .declared = getBoolDefault(obj, "declared", false),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
+        .raises => return .{ .raises = .{
+            .task = try getUlid(obj, "task"),
+            .decision = try getUlid(obj, "decision"),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
+        .unraises => return .{ .unraises = .{
+            .task = try getUlid(obj, "task"),
+            .decision = try getUlid(obj, "decision"),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
         .setShort => return .{ .setShort = .{
             .id = try getUlid(obj, "id"),
             .short = try gpa.dupe(u8, try getStr(obj, "short")),
@@ -746,4 +788,58 @@ test "peekUnknownOp: returns null on a line that isn't even a JSON object with a
     const gpa = testing.allocator;
     try testing.expect(try peekUnknownOp(gpa, "not json") == null);
     try testing.expect(try peekUnknownOp(gpa, "{\"id\":\"x\"}") == null); // no op field at all
+}
+
+test "encode/decode round-trip the decision ops (01M2VFV82)" {
+    const gpa = testing.allocator;
+    const a = try ulid.parse(&ulid.mintAt(testing.io, 100).text);
+    const b = try ulid.parse(&ulid.mintAt(testing.io, 101).text);
+
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try encode(&buf, gpa, .{ .decisionDeclare = .{ .id = a, .declared = true, .ts = 100 } });
+        const ev = try decode(gpa, buf.items);
+        try testing.expect(ev.decisionDeclare.id.eql(a));
+        try testing.expect(ev.decisionDeclare.declared);
+        try testing.expectEqual(@as(i64, 100), ev.decisionDeclare.ts);
+        // A retraction is a distinct value, not an absent key.
+        var buf2: std.ArrayList(u8) = .empty;
+        defer buf2.deinit(gpa);
+        try encode(&buf2, gpa, .{ .decisionDeclare = .{ .id = a, .declared = false, .ts = 100 } });
+        const ev2 = try decode(gpa, buf2.items);
+        try testing.expect(!ev2.decisionDeclare.declared);
+    }
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try encode(&buf, gpa, .{ .raises = .{ .task = a, .decision = b, .ts = 150 } });
+        // The two endpoints are named, so a swap is visible in the line itself
+        // rather than being two interchangeable positional ids.
+        try testing.expect(std.mem.indexOf(u8, buf.items, "\"task\"") != null);
+        try testing.expect(std.mem.indexOf(u8, buf.items, "\"decision\"") != null);
+        const ev = try decode(gpa, buf.items);
+        try testing.expect(ev.raises.task.eql(a));
+        try testing.expect(ev.raises.decision.eql(b));
+        try testing.expectEqual(@as(i64, 150), ev.raises.ts);
+    }
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try encode(&buf, gpa, .{ .unraises = .{ .task = a, .decision = b, .ts = 150 } });
+        const ev = try decode(gpa, buf.items);
+        try testing.expect(ev.unraises.task.eql(a));
+        try testing.expect(ev.unraises.decision.eql(b));
+    }
+
+    // NOT breaking: an older binary skips these and warns. The recorded
+    // consequence (design.md "Decisions") is that it would see a decision as an
+    // ordinary open task and surface it in `next` — a wasted dispatch, versus
+    // bricking every read of the store, which is worse.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try encode(&buf, gpa, .{ .decisionDeclare = .{ .id = a, .declared = true, .ts = 100 } });
+        try testing.expect(std.mem.indexOf(u8, buf.items, "breaking") == null);
+    }
 }

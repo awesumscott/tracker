@@ -268,12 +268,21 @@ pub const Error = error{
     /// `setState claimed` without a holder. A lease nobody can be asked about
     /// or release by name is the stranding this exists to prevent.
     HolderRequired,
+    /// `setState claimed`/`submitted` on a declared DECISION. A decision is a
+    /// question, not work: leasing one starts `stale`/`release` bookkeeping on
+    /// something nobody is building.
+    DecisionNotWork,
+    /// A task may not be both an arc root and a decision. An arc contains work;
+    /// a decision is a question — and `rule` closes its target, so a task that
+    /// were both would have its arc closed with members still open.
+    DecisionNotArc,
 } || std.mem.Allocator.Error;
 
 /// A `needs` edge in memory.
 pub const Needs = model.Needs;
 /// An `in` membership edge in memory.
 pub const In = model.In;
+pub const Raises = model.Raises;
 
 /// Endpoints of the back-edge that closes a self-wait cycle (see
 /// `findSelfWaitCycles`). Just a (from, to) pair — reuses `Needs`'s shape
@@ -365,6 +374,26 @@ pub const Store = struct {
     /// `in` members — the structural fix for an empty goal that was previously
     /// inexpressible. See `isArc`.
     declared_arcs: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    /// Explicitly declared DECISIONS (`trk decision`), folded from
+    /// `decisionDeclare` events. Declaration is NATURE, not lifecycle: a
+    /// decision stays in this set once it is ruled, exactly as an arc stays an
+    /// arc once it is done. `trk rule` resolves one by setting `done` and must
+    /// never remove it from here — otherwise the answered question becomes an
+    /// ordinary open task and `next` hands it out as work. See `isDecision`.
+    declared_decisions: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    /// `raises` edges: which task raised which decision. PROVENANCE ONLY — no
+    /// dependency, no scheduling effect, and deliberately NOT walked by
+    /// `combinedReaches`/`checkAcyclic`, because it encodes no waiting and
+    /// walking it would reject the ordinary shape where a task both raised a
+    /// decision and needs it. Whether a decision blocks a task is a separate,
+    /// ordinary `needs` edge.
+    raises_edges: std.ArrayList(Raises) = .empty,
+    /// Tombstone set for `unraises` ops: every (task,decision) pair for which an
+    /// `unraises` has been applied. Exact mirror of `dep_tombstones` /
+    /// `in_tombstones` — an edge is authorable from either endpoint and so can
+    /// genuinely be raced, which is why it needs a tombstone map rather than
+    /// `untag`'s plain list removal.
+    raises_tombstones: std.AutoHashMapUnmanaged([ulid.len * 2]u8, void) = .empty,
     /// Standing-arc markers (`trk arc <id> --standing`), folded from
     /// `arcStanding{standing:true}` events. A member is excluded from `next`'s
     /// ready frontier UNCONDITIONALLY, drained or not — see `isStanding` and
@@ -500,6 +529,9 @@ pub const Store = struct {
         self.doc_paths.deinit(self.gpa);
         self.declared_arcs.deinit(self.gpa);
         self.standing_arcs.deinit(self.gpa);
+        self.declared_decisions.deinit(self.gpa);
+        self.raises_edges.deinit(self.gpa);
+        self.raises_tombstones.deinit(self.gpa);
         self.self_wait_cycles.deinit(self.gpa);
         self.ghost_tasks.deinit(self.gpa);
         self.superseded.deinit(self.gpa);
@@ -597,10 +629,12 @@ pub const Store = struct {
             .undocref => |x| x.id,
             .arcDeclare => |x| x.id,
             .arcStanding => |x| x.id,
+            .decisionDeclare => |x| x.id,
             // An edge event touches two tasks, but the watermark only ever gates
             // SCALAR ops (see `scalarTarget`), so stamping either endpoint would
-            // raise a bar nothing checks. Left alone deliberately.
-            .dep, .undep, .in, .unin, .setDocPath => return,
+            // raise a bar nothing checks. Left alone deliberately. `raises` and
+            // `unraises` join that list for the same reason.
+            .dep, .undep, .in, .unin, .raises, .unraises, .setDocPath => return,
         };
         const t = try self.ensureNode(id);
         if (ts > t.last_ts) t.last_ts = ts;
@@ -799,6 +833,40 @@ pub const Store = struct {
                 } else {
                     _ = self.declared_arcs.remove(key(x.id));
                 }
+            },
+            .decisionDeclare => |x| {
+                // Out-of-order tolerance like arcDeclare/dep/in: a declaration
+                // for an id we haven't `add`ed yet creates the placeholder.
+                _ = try self.ensureNode(x.id);
+                if (x.declared) {
+                    try self.declared_decisions.put(self.gpa, key(x.id), {});
+                } else {
+                    _ = self.declared_decisions.remove(key(x.id));
+                }
+            },
+            .raises => |x| {
+                // Exact mirror of `dep`/`in`: dedup, and a tombstone for the
+                // pair beats this add regardless of fold order.
+                _ = try self.ensureNode(x.task);
+                _ = try self.ensureNode(x.decision);
+                if (self.raises_tombstones.contains(edgeKey(x.task, x.decision))) return;
+                for (self.raises_edges.items) |e| {
+                    if (e.task.eql(x.task) and e.decision.eql(x.decision)) return;
+                }
+                try self.raises_edges.append(self.gpa, .{ .task = x.task, .decision = x.decision });
+            },
+            .unraises => |x| {
+                // Exact mirror of `undep`/`unin`. Deliberately does NOT
+                // `ensureNode`: a removal must never mint a ghost.
+                try self.raises_tombstones.put(self.gpa, edgeKey(x.task, x.decision), {});
+                var idx: ?usize = null;
+                for (self.raises_edges.items, 0..) |e, i| {
+                    if (e.task.eql(x.task) and e.decision.eql(x.decision)) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (idx) |i| _ = self.raises_edges.orderedRemove(i);
             },
             .arcStanding => |x| {
                 // Out-of-order tolerance like arcDeclare/dep/in.
@@ -1705,12 +1773,28 @@ pub const Store = struct {
             .in => |x| if (!x.task.eql(x.arc) and !self.isArc(x.arc)) return error.UndeclaredArc,
             // A lease is taken only on open work. Checked at WRITE time only:
             // the fold applies any sequence a merge delivers.
-            .setState => |x| if (x.state == .claimed) {
-                if (x.holder == null or x.holder.?.len == 0) return error.HolderRequired;
-                if (self.tasks.get(key(x.id))) |t| {
-                    if (State.claimRefusal(t.state) != null) return error.ClaimRequiresOpen;
+            .setState => |x| {
+                if (x.state == .claimed) {
+                    if (x.holder == null or x.holder.?.len == 0) return error.HolderRequired;
+                    if (self.tasks.get(key(x.id))) |t| {
+                        if (State.claimRefusal(t.state) != null) return error.ClaimRequiresOpen;
+                    }
                 }
+                // A decision is a question, not work: it cannot be leased or
+                // reported as built. Without this an agent claims a fork and
+                // `stale`/`release` start doing lease bookkeeping on it. Checked
+                // at WRITE time only, like the lease rules above — the fold
+                // applies whatever a merge delivers.
+                if ((x.state == .claimed or x.state == .submitted) and self.isDecision(x.id))
+                    return error.DecisionNotWork;
             },
+            // Nature conflicts. An arc is a container for work; a decision is a
+            // question. A task that is both makes `rule` — which closes its
+            // target — close an arc root with members still open. Refused in
+            // both directions at write time; a union merge can still land both,
+            // and `next` excludes either way, so only `rule` needs the guard.
+            .arcDeclare => |x| if (x.declared and self.isDecision(x.id)) return error.DecisionNotArc,
+            .decisionDeclare => |x| if (x.declared and self.isArc(x.id)) return error.DecisionNotArc,
             else => {},
         }
 
@@ -2201,7 +2285,7 @@ pub const Store = struct {
         t: Task,
     ) !u64 {
         buf.clearRetainingCapacity();
-        try buf.print(self.gpa, "title\x00{s}\x00body\x00{s}\x00state\x00{s}\x00holder\x00{s}\x00lease_ts\x00{d}\x00priority\x00{d}\x00short\x00{s}\x00declared\x00{}\x00standing\x00{}\x00", .{
+        try buf.print(self.gpa, "title\x00{s}\x00body\x00{s}\x00state\x00{s}\x00holder\x00{s}\x00lease_ts\x00{d}\x00priority\x00{d}\x00short\x00{s}\x00declared\x00{}\x00standing\x00{}\x00decision\x00{}\x00", .{
             t.title,
             t.body,
             @tagName(t.state),
@@ -2211,6 +2295,7 @@ pub const Store = struct {
             t.short orelse "\x01",
             self.declared_arcs.contains(key(id)),
             self.standing_arcs.contains(key(id)),
+            self.declared_decisions.contains(key(id)),
         });
 
         // Tags: sorted, order-independent (a re-fold may reorder them).
@@ -2260,6 +2345,23 @@ pub const Store = struct {
             std.sort.pdq(In, ins_here.items, {}, inLessThan);
             try buf.appendSlice(self.gpa, "in\x00");
             for (ins_here.items) |e| try buf.print(self.gpa, "{s}\x00{d}\x00", .{ &e.arc.text, e.seq });
+        }
+
+        // `raises` edges OWNED by this id (task == id), same collectable-
+        // endpoint exclusion. WITHOUT THIS a compact that silently dropped
+        // every raises edge would PASS the round-trip verify — the exact
+        // silent-loss class 01M0YESW6 exists to catch.
+        {
+            var raised: std.ArrayList(Ulid) = .empty;
+            defer raised.deinit(self.gpa);
+            for (self.raises_edges.items) |e| {
+                if (!e.task.eql(id)) continue;
+                if (gc_set.contains(key(e.task)) or gc_set.contains(key(e.decision))) continue;
+                try raised.append(self.gpa, e.decision);
+            }
+            std.sort.pdq(Ulid, raised.items, {}, Ulid.lessThan);
+            try buf.appendSlice(self.gpa, "raises\x00");
+            for (raised.items) |d| try buf.print(self.gpa, "{s}\x00", .{&d.text});
         }
 
         return std.hash.Wyhash.hash(0, buf.items);
@@ -2498,6 +2600,8 @@ pub const Store = struct {
                 try self.emit(buf, .{ .arcDeclare = .{ .id = id, .declared = true } });
             if (self.standing_arcs.contains(key(id)))
                 try self.emit(buf, .{ .arcStanding = .{ .id = id, .standing = true } });
+            if (self.declared_decisions.contains(key(id)))
+                try self.emit(buf, .{ .decisionDeclare = .{ .id = id, .declared = true } });
             live += 1;
         }
 
@@ -2519,6 +2623,18 @@ pub const Store = struct {
             if (gc_set.contains(key(e.task))) continue;
             if (gc_set.contains(key(e.arc))) continue;
             try self.emit(buf, .{ .in = .{ .task = e.task, .arc = e.arc, .seq = e.seq } });
+        }
+
+        // `raises` edges: stable (task, decision) order; skip collected
+        // endpoints, for the same reason the two above do — a surviving edge to
+        // a collected id re-materializes it as a ghost on the next load.
+        const sorted_raises = try self.gpa.dupe(Raises, self.raises_edges.items);
+        defer self.gpa.free(sorted_raises);
+        std.sort.pdq(Raises, sorted_raises, {}, raisesLessThan);
+        for (sorted_raises) |e| {
+            if (gc_set.contains(key(e.task))) continue;
+            if (gc_set.contains(key(e.decision))) continue;
+            try self.emit(buf, .{ .raises = .{ .task = e.task, .decision = e.decision } });
         }
 
         // `setDocPath` entries: sorted by doc_id for determinism.
@@ -2568,6 +2684,12 @@ pub const Store = struct {
         const ct = std.mem.order(u8, &lhs.task.text, &rhs.task.text);
         if (ct != .eq) return ct == .lt;
         return std.mem.lessThan(u8, &lhs.arc.text, &rhs.arc.text);
+    }
+
+    fn raisesLessThan(_: void, lhs: Raises, rhs: Raises) bool {
+        const ct = std.mem.order(u8, &lhs.task.text, &rhs.task.text);
+        if (ct != .eq) return ct == .lt;
+        return std.mem.lessThan(u8, &lhs.decision.text, &rhs.decision.text);
     }
 
     fn emit(self: *Store, buf: *std.ArrayList(u8), ev: Event) !void {
@@ -2733,6 +2855,21 @@ pub const Store = struct {
                     task_id = x.id;
                     break :blk try std.fmt.allocPrint(alloc, "release: lease held by {s}", .{x.holder});
                 },
+                .decisionDeclare => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "decision: {s}", .{if (x.declared) "declared" else "retracted"});
+                },
+                .raises => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.task;
+                    break :blk try std.fmt.allocPrint(alloc, "raises: {s} raised decision {s}", .{ x.task.slice(), x.decision.slice() });
+                },
+                .unraises => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.task;
+                    break :blk try std.fmt.allocPrint(alloc, "unraises: {s} no longer raises {s}", .{ x.task.slice(), x.decision.slice() });
+                },
             };
             try out.append(alloc, .{
                 .ts = ts,
@@ -2883,6 +3020,41 @@ pub const Store = struct {
     /// act, so that combination should not arise via the CLI.
     pub fn isStanding(self: *Store, id: Ulid) bool {
         return self.standing_arcs.contains(key(id));
+    }
+
+    /// Is `id` a declared DECISION — a fork awaiting a ruling?
+    ///
+    /// True for a RULED decision too: declaration is nature, not lifecycle, the
+    /// same way `isArc` stays true for a finished arc. "Pending" is the
+    /// conjunction of this and an open state, never this alone.
+    pub fn isDecision(self: *Store, id: Ulid) bool {
+        return self.declared_decisions.contains(key(id));
+    }
+
+    /// Every decision `task` raised, as folded `raises` edges. Caller owns the
+    /// slice. Sorted by id so output is stable across runs.
+    pub fn raisedBy(self: *Store, alloc: std.mem.Allocator, task: Ulid) ![]Ulid {
+        var out: std.ArrayList(Ulid) = .empty;
+        errdefer out.deinit(alloc);
+        for (self.raises_edges.items) |e| {
+            if (e.task.eql(task)) try out.append(alloc, e.decision);
+        }
+        const slice = try out.toOwnedSlice(alloc);
+        std.sort.pdq(Ulid, slice, {}, Ulid.lessThan);
+        return slice;
+    }
+
+    /// Every task that raised `decision` — the reverse of `raisedBy`. Caller
+    /// owns the slice.
+    pub fn raisersOf(self: *Store, alloc: std.mem.Allocator, decision: Ulid) ![]Ulid {
+        var out: std.ArrayList(Ulid) = .empty;
+        errdefer out.deinit(alloc);
+        for (self.raises_edges.items) |e| {
+            if (e.decision.eql(decision)) try out.append(alloc, e.task);
+        }
+        const slice = try out.toOwnedSlice(alloc);
+        std.sort.pdq(Ulid, slice, {}, Ulid.lessThan);
+        return slice;
     }
 
     /// Every declared arc root id: in `declared_arcs`, or (back-compat)

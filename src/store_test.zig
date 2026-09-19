@@ -3154,3 +3154,188 @@ fn indexOf(haystack: []const tracker.Ulid, needle: tracker.Ulid) ?usize {
     for (haystack, 0..) |h, i| if (h.eql(needle)) return i;
     return null;
 }
+
+// ----- decisions: a fork is a declared node (01M2VFV82) -----
+
+test "decisionDeclare is nature, not lifecycle: it survives ruling, compaction and a re-fold" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const work = mintId();
+    const d = mintId();
+
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = work, .title = "the display fix" } });
+        try s.append(.{ .add = .{ .id = d, .title = "does TODO.md want the annotation?" } });
+        try s.append(.{ .decisionDeclare = .{ .id = d, .declared = true } });
+        try s.append(.{ .raises = .{ .task = work, .decision = d } });
+        // Blocking is an ORDINARY dep, separate from provenance: the work needs
+        // the ruling.
+        try s.append(.{ .dep = .{ .from = work, .to = d } });
+
+        try testing.expect(s.isDecision(d));
+        try testing.expect(!s.isDecision(work));
+
+        // Resolving is STATE. The declaration must NOT move — an arc stays an
+        // arc once done, and a decision stays a decision once ruled. If ruling
+        // cleared it, the answered question would become an ordinary open task
+        // and `next` would hand it out as work.
+        try s.append(.{ .setState = .{ .id = d, .state = .done } });
+        try testing.expect(s.isDecision(d));
+    }
+
+    // Survives a re-fold from disk.
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try testing.expect(s.isDecision(d));
+        try testing.expectEqual(tracker.State.done, s.get(d).?.state);
+        const raised = try s.raisedBy(testing.allocator, work);
+        defer testing.allocator.free(raised);
+        try testing.expectEqual(@as(usize, 1), raised.len);
+        try testing.expect(raised[0].eql(d));
+        const raisers = try s.raisersOf(testing.allocator, d);
+        defer testing.allocator.free(raisers);
+        try testing.expectEqual(@as(usize, 1), raisers.len);
+        try testing.expect(raisers[0].eql(work));
+    }
+
+    // And a compact round-trip. `compact` KEEPS `done` (a satisfied prereq and
+    // the un-graduated changelog queue), so both nodes and both relations must
+    // come back — the declaration bit and the raises edge are in
+    // `taskFingerprint`, so a rewrite that dropped either would be caught by
+    // compact's own verify rather than by this assertion.
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        _ = try s.compact();
+    }
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try testing.expect(s.isDecision(d));
+        const raised = try s.raisedBy(testing.allocator, work);
+        defer testing.allocator.free(raised);
+        try testing.expectEqual(@as(usize, 1), raised.len);
+    }
+}
+
+test "raises/unraises converge under union-merge in EITHER order (tombstone beats add)" {
+    const t = mintId();
+    const d = mintId();
+
+    // The two orders a git union-merge can produce for the same pair.
+    for ([_]bool{ true, false }) |tombstone_last| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = t, .title = "raiser" } });
+        try s.append(.{ .add = .{ .id = d, .title = "fork" } });
+
+        if (tombstone_last) {
+            try s.apply(.{ .raises = .{ .task = t, .decision = d } });
+            try s.apply(.{ .unraises = .{ .task = t, .decision = d } });
+        } else {
+            try s.apply(.{ .unraises = .{ .task = t, .decision = d } });
+            try s.apply(.{ .raises = .{ .task = t, .decision = d } });
+        }
+
+        const raised = try s.raisedBy(testing.allocator, t);
+        defer testing.allocator.free(raised);
+        try testing.expectEqual(@as(usize, 0), raised.len);
+    }
+}
+
+test "raises is idempotent, and unraises never mints a ghost" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    const t = mintId();
+    const d = mintId();
+    const never = mintId();
+    try s.append(.{ .add = .{ .id = t, .title = "raiser" } });
+    try s.append(.{ .add = .{ .id = d, .title = "fork" } });
+
+    // Replaying a log twice must be a no-op, like every other edge.
+    try s.apply(.{ .raises = .{ .task = t, .decision = d } });
+    try s.apply(.{ .raises = .{ .task = t, .decision = d } });
+    const raised = try s.raisedBy(testing.allocator, t);
+    defer testing.allocator.free(raised);
+    try testing.expectEqual(@as(usize, 1), raised.len);
+
+    // A REMOVAL must not materialize its endpoints — same rule as `undep`.
+    // Without it, correcting a mis-attributed origin would create the very
+    // ghost `compact` then has to GC.
+    const before = s.count();
+    try s.apply(.{ .unraises = .{ .task = never, .decision = d } });
+    try testing.expectEqual(before, s.count());
+    try testing.expect(s.get(never) == null);
+}
+
+test "raises is NOT a wait: a task may both raise a decision and need it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    const t = mintId();
+    const d = mintId();
+    try s.append(.{ .add = .{ .id = t, .title = "the work" } });
+    try s.append(.{ .add = .{ .id = d, .title = "the fork it hit" } });
+
+    // The ordinary shape: mid-build fork. Both facts hold at once, and the
+    // acyclic check must not see a cycle — `raises` encodes no waiting, so
+    // `combinedReaches`/`checkAcyclic` deliberately do not walk it.
+    try s.append(.{ .raises = .{ .task = t, .decision = d } });
+    try s.append(.{ .dep = .{ .from = t, .to = d } });
+
+    // Re-folds cleanly (checkAcyclic runs on every load).
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqual(@as(usize, 0), s2.self_wait_cycles.items.len);
+}
+
+test "a decision is not work, and is not an arc: both refusals are write-time" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    const d = mintId();
+    const arc = mintId();
+    try s.append(.{ .add = .{ .id = d, .title = "a fork" } });
+    try s.append(.{ .decisionDeclare = .{ .id = d, .declared = true } });
+
+    // A question cannot be leased or reported built — otherwise an agent takes
+    // a lease on it and `stale`/`release` start tracking a question.
+    try testing.expectError(error.DecisionNotWork, s.append(.{ .setState = .{
+        .id = d,
+        .state = .claimed,
+        .holder = "lane-1",
+    } }));
+    try testing.expectError(error.DecisionNotWork, s.append(.{ .setState = .{ .id = d, .state = .submitted } }));
+    // But resolving it is ordinary, and so is dropping it as moot.
+    try s.append(.{ .setState = .{ .id = d, .state = .done } });
+
+    // Nature conflict, refused in BOTH directions.
+    try testing.expectError(error.DecisionNotArc, s.append(.{ .arcDeclare = .{ .id = d, .declared = true } }));
+    try s.append(.{ .add = .{ .id = arc, .title = "an arc" } });
+    try s.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try testing.expectError(error.DecisionNotArc, s.append(.{ .decisionDeclare = .{ .id = arc, .declared = true } }));
+
+    // Retraction is never refused: `--undo` is how a mistaken declaration is
+    // corrected, and it cannot conflict with anything.
+    try s.append(.{ .decisionDeclare = .{ .id = d, .declared = false } });
+    try testing.expect(!s.isDecision(d));
+    try s.append(.{ .arcDeclare = .{ .id = d, .declared = true } });
+}

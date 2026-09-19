@@ -78,6 +78,11 @@ pub const CliError = error{
     ClaimRequiresOpen,
     /// `trk state <id> claimed` without `--holder`; the hint names `submitted`.
     HolderRequired,
+    /// `trk state <id> claimed|submitted` on a declared decision — a question
+    /// is not work. See `store.StoreError.DecisionNotWork`.
+    DecisionNotWork,
+    /// A task may not be both an arc root and a decision (either direction).
+    DecisionNotArc,
     /// `trk release <id> --holder <h>` where someone other than `<h>` holds it.
     LeaseHolderMismatch,
     /// `trk stale` could not run or was refused by `git log` (not a git repo,
@@ -2031,6 +2036,22 @@ pub const Cli = struct {
     /// `--standing` additionally marks it a STANDING arc (a perpetual
     /// category, never a `next` close-out candidate — see `Store.isStanding`).
     /// See `Store.isArc`.
+    /// Turn a nature conflict from `Store.append` into a message naming both
+    /// natures and the way out. Shared by every `arcDeclare` call site in
+    /// `cmdArc`, so none of them can fail silently (`main.zig` treats
+    /// `DecisionNotArc` as "a clean message is already in `out`").
+    fn arcDeclareFailed(self: *Cli, e: anyerror, sid: []const u8) Error {
+        if (e == error.DecisionNotArc) {
+            self.print(
+                "trk: {s} is a DECISION, and a decision cannot also be an arc root. An arc contains " ++
+                    "work; a decision is a question about it. If the fork is resolved, rule it " ++
+                    "(`trk rule {s} \"<the ruling>\"`) and file the work as its own task.\n",
+                .{ sid, sid },
+            ) catch |pe| return pe;
+        }
+        return @errorCast(e);
+    }
+
     fn cmdArc(self: *Cli, args: []const []const u8) Error!void {
         if (args.len == 0) {
             try self.write("trk: usage: trk arc <id> [--undo] [--standing [--undo]]\n");
@@ -2060,13 +2081,15 @@ pub const Cli = struct {
         if (standing) {
             // Standing implies arc-ness: declare in the same act (idempotent
             // last-write-wins if already declared).
-            try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = true } });
+            self.store.append(.{ .arcDeclare = .{ .id = id, .declared = true } }) catch |e|
+                return self.arcDeclareFailed(e, try self.shortId(id, &sb));
             try self.store.append(.{ .arcStanding = .{ .id = id, .standing = true } });
             try self.print("{s} declared an arc and marked standing\n", .{try self.shortId(id, &sb)});
             return;
         }
 
-        try self.store.append(.{ .arcDeclare = .{ .id = id, .declared = !undo } });
+        self.store.append(.{ .arcDeclare = .{ .id = id, .declared = !undo } }) catch |e|
+            return self.arcDeclareFailed(e, try self.shortId(id, &sb));
         if (undo) {
             // Retracting the arc declaration also clears any orphaned standing
             // mark — a task that is no longer (declared) an arc has no
@@ -2289,6 +2312,15 @@ pub const Cli = struct {
             return error.HolderRequired;
         }
         self.store.append(.{ .setState = .{ .id = id, .state = st, .holder = holder } }) catch |e| {
+            if (e == error.DecisionNotWork) {
+                try self.print(
+                    "trk: {s} is a DECISION, not work — it cannot be {s}. A decision is a question " ++
+                        "awaiting a ruling; resolve it with `trk rule {s} \"<the ruling>\"`, which records " ++
+                        "the answer and closes it.\n",
+                    .{ sid, st.toString(), sid },
+                );
+                return e;
+            }
             if (e != error.ClaimRequiresOpen) return e;
             const from = self.store.get(id).?.state;
             // Every refusal names `submitted`: writing `claimed` to mean

@@ -186,6 +186,13 @@ pub const In = struct {
     seq: i32,
 };
 
+/// `task` raised `decision` — provenance, carrying no dependency. See
+/// `Op.raises`. No `seq`: there is no ordering among a task's forks.
+pub const Raises = struct {
+    task: Ulid,
+    decision: Ulid,
+};
+
 /// The op discriminator for a log event. Adding a variant here is a
 /// forward-compat event for every OLDER binary, not just a new feature for
 /// this one (01KYT2QET): an unrecognized op is skipped-and-warned by
@@ -268,6 +275,52 @@ pub const Op = enum {
     /// taken by someone else. Safe for an older binary to skip (it cannot load
     /// the `leased` state this op acts on anyway).
     release,
+    /// Declare (or retract) `id` as a DECISION: a fork that only the repo owner
+    /// can rule on. Last-write-wins on fold, the exact commutation shape as
+    /// `arcDeclare`, and for the same reason: it is a single-task boolean about
+    /// the task's NATURE, not its lifecycle.
+    ///
+    /// Nature, not lifecycle, is the whole point (design.md "Decisions"). An arc
+    /// stays an arc once it is done; a decision stays a decision once it is
+    /// ruled. `trk rule` resolves one by setting `done` — it must NEVER clear
+    /// this flag, or the ruled question becomes an ordinary open task and
+    /// surfaces in `next` as work to go build.
+    ///
+    /// This replaces a TAG convention (`#scott-decision`) plus a body-text grep
+    /// in `archive`. Both were archaeology: a fork had no representation in the
+    /// model, so intent was destroyed at authoring time and every downstream
+    /// mechanism was left guessing at it from prose.
+    ///
+    /// Safe for an older binary to skip, with a recorded caveat: it would see
+    /// the task as ordinary and surface it in `next`. A wasted dispatch the
+    /// agent corrects on reading the body; bricking every read would be worse.
+    decisionDeclare,
+    /// `task` raised `decision` — pure PROVENANCE, carrying no dependency and
+    /// no scheduling effect. Whether the decision also BLOCKS that task is a
+    /// separate, ordinary `dep` edge, because "raised by" and "blocks" are
+    /// genuinely different facts: a fork noticed while doing T usually does not
+    /// stop T.
+    ///
+    /// Many-to-many in both directions: several tasks legitimately hit the same
+    /// fork, and one task raises several.
+    ///
+    /// An EDGE rather than prose in the raiser's body, because a body is a
+    /// `setBody` last-write-wins scalar — recording it there is a read-modify-
+    /// write on a task other lanes may be appending to, and two concurrent
+    /// appends lose one. An edge is additive and commutes.
+    ///
+    /// EXCLUDED from the combined acyclic graph (`Store.combinedReaches`,
+    /// `checkAcyclic`): it encodes no waiting, so it cannot close a self-wait,
+    /// and walking it would reject the ordinary shape where T both raised D and
+    /// needs D.
+    raises,
+    /// Remove a `raises` edge — the inverse of `raises`, mirroring `undep`/
+    /// `unin` exactly: a fold-time tombstone that beats its add regardless of
+    /// append order, so a mis-attributed origin is correctable rather than only
+    /// overwritable. An EDGE needs a tombstone map (rather than `untag`'s plain
+    /// list removal) because it is authorable from either endpoint and so can
+    /// genuinely be raced.
+    unraises,
 };
 
 /// One log event — a tagged union over the op kinds. Fields mirror the JSON
@@ -303,10 +356,16 @@ pub fn eventTaskIds(ev: Event) [2]?Ulid {
         .arcDeclare => |x| .{ x.id, null },
         .arcStanding => |x| .{ x.id, null },
         .release => |x| .{ x.id, null },
+        .decisionDeclare => |x| .{ x.id, null },
         .dep => |x| .{ x.from, x.to },
         .undep => |x| .{ x.from, x.to },
         .in => |x| .{ x.task, x.arc },
         .unin => |x| .{ x.task, x.arc },
+        // Both endpoints, like every other edge: this is what lets
+        // `quarantineGhosts` and `tombstones --rebuild`'s history scan see the
+        // edge at all.
+        .raises => |x| .{ x.task, x.decision },
+        .unraises => |x| .{ x.task, x.decision },
         .setDocPath => .{ null, null },
     };
 }
@@ -380,4 +439,11 @@ pub const Event = union(Op) {
     setShort: struct { id: Ulid, short: []const u8, ts: i64 = 0 },
     /// Release `holder`'s lease on `id`. See `Op.release`.
     release: struct { id: Ulid, holder: []const u8, ts: i64 = 0 },
+    /// Declare/retract `id` as a decision. Last-write-wins on fold. See
+    /// `Op.decisionDeclare` — declaration is NATURE, never cleared by ruling.
+    decisionDeclare: struct { id: Ulid, declared: bool, ts: i64 = 0 },
+    /// `task` raised `decision`. Provenance only. See `Op.raises`.
+    raises: struct { task: Ulid, decision: Ulid, ts: i64 = 0 },
+    /// Remove a `raises` edge. See `Op.unraises`.
+    unraises: struct { task: Ulid, decision: Ulid, ts: i64 = 0 },
 };
