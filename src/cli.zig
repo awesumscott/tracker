@@ -1206,8 +1206,15 @@ pub const Cli = struct {
             \\      A body edit must NAME its direction; there is no `--body` (hard error).
             \\      --append-body reads the current body through trk's own log+snapshot fold,
             \\      which an external read-modify-write cannot do correctly.
-            \\  trk rule <id> <ruling text|->   append a ruling and remove #scott-decision, atomically
-            \\      (see `trk rule --help`). Refuses on a task not currently tagged #scott-decision.
+            \\  trk decision "<question>" [--from <id>] [--blocks <id> ...]
+            \\      Raise a fork as its own node, at the moment you write it. Excluded from
+            \\      `next` (a question is not buildable work); --blocks wires the tasks that
+            \\      WAIT for the ruling. `trk list --decision --state open` is the sweep.
+            \\  trk rule <id> <ruling text|->   record the answer and CLOSE the decision,
+            \\      atomically — which releases everything --blocks held back, with no second
+            \\      command. Refuses on anything that is not a declared decision.
+            \\  trk migrate-decisions --from-tag <tag> [--dry-run]
+            \\      One-shot move off a legacy tag-plus-prose convention (see its --help).
             \\  trk log [<id>] [--limit <n>] event history (most-recent-last)
             \\  trk stale                    open or claimed tasks cited in a landed commit but never closed
             \\  trk mcp-serve                serve the verbs as MCP tools over stdio (see `trk mcp-serve --help`)
@@ -3141,10 +3148,10 @@ pub const Cli = struct {
         var words: std.ArrayList([]const u8) = .empty;
         defer words.deinit(self.gpa);
         // `--not-tag <t>` (repeatable, ANDed exclusion): drop any task carrying
-        // ANY of these tags. The backfilled negative blocker-tag vocabulary
-        // (`metal`/`scott-testing`/`scott-decision`) makes the autonomous-
-        // eligible bucket one bare command:
-        //   trk next --not-tag metal --not-tag scott-testing --not-tag scott-decision
+        // ANY of these tags — a repo's own blocker-tag vocabulary, whatever it
+        // is. Decisions are NOT in it any more: they are excluded from `next`
+        // structurally (01M2VFV84), so no term is needed for them and none can
+        // be forgotten.
         var not_tags: std.ArrayList([]const u8) = .empty;
         defer not_tags.deinit(self.gpa);
         var i: usize = 0;

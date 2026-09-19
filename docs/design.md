@@ -861,11 +861,10 @@ The merge model is **owned** here, because it gates how parallel agents may touc
 where close/edge authority would become **capability-scoped**; an unscoped API is acceptable only while git
 *is* the authority log.
 
-## Decisions — a fork is a node, not a marker in prose (01M2VD RULED 2026-09-18, NOT YET BUILT)
+## Decisions — a fork is a node, not a marker in prose (2026-09-18, arc 01M2VFTG4)
 
-**Status: ruled, unimplemented.** Everything below is the agreed design; the code still carries the tag +
-body-grep convention it replaces. The implementation arc is tracked in the tracker. Read this before
-touching `reportBuriedDecisions`, `cmdRule`, or anything named `decision_*` in `Config`.
+**Status: BUILT.** Shipped across seven slices; the tag + body-grep convention it replaces is deleted. Read
+this before touching `cmdDecision`, `cmdRule`, `Store.isDecision`, or the `raises` edge.
 
 ### The problem
 
@@ -1030,6 +1029,28 @@ direction this doc elsewhere calls unsafe, so it is an explicit, recorded except
 oversight. A wasted dispatch is corrected by the agent's first read of the body; bricking every read of the
 store is worse. The stale-binary window was closed OPERATIONALLY here (one other session, restarted after
 install), not structurally — do not read this as a guarantee.
+
+### What the build changed, relative to the ruling above
+
+Recorded because the ruling is the reasoning and the code is the fact; where they diverged, the code won
+for a stated reason.
+
+- **`serializeState` + `taskFingerprint` landed in slice 1, not slice 4.** Leaving them to the compaction
+  slice would have meant an installable binary whose `compact` silently dropped every decision and `raises`
+  edge. Verified the other way round: with the emission removed, `compact` REFUSES itself with
+  `CompactVerifyFailed` rather than losing data — which is what putting the new fields in the fingerprint
+  buys, and why they belong with the fold rather than after it.
+- **`rule` refuses an already-ruled decision** rather than appending to it. A second ruling on a settled
+  fork is a mistake, not an edit.
+- **`markerFor` renders an open decision `[?]`** in `list`, `tree` and `TODO.md`. The ruling said "a
+  distinct marker or grouping"; this is the marker, and it tracks the STATE (`open` and declared), not the
+  declaration — so a ruled decision reads `[x]` like anything else finished.
+- **`looksIdShaped` survived slice 5.** Its original occasion was a second id typed after
+  `--allow-buried-decisions-for`, but the hazard is independent of that flag: `archive`'s positional is a
+  SEARCH TERM, so a bare id there matches nothing and reports an empty run. Kept, message rewritten.
+- **The `--not-tag` incantation lost exactly one of its three terms**, as the red team pointed out it would.
+  `--not-tag metal --not-tag scott-testing` survives, and `scott-testing` carries an owner's name as much
+  as the decision tag did. Out of scope here; worth filing separately.
 
 ### Rejected
 

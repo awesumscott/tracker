@@ -212,7 +212,10 @@ test "tools/list: one tool per exposed verb, all requiring tree, readOnlyHint fr
 
     for (tools) |t| {
         const name = t.object.get("name").?.string;
-        for ([_][]const u8{ "init", "migrate-arcs", "migrate-shorts", "mcp-serve" }) |cli_only|
+        // `migrate-decisions` joins the CLI-only set for the same reasons as its
+        // siblings: a one-shot migration an orchestrator runs once, whose second
+        // pass is a report a human reads and acts on.
+        for ([_][]const u8{ "init", "migrate-arcs", "migrate-shorts", "migrate-decisions", "mcp-serve" }) |cli_only|
             try testing.expect(!std.mem.eql(u8, name, cli_only));
         const schema = t.object.get("inputSchema").?.object;
         try testing.expect(schema.get("properties").?.object.get("tree") != null);
@@ -491,4 +494,56 @@ test "tools/call: a dash-leading title is refused at the boundary, never reparse
     );
     defer ok.deinit();
     try testing.expect(!ok.isError());
+}
+
+// The decisions mechanism over MCP (01M2VFX27). `decision` is exposed;
+// `migrate-decisions` deliberately is NOT — it is a one-shot migration an
+// orchestrator runs once from the CLI, and its whole second pass is a report a
+// human reads.
+test "tools/call: decision raises a node, next withholds the work it blocks, list --decision finds it" {
+    var r = try Repo.init(.{});
+    defer r.deinit();
+
+    var work = try r.call("add",
+        \\"tree":"main","title":"the display fix","arc":true
+    );
+    defer work.deinit();
+    const wid = std.mem.trimEnd(u8, work.text(), "\n");
+
+    const args = try std.fmt.allocPrint(gpa,
+        \\"tree":"main","question":"does TODO.md want the annotation?","from":"{s}","blocks":["{s}"]
+    , .{ wid, wid });
+    defer gpa.free(args);
+    var d = try r.call("decision", args);
+    defer d.deinit();
+    try testing.expect(!d.isError());
+    const did = std.mem.trimEnd(u8, d.text(), "\n");
+    try testing.expectEqual(@as(usize, 26), did.len);
+
+    // The frontier is empty: the question is not work, and the work waits on it.
+    var nx = try r.call("next", "\"tree\":\"main\"");
+    defer nx.deinit();
+    try testing.expect(!nx.isError());
+    try testing.expectEqualStrings("[]", std.mem.trim(u8, nx.text(), " \n"));
+
+    // ...and the machine-readable way to find out why, which `next --json`
+    // deliberately does not carry (an array has nowhere to put a tail).
+    var ls = try r.call("list", "\"tree\":\"main\",\"decision\":true,\"state\":\"open\"");
+    defer ls.deinit();
+    try testing.expect(!ls.isError());
+    try testing.expect(contains(ls.text(), "does TODO.md want the annotation?"));
+
+    // Ruling it releases the work, in one call.
+    const rule_args = try std.fmt.allocPrint(gpa,
+        \\"tree":"main","id":"{s}","text":"RULED: list --arc only"
+    , .{did});
+    defer gpa.free(rule_args);
+    var ruled = try r.call("rule", rule_args);
+    defer ruled.deinit();
+    try testing.expect(!ruled.isError());
+
+    var nx2 = try r.call("next", "\"tree\":\"main\"");
+    defer nx2.deinit();
+    try testing.expect(contains(nx2.text(), "the display fix"));
+    try testing.expect(!contains(nx2.text(), "does TODO.md want"));
 }
