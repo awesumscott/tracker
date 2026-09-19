@@ -2433,6 +2433,7 @@ test "every verb supports --help/-h and add --help mints no task" {
         "init",  "add",  "dep",   "undep",   "in",         "unin",      "arc",     "migrate-arcs", "migrate-shorts",
         "state", "next", "list",  "render",  "tree",       "compact",   "archive", "doc",          "show",
         "edit",  "rule", "log",   "stale",   "release",    "tombstones", "mcp-serve",
+        "decision",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -3394,52 +3395,66 @@ test "edit --rm-doc: removes a doc-ref, clears every section ref, and says so wh
     try testing.expectEqualStrings("design", left[0].doc_id);
 }
 
-test "rule: SABOTAGE PAIR -- untags+appends a #scott-decision task; refuses (untouched) on one without the tag" {
+test "rule: SABOTAGE PAIR -- records the ruling and CLOSES a decision; refuses (untouched) on a non-decision (01M2VFV83)" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
 
-    // POSITIVE half: a genuinely pending fork -- rule settles it.
+    // POSITIVE half: a genuinely pending fork, with work waiting on it.
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "the display fix" } });
     const pending = mintId();
     try f.store.append(.{ .add = .{ .id = pending, .title = "fork", .body = "(a) or (b)?" } });
-    try f.store.append(.{ .tag = .{ .id = pending, .tag = "scott-decision" } });
+    try f.store.append(.{ .decisionDeclare = .{ .id = pending, .declared = true } });
     try f.store.append(.{ .tag = .{ .id = pending, .tag = "net" } });
+    try f.store.append(.{ .dep = .{ .from = work, .to = pending } });
 
     try f.run(&.{ "rule", &pending.text, "RULED: (a), see design.md" });
     const p = f.store.get(pending).?;
     try testing.expectEqualStrings("(a) or (b)?\n\nRULED: (a), see design.md", p.body);
-    for (p.tags.items) |tg| try testing.expect(!std.mem.eql(u8, tg, "scott-decision"));
-    // Untagging is scoped to THIS task -- an unrelated tag survives untouched.
+    // CLOSING is the point: `done` satisfies a prereq, so the work waiting on
+    // this fork is released by the ruling itself, with no second command.
+    try testing.expectEqual(tracker.State.done, p.state);
+    try testing.expect(f.store.get(work).?.state.satisfiesPrereq() == false);
+    // And it says what it released, so nobody has to go looking.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "unblocks 1 task") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "the display fix") != null);
+
+    // DECLARATION IS NATURE: ruling must never clear it. If it did, the
+    // answered question would become an ordinary open task and `next` would
+    // hand it out as work to go build.
+    try testing.expect(f.store.isDecision(pending));
+    // Unrelated tags survive untouched.
     var kept_net = false;
     for (p.tags.items) |tg| {
         if (std.mem.eql(u8, tg, "net")) kept_net = true;
     }
     try testing.expect(kept_net);
 
-    // PAIRED NEGATIVE half: a task genuinely NOT tagged #scott-decision (the
-    // shape of 01M12CKRK -- a real open fork the guard must never silently
-    // close) is refused outright, body and tags untouched.
-    const untagged = mintId();
-    try f.store.append(.{ .add = .{ .id = untagged, .title = "unrelated", .body = "security note" } });
-    try f.store.append(.{ .tag = .{ .id = untagged, .tag = "security" } });
+    // PAIRED NEGATIVE half: ordinary work is refused outright, body untouched.
+    // `rule` closes its target, so using it on a non-decision would close real
+    // work on the strength of a note.
+    const ordinary = mintId();
+    try f.store.append(.{ .add = .{ .id = ordinary, .title = "unrelated", .body = "security note" } });
 
-    const e = f.runExpectErr(&.{ "rule", &untagged.text, "RULED: nope" });
+    const e = f.runExpectErr(&.{ "rule", &ordinary.text, "RULED: nope" });
     try testing.expectEqual(@as(anyerror, error.UsageError), e);
-    const u = f.store.get(untagged).?;
+    const u = f.store.get(ordinary).?;
     try testing.expectEqualStrings("security note", u.body);
-    try testing.expectEqual(@as(usize, 1), u.tags.items.len);
-    try testing.expectEqualStrings("security", u.tags.items[0]);
+    try testing.expectEqual(tracker.State.open, u.state);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "is not a decision") != null);
 
-    // A SECOND #scott-decision task is untouched by ruling the first --
-    // the removal is per-task, never global.
+    // An ALREADY-ruled decision is refused too, rather than appended to
+    // silently -- a second ruling on a settled fork is a mistake, not an edit.
+    const e2 = f.runExpectErr(&.{ "rule", &pending.text, "RULED: actually (b)" });
+    try testing.expectEqual(@as(anyerror, error.UsageError), e2);
+    try testing.expectEqualStrings("(a) or (b)?\n\nRULED: (a), see design.md", f.store.get(pending).?.body);
+
+    // A SECOND decision is untouched by ruling the first.
     const other = mintId();
     try f.store.append(.{ .add = .{ .id = other, .title = "other fork" } });
-    try f.store.append(.{ .tag = .{ .id = other, .tag = "scott-decision" } });
-    var still_tagged = false;
-    for (f.store.get(other).?.tags.items) |tg| {
-        if (std.mem.eql(u8, tg, "scott-decision")) still_tagged = true;
-    }
-    try testing.expect(still_tagged);
+    try f.store.append(.{ .decisionDeclare = .{ .id = other, .declared = true } });
+    try testing.expectEqual(tracker.State.open, f.store.get(other).?.state);
 }
 
 test "rule: too few or too many positional args is a usage error, task untouched" {
@@ -3468,7 +3483,7 @@ test "rule: `-` reads the ruling from stdin, same as --append-body" {
 
     const t = mintId();
     try f.store.append(.{ .add = .{ .id = t, .title = "t" } });
-    try f.store.append(.{ .tag = .{ .id = t, .tag = "scott-decision" } });
+    try f.store.append(.{ .decisionDeclare = .{ .id = t, .declared = true } });
 
     try f.tmp.dir.writeFile(io, .{ .sub_path = "ruling.txt", .data = "RULED: piped\n" });
     const stdin_file = try f.tmp.dir.openFile(io, "ruling.txt", .{});
@@ -3477,38 +3492,12 @@ test "rule: `-` reads the ruling from stdin, same as --append-body" {
 
     try f.run(&.{ "rule", &t.text, "-" });
     try testing.expectEqualStrings("RULED: piped", f.store.get(t).?.body);
-    try testing.expectEqual(@as(usize, 0), f.store.get(t).?.tags.items.len);
+    try testing.expectEqual(tracker.State.done, f.store.get(t).?.state);
 }
 
-test "rule.tag config: overrides the tag rule looks for and removes" {
-    const alloc = testing.allocator;
-    var f = try Fixture.init(alloc);
-    defer f.deinit();
-
-    var sub = try f.tmp.dir.createDirPathOpen(io, ".tracker", .{});
-    defer sub.close(io);
-    try sub.writeFile(io, .{
-        .sub_path = "config.json",
-        .data = "{ \"rule\": { \"tag\": \"needs-scott\" } }",
-        .flags = .{},
-    });
-    f.store.loadConfig();
-    try testing.expectEqualStrings("needs-scott", f.store.config.rule_tag.?);
-
-    const t = mintId();
-    try f.store.append(.{ .add = .{ .id = t, .title = "t", .body = "orig" } });
-    // The DEFAULT tag no longer satisfies the configured one.
-    try f.store.append(.{ .tag = .{ .id = t, .tag = "scott-decision" } });
-    const e = f.runExpectErr(&.{ "rule", &t.text, "RULED: x" });
-    try testing.expectEqual(@as(anyerror, error.UsageError), e);
-    try testing.expectEqualStrings("orig", f.store.get(t).?.body);
-
-    try f.store.append(.{ .tag = .{ .id = t, .tag = "needs-scott" } });
-    try f.run(&.{ "rule", &t.text, "RULED: x" });
-    try testing.expectEqualStrings("orig\n\nRULED: x", f.store.get(t).?.body);
-    for (f.store.get(t).?.tags.items) |tg| try testing.expect(!std.mem.eql(u8, tg, "needs-scott"));
-}
-
+// DELETED with the tag-based `rule` (01M2VFV83): `rule` no longer looks for or
+// removes any tag, so `rule.tag` has nothing to override. The config key itself
+// is removed in the slice that deletes archive's marker guard.
 test "loadConfig parses rule.tag; absent section falls back to the default" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
@@ -5359,4 +5348,105 @@ test "list --arc reports an arc's compacted members; next and render deliberatel
     const md = try f.tmp.dir.readFileAlloc(io, "TODO.md", alloc, .unlimited);
     defer alloc.free(md);
     try testing.expect(std.mem.indexOf(u8, md, "compacted") == null);
+}
+
+// ----- trk decision (01M2VFV83) -----
+
+test "trk decision: raises a node, separates provenance from blocking, prints only the id" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const work = mintId();
+    const other = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "the display fix" } });
+    try f.store.append(.{ .add = .{ .id = other, .title = "unrelated work" } });
+
+    try f.run(&.{ "decision", "does TODO.md want the annotation?", "--from", &work.text, "--blocks", &work.text });
+    // Scriptable like `add`: stdout is the id and nothing else.
+    const printed = std.mem.trimEnd(u8, f.out.items, "\n");
+    try testing.expectEqual(@as(usize, 26), printed.len);
+    const d = try tracker.ulid.parse(printed);
+
+    try testing.expect(f.store.isDecision(d));
+    try testing.expectEqualStrings("does TODO.md want the annotation?", f.store.get(d).?.title);
+
+    // Provenance and blocking are SEPARATE relations that happen to coincide
+    // here — and coinciding is exactly the shape that would be a cycle if
+    // provenance were spelled as a dep.
+    const raisers = try f.store.raisersOf(alloc, d);
+    defer alloc.free(raisers);
+    try testing.expectEqual(@as(usize, 1), raisers.len);
+    try testing.expect(raisers[0].eql(work));
+    const rdeps = try f.store.reverseDeps(alloc, d);
+    defer alloc.free(rdeps);
+    try testing.expectEqual(@as(usize, 1), rdeps.len);
+    try testing.expect(rdeps[0].eql(work));
+
+    // --from alone must NOT block: a fork noticed while doing a task usually
+    // does not stop it, which is why blocking is opt-in.
+    try f.run(&.{ "decision", "should trk support multi-user?", "--from", &other.text });
+    const d2 = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+    const rdeps2 = try f.store.reverseDeps(alloc, d2);
+    defer alloc.free(rdeps2);
+    try testing.expectEqual(@as(usize, 0), rdeps2.len);
+    // ...and it says so, on stderr, so a blocking fork filed without --blocks
+    // is not silently inert.
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "blocks nothing") != null);
+
+    // A standalone decision is legal: not every fork comes out of a task.
+    try f.run(&.{ "decision", "what should the release cadence be?" });
+    try testing.expect(f.store.isDecision(try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"))));
+}
+
+test "trk decision: a bad --from/--blocks/--in fails BEFORE minting (no half-built decision)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "work" } });
+
+    try testing.expectEqual(
+        cli.CliError.NoSuchId,
+        f.runExpectErr(&.{ "decision", "q?", "--from", "ZZZZZZZZZ" }),
+    );
+    try testing.expectEqual(
+        cli.CliError.NoSuchId,
+        f.runExpectErr(&.{ "decision", "q?", "--blocks", "ZZZZZZZZZ" }),
+    );
+    // --in must name an ALREADY-DECLARED arc, same rule as `add`.
+    try testing.expectEqual(
+        cli.CliError.UndeclaredArc,
+        f.runExpectErr(&.{ "decision", "q?", "--in", &work.text }),
+    );
+    // Nothing was minted by any of the three.
+    try testing.expectEqual(@as(usize, 1), f.store.count());
+}
+
+test "trk decision: a decision cannot be leased, submitted, or made an arc" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try f.run(&.{ "decision", "a fork" });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+
+    // A question is not work: leasing one would start stale/release bookkeeping
+    // on something nobody is building.
+    try testing.expectEqual(
+        @as(anyerror, error.DecisionNotWork),
+        f.runExpectErr(&.{ "state", &d.text, "claimed", "--holder", "lane-1" }),
+    );
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "is a DECISION, not work") != null);
+    try testing.expectEqual(
+        @as(anyerror, error.DecisionNotWork),
+        f.runExpectErr(&.{ "state", &d.text, "submitted" }),
+    );
+
+    // An arc contains work; a decision is a question about it. `rule` closes its
+    // target, so a task that were both would close an arc with members open.
+    try testing.expectEqual(
+        @as(anyerror, error.DecisionNotArc),
+        f.runExpectErr(&.{ "arc", &d.text }),
+    );
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "cannot also be an arc") != null);
 }

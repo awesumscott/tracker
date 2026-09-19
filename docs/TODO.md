@@ -22,20 +22,6 @@ SUPERSEDES 01M2V2TB9 — that task asked how to tune the marker guard's false-po
 </details>
 
 
-- [ ] `01M2VFV83` (seq 2) Verbs: trk decision, rule closes unconditionally, list --decision #decisions
-
-  <details><summary>`trk decision "&lt;question>" --from &lt;id> [--blocks &lt;id> ...] [--in &lt;arc>]…</summary>
-
-  `trk decision "<question>" --from <id> [--blocks <id> ...] [--in <arc>] [--tag t] [--body s]` — mints the node, declares it, writes raises{from, D} and a dep{blocks, D} per --blocks. Resolve --from/--blocks ids BEFORE minting (cmdAdd's no-half-built-task rule). Does NOT inherit the raiser's arcs; --in is explicit.
-
-  `trk rule <id> <text>`: append the ruling AND setState done, unconditionally. REFUSE on a task that is not a declared decision — the direct analogue of today's "refuses on a task not currently tagged". Drop the tag-removal path and Config.rule_tag with it.
-
-  `trk list --decision` — the pre-dispatch sweep replacing `list --tag scott-decision`. This is the query the whole mechanism serves; the exclusion in slice 3 is a regression without it.
-
-  Every flag must appear in the verb's help text (mcp_test asserts it).
-
-  </details>
-
 - [ ] `01M2VFV84` (seq 3) Views: next excludes decisions, and says what it withheld; render/tree mark them #decisions
 
   <details><summary>`Store.next`: skip declared decisions, the way standing arcs are…</summary>

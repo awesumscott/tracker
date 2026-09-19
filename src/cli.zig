@@ -604,6 +604,26 @@ pub const Cli = struct {
         \\  e.g.  trk arc 01KX6H4V           trk arc 01KX6H4V --undo
         \\        trk arc 01KVKHBZQ --standing           trk arc 01KVKHBZQ --standing --undo
         },
+        .{ .name = "decision", .run = &cmdDecision, .mutates = true, .tools = &decision_tools, .flags = &.{ "--from", "--blocks", "--in", "--seq", "--tag", "--body", "-v", "--verbose" }, .text =
+        \\trk decision "<question>" [--from <id>] [--blocks <id> ...] [--in <arc> [--seq <n>]]
+        \\               [--tag <t> ...] [--body <s>] [-v]
+        \\  Raise a fork as its OWN node, at the moment you write it. Prints ONLY the
+        \\  new ULID (scriptable); -v prints the friendly form. A decision is a task
+        \\  declared a decision — it is excluded from `next` (a question is not
+        \\  buildable work), it cannot be leased or submitted, and it cannot also be an
+        \\  arc root.
+        \\  --from <id>: PROVENANCE — that task raised this fork. No scheduling effect.
+        \\  --blocks <id> (repeatable): an ordinary `needs` edge — that task waits for
+        \\  the ruling. SEPARATE from --from on purpose: a fork noticed while doing a
+        \\  task usually does NOT stop it, so blocking is opt-in. --blocks names the
+        \\  task that WAITS, so the edge direction is stated rather than positional.
+        \\  Resolve it with `trk rule <id> "<the ruling>"`, which records the answer,
+        \\  closes the decision and thereby releases everything --blocks held back.
+        \\  Sweep the open ones with `trk list --decision --state open`.
+        \\  -v/--verbose prints the friendly form instead of the bare id.
+        \\  e.g.  trk decision "does TODO.md want the annotation?" --from 01M2V2TSA --blocks 01M2V2TSA
+        \\        trk decision "should trk support multi-user?"
+        },
         .{ .name = "migrate-arcs", .run = &cmdMigrateArcs, .mutates = true, .tools = &cli_only_tools, .text =
         \\trk migrate-arcs
         \\  One-time (but idempotent/re-runnable) migration, two passes: (1) for every
@@ -688,14 +708,17 @@ pub const Cli = struct {
         \\  e.g.  trk next           trk next prism windowed
         },
         .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--state", "--tag", "--not-tag", "--limit", "--json", "--word" }, .text =
-        \\trk list [--arc <id> | --no-arc] [--state <s>] [--tag <t>] [--not-tag <t> ...]
-        \\         [--limit <n>] [--json] [<term> | --word <term> ...]
+        \\trk list [--arc <id> | --no-arc] [--decision] [--state <s>] [--tag <t>]
+        \\         [--not-tag <t> ...] [--limit <n>] [--json] [<term> | --word <term> ...]
         \\  Every task (not just the ready frontier), filterable by arc/state/tag and
         \\  the same bare-term search as `next`. --not-tag (repeatable, ANDed
         \\  exclusion) drops any task carrying that tag. --no-arc lists every task in
         \\  NO arc (by the unified isArc/membership model, including needs-
         \\  reachability) — the completeness query for "sort everything into arcs";
-        \\  mutually exclusive with --arc. --json for machine-readable output (same
+        \\  mutually exclusive with --arc. --decision lists only declared decisions;
+        \\  pair it with --state open for the PENDING ones, which is the pre-dispatch
+        \\  "what is still waiting on a call" sweep (a declaration is nature and
+        \\  survives the ruling, so --decision alone is every fork ever raised). --json for machine-readable output (same
         \\  object shape as `next --json`, body included).
         \\  With --arc, a tail line reports the arc's COMPACTED members by count and
         \\  points at `trk tree <arc>`, which names them. `list` already shows closed
@@ -851,29 +874,21 @@ pub const Cli = struct {
         },
         .{ .name = "rule", .run = &cmdRule, .mutates = true, .tools = &rule_tools, .text =
         \\trk rule <id> <ruling text|->
-        \\  Record a ruling on a `#scott-decision` task and remove that tag IN THE SAME
-        \\  COMMAND — the atomic pairing `trk edit --append-body` cannot guarantee, because
-        \\  `edit` is generic and has no notion that the text it is appending settles the
-        \\  fork the tag exists to flag (01M298M9Z, ruled 2026-09-11: "it is insane that
-        \\  this is a new task as a scott-decision that asks to remove a scott-decision
-        \\  that should have already been removed"). `<ruling text>` is appended to the
-        \\  body exactly like `--append-body` (accepts `-` for stdin); the decision tag
-        \\  (`.tracker/config.json`'s `rule.tag`, default `#scott-decision`) is then
-        \\  removed. Refuses on a task that does not currently carry the tag — `rule` is
-        \\  for closing out a pending fork, not a general body+tag edit; use `trk edit`
-        \\  for that.
-        \\  This does NOT close the task: a ruling sometimes leaves the task alive as the
-        \\  carrier for the ruled work (rename/re-scope it instead), sometimes the task is
-        \\  now done — that is a separate, judgment-based `trk state <id> done`.
-        \\  Still depends on an author reaching for `rule` instead of hand-composing
-        \\  `edit --append-body` + `edit --rm-tag scott-decision` — it cannot stop that,
-        \\  only make the correct action the shorter and more obvious one, and remove the
-        \\  chance of doing half of it. (`trk archive`'s buried-decision guard is the
-        \\  complementary check at the OTHER end of the lifecycle: it catches a decision
-        \\  still discussed in a task's body at ARCHIVE time; `rule` is for a decision
-        \\  that is answered while the task stays OPEN, which archive's guard never sees.)
-        \\  e.g.  trk rule 01M298M9Z "RULED: (a), see docs/design.md"
-        \\        trk show 01M298M9Z --body | trk rule 01M298M9Z -
+        \\  Record the answer to a DECISION and close it, atomically: appends the
+        \\  ruling to the decision's body and sets it `done`. `-` reads the ruling
+        \\  from stdin.
+        \\  Closing is the point, not a side effect: `done` satisfies a prereq, so
+        \\  every task wired `--blocks` on this fork becomes eligible the moment it is
+        \\  answered — with no second command to forget. The tasks it released are
+        \\  named in the output.
+        \\  It does NOT clear the decision declaration. Declaration is NATURE, like
+        \\  arc-ness: an arc stays an arc once done, and a ruled decision stays a
+        \\  decision. Clearing it would turn the answered question back into an
+        \\  ordinary open task and `next` would hand it out as work to go build.
+        \\  REFUSES on a task that is not a declared decision — `rule` is the resolver
+        \\  for forks, not a way to close work on the strength of a note; use
+        \\  `trk edit <id> --append-body` for that. Refuses on an already-ruled one too.
+        \\  e.g.  trk rule 01M2V2TSA "list --arc only; TODO.md stays forward-looking"
         },
         .{ .name = "log", .run = &cmdLog, .tools = &log_tools, .flags = &.{ "--limit", "--json" }, .text =
         \\trk log [<id>] [--limit <n>] [--json]
@@ -1025,6 +1040,7 @@ pub const Cli = struct {
     const list_tools = [_]Tool{.{ .name = "list", .argv = &.{"--json"}, .params = &.{
         p_arc_filter,
         .{ .name = "no_arc", .kind = .boolean, .flag = "--no-arc", .desc = "Only tasks in no arc." },
+        .{ .name = "decision", .kind = .boolean, .flag = "--decision", .desc = "Only declared decisions (add state=open for the pending ones)." },
         .{
             .name = "state",
             .kind = .choice,
@@ -1077,9 +1093,19 @@ pub const Cli = struct {
         .{ .name = "priority", .kind = .integer, .flag = "--priority", .desc = "Lower sorts first; 0 = unset." },
     } }};
 
+    const decision_tools = [_]Tool{.{ .name = "decision", .params = &.{
+        .{ .name = "question", .kind = .string, .required = true, .desc = "The fork, as a question." },
+        .{ .name = "from", .kind = .string, .flag = "--from", .desc = "The task that raised it (provenance; no scheduling effect)." },
+        .{ .name = "blocks", .kind = .string_list, .flag = "--blocks", .desc = "Task ids that WAIT for this ruling." },
+        .{ .name = "in", .kind = .string, .flag = "--in", .desc = "Add to this already-declared arc." },
+        .{ .name = "seq", .kind = .integer, .flag = "--seq", .desc = "Arc sequence (with `in`)." },
+        .{ .name = "tag", .kind = .string_list, .flag = "--tag", .desc = "Tags." },
+        .{ .name = "body", .kind = .string, .flag = "--body", .desc = "Detail behind the question." },
+    } }};
+
     const rule_tools = [_]Tool{.{ .name = "rule", .params = &.{
         p_id,
-        .{ .name = "text", .kind = .string, .required = true, .desc = "The ruling, appended to the body (like --append-body). Removes #scott-decision." },
+        .{ .name = "text", .kind = .string, .required = true, .desc = "The ruling. Appended to the decision's body; closes it, releasing whatever it blocked." },
     } }};
 
     const log_tools = [_]Tool{.{ .name = "log", .argv = &.{"--json"}, .params = &.{
@@ -3474,6 +3500,13 @@ pub const Cli = struct {
     fn cmdList(self: *Cli, args: []const []const u8) Error!void {
         var arc_filter: ?[]const u8 = null;
         var no_arc = false;
+        // `--decision`: the pre-dispatch sweep — "what is still waiting on a
+        // call" (01M2VFV83). This is the query the whole decisions mechanism
+        // serves, and what replaces `list --tag scott-decision`. Combines with
+        // `--state open` for the PENDING ones specifically: a declaration is
+        // nature and stays true after a ruling, so `--decision` alone is every
+        // decision ever raised, ruled or not.
+        var decisions_only = false;
         var state_filter: ?State = null;
         var tag_filter: ?[]const u8 = null;
         var limit: ?usize = null;
@@ -3491,6 +3524,8 @@ pub const Cli = struct {
                 arc_filter = try self.flagVal(args, &i, "--arc");
             } else if (std.mem.eql(u8, args[i], "--no-arc")) {
                 no_arc = true;
+            } else if (std.mem.eql(u8, args[i], "--decision")) {
+                decisions_only = true;
             } else if (std.mem.eql(u8, args[i], "--state")) {
                 const sv = try self.flagVal(args, &i, "--state");
                 state_filter = State.fromString(sv) orelse {
@@ -3543,6 +3578,7 @@ pub const Cli = struct {
                 continue;
             }
             if (members) |m| if (!containsId(m, id)) continue;
+            if (decisions_only and !self.store.isDecision(id)) continue;
             if (tag_filter) |tf| if (!hasTag(t, tf)) continue;
             if (hasAnyTag(t, not_tags.items)) continue;
             if (!allWordsMatch(t, words.items)) continue;
@@ -4878,10 +4914,171 @@ pub const Cli = struct {
     /// distinct verb rather than "remember to pass both flags to `edit`" is
     /// that its OWN code always performs both, so nothing routed through
     /// `rule` can end up half-done.
+    // ----------------------------------------------------------- decision
+
+    /// `trk decision "<question>" [--from <id>] [--blocks <id> ...] [--in <arc>]
+    /// [--tag <t> ...] [--body <s>]` — raise a fork as its own node
+    /// (01M2VFV83).
+    ///
+    /// This is the authoring-time capture the whole mechanism rests on. A fork
+    /// used to be a string in a body plus a tag, so intent was destroyed the
+    /// moment it was written and every downstream mechanism was left grepping
+    /// prose for it. Said here, once, it is structure.
+    ///
+    /// The two relations are SEPARATE because they are different facts:
+    ///   * `--from <id>`   — provenance. This task raised it. No scheduling
+    ///                       effect whatsoever.
+    ///   * `--blocks <id>` — an ordinary `dep`: that task needs this ruling.
+    /// A fork noticed while doing T usually does NOT stop T, so non-blocking is
+    /// the default and `--blocks` is opt-in. `--blocks` names the task that
+    /// WAITS, so the edge direction is stated as an effect rather than as two
+    /// interchangeable endpoints — the same hazard that made the bare
+    /// `trk dep A B` form a hard error.
+    fn cmdDecision(self: *Cli, args: []const []const u8) Error!void {
+        if (args.len == 0) {
+            try self.write("trk: decision needs a \"<question>\"\n");
+            return error.MissingArgument;
+        }
+        var question: ?[]const u8 = null;
+        var body: []const u8 = "";
+        var body_owned = false;
+        defer if (body_owned) self.gpa.free(body);
+        var from_arg: ?[]const u8 = null;
+        var in_arc: ?[]const u8 = null;
+        var seq: i32 = 0;
+        var verbose = false;
+        var blocks: std.ArrayList([]const u8) = .empty;
+        defer blocks.deinit(self.gpa);
+        var tags: std.ArrayList([]const u8) = .empty;
+        defer tags.deinit(self.gpa);
+
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (arg.len == 0 or arg[0] != '-') {
+                if (question != null) {
+                    try self.print(
+                        "trk: decision takes exactly one positional (the question) — '{s}' is a second one. " ++
+                            "Quote the whole question as ONE argument (trk decision --help)\n",
+                        .{arg},
+                    );
+                    return error.UsageError;
+                }
+                question = arg;
+            } else if (std.mem.eql(u8, arg, "--from")) {
+                from_arg = try self.flagVal(args, &i, "--from");
+            } else if (std.mem.eql(u8, arg, "--blocks")) {
+                try blocks.append(self.gpa, try self.flagVal(args, &i, "--blocks"));
+            } else if (std.mem.eql(u8, arg, "--in")) {
+                in_arc = try self.flagVal(args, &i, "--in");
+            } else if (std.mem.eql(u8, arg, "--seq")) {
+                seq = try self.parseI32(try self.flagVal(args, &i, "--seq"));
+            } else if (std.mem.eql(u8, arg, "--tag")) {
+                try tags.append(self.gpa, try self.flagVal(args, &i, "--tag"));
+            } else if (std.mem.eql(u8, arg, "--body")) {
+                const b = try self.bodyArg("--body", try self.flagVal(args, &i, "--body"));
+                body = b.text;
+                body_owned = b.owned;
+            } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+                verbose = true;
+            } else {
+                return self.unknownFlag(arg);
+            }
+        }
+
+        const the_question = question orelse {
+            try self.write("trk: decision needs a \"<question>\" — every other argument here is a flag.\n");
+            return error.MissingArgument;
+        };
+
+        // Resolve every referenced id BEFORE minting, so a bad --from/--blocks/
+        // --in fails without leaving a half-built decision in the log — the same
+        // rule `add` follows.
+        const from_id: ?Ulid = if (from_arg) |f| try self.resolve(f) else null;
+        const arc_id: ?Ulid = if (in_arc) |a| try self.resolve(a) else null;
+        if (arc_id) |a| {
+            if (!self.store.isArc(a)) {
+                var ab: [ulid.len]u8 = undefined;
+                const as = try self.shortId(a, &ab);
+                try self.print(
+                    "trk: refusing: {s} is not a declared arc — declare it first with `trk arc {s}`, then retry\n",
+                    .{ as, as },
+                );
+                return error.UndeclaredArc;
+            }
+        }
+        const blocked = try self.gpa.alloc(Ulid, blocks.items.len);
+        defer self.gpa.free(blocked);
+        for (blocks.items, 0..) |b, bi| blocked[bi] = try self.resolve(b);
+
+        const id = ulid.mint(self.io);
+        // Freeze the short id before `id` is in the store, so the collision
+        // check runs against the pre-add id set (mintShortId's contract).
+        var sb: [ulid.len]u8 = undefined;
+        const short = try self.mintShortId(id, &sb);
+        const tag_slice = try self.gpa.alloc([]const u8, tags.items.len);
+        defer self.gpa.free(tag_slice);
+        for (tags.items, 0..) |tg, ti| tag_slice[ti] = tg;
+
+        try self.store.append(.{ .add = .{
+            .id = id,
+            .title = the_question,
+            .body = body,
+            .tags = tag_slice,
+            .short = short,
+        } });
+        try self.store.append(.{ .decisionDeclare = .{ .id = id, .declared = true } });
+        if (from_id) |f| try self.store.append(.{ .raises = .{ .task = f, .decision = id } });
+        if (arc_id) |a| try self.store.append(.{ .in = .{ .task = id, .arc = a, .seq = seq } });
+        for (blocked) |b| try self.store.append(.{ .dep = .{ .from = b, .to = id } });
+
+        var idb: [ulid.len]u8 = undefined;
+        const sid = try self.shortId(id, &idb);
+        if (verbose) {
+            try self.print("raised decision {s} ({s})\n", .{ sid, &id.text });
+            if (from_id) |f| {
+                var fb: [ulid.len]u8 = undefined;
+                try self.print("  raised by {s}\n", .{try self.shortId(f, &fb)});
+            }
+            for (blocked) |b| {
+                var bb: [ulid.len]u8 = undefined;
+                try self.print("  blocks {s}\n", .{try self.shortId(b, &bb)});
+            }
+        } else {
+            // Scriptable, exactly like `add`: stdout is the id and nothing else.
+            try self.print("{s}\n", .{&id.text});
+        }
+        if (blocked.len == 0) {
+            try self.warn.print(
+                self.gpa,
+                "trk: note: {s} blocks nothing — it will not hold any task back. " ++
+                    "If work is waiting on this ruling, say so: `trk decision ... --blocks <id>`.\n",
+                .{sid},
+            );
+        }
+    }
+
+    /// `trk rule <id> <ruling text|->` — record the ruling and CLOSE the
+    /// decision, atomically (01M2VFV83).
+    ///
+    /// Resolution is STATE; declaration is nature and is never touched here.
+    /// That split is what makes the blocking `dep` release on the ruling with no
+    /// second command: `done` satisfies a prereq, so every task that was waiting
+    /// on this fork becomes eligible the moment it is answered. The earlier
+    /// tag-based shape appended the ruling and untagged WITHOUT closing, which
+    /// under `dep`-based blocking would leave the work blocked pending a
+    /// separate, forgettable `trk state <id> done` — the exact failure `rule`
+    /// exists to eliminate — and would leave the answered question sitting in
+    /// `next` as work to go build.
+    ///
+    /// REFUSES on anything that is not a declared decision. The direct analogue
+    /// of the old "refuses on a task not currently carrying the tag": `rule` is
+    /// the resolver for decisions, and using it on ordinary work would close
+    /// that work on the strength of a note.
     fn cmdRule(self: *Cli, args: []const []const u8) Error!void {
         if (args.len < 2) {
             try self.write("trk: usage: trk rule <id> <ruling text|->\n" ++
-                "  Appends <ruling text> to the body and removes the decision tag, atomically.\n");
+                "  Appends <ruling text> to the decision's body and closes it, atomically.\n");
             return error.MissingArgument;
         }
         const id = try self.resolve(args[0]);
@@ -4889,33 +5086,48 @@ pub const Cli = struct {
             try self.print("trk: rule takes exactly one ruling-text argument, got {d} extra\n", .{args.len - 2});
             return error.UsageError;
         }
-        const tag = self.store.config.rule_tag orelse tracker.store.default_decision_tag;
         const b = try self.bodyArg("rule", args[1]);
         defer if (b.owned) self.gpa.free(b.text);
 
         var sb: [ulid.len]u8 = undefined;
         const sid = try self.shortId(id, &sb);
 
-        const t = self.store.get(id).?; // resolve() already proved it exists
-        var tagged = false;
-        for (t.tags.items) |tg| {
-            if (std.mem.eql(u8, tg, tag)) {
-                tagged = true;
-                break;
-            }
-        }
-        if (!tagged) {
+        if (!self.store.isDecision(id)) {
             try self.print(
-                "trk: {s} does not carry #{s} -- `rule` is for closing out a PENDING decision " ++
-                    "fork. If you meant to add a note, use `trk edit --append-body`.\n",
-                .{ sid, tag },
+                "trk: {s} is not a decision — `rule` records the answer to a fork and closes it. " ++
+                    "To raise one, `trk decision \"<question>\" --from {s}`; to add a note to ordinary " ++
+                    "work, `trk edit {s} --append-body`.\n",
+                .{ sid, sid, sid },
+            );
+            return error.UsageError;
+        }
+
+        const t = self.store.get(id).?; // resolve() already proved it exists
+        if (t.state.satisfiesPrereq()) {
+            try self.print(
+                "trk: {s} is already {s} — it has been ruled. `trk show {s}` for the ruling; " ++
+                    "`trk edit {s} --append-body` to add to it.\n",
+                .{ sid, t.state.toString(), sid, sid },
             );
             return error.UsageError;
         }
 
         try self.applyBodyEdit(id, sid, b.text, true);
-        try self.store.append(.{ .untag = .{ .id = id, .tag = tag } });
-        try self.print("{s}: -#{s}\n", .{ sid, tag });
+        try self.store.append(.{ .setState = .{ .id = id, .state = .done } });
+        try self.print("{s}: ruled and closed\n", .{sid});
+
+        // Name what the ruling just released. The whole point of blocking on a
+        // decision is that answering it unblocks the work, and an agent that
+        // cannot see which work moved has to go looking for it.
+        const freed = try self.store.reverseDeps(self.gpa, id);
+        defer self.gpa.free(freed);
+        if (freed.len != 0) {
+            try self.print("  unblocks {d} task(s):\n", .{freed.len});
+            for (freed) |f| {
+                var fb: [ulid.len]u8 = undefined;
+                try self.print("    {s}  {s}\n", .{ try self.shortId(f, &fb), self.store.get(f).?.title });
+            }
+        }
     }
 
     /// True iff `id` currently carries any docref to `doc_id` (section or not).
