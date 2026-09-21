@@ -2419,10 +2419,10 @@ test "every verb supports --help/-h and add --help mints no task" {
     // The full dispatch set. Kept in lockstep with the `verbs` table via the
     // count assertion below, so a new verb without a help entry is caught.
     const verbs = [_][]const u8{
-        "init",  "add",  "dep",   "undep",   "in",         "unin",      "arc",     "migrate-arcs", "migrate-shorts",
-        "state", "next", "list",  "render",  "tree",       "compact",   "archive", "doc",          "show",
-        "edit",  "rule", "log",   "stale",   "release",    "tombstones", "mcp-serve",
-        "decision", "migrate-decisions",
+        "init",              "add",  "dep",  "undep",  "in",            "unin",    "arc",        "migrate-arcs", "migrate-shorts",
+        "state",             "next", "list", "render", "tree",          "compact", "archive",    "doc",          "show",
+        "edit",              "rule", "log",  "stale",  "stale-rulings", "release", "tombstones", "mcp-serve",    "decision",
+        "migrate-decisions",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -3227,6 +3227,90 @@ test "trk stale: reports nothing when no open task is cited" {
 
     try f.run(&.{"stale"});
     try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing") != null);
+}
+
+// ----- trk stale-rulings (01M31D03S) -----
+
+test "trk stale-rulings: SABOTAGE PAIR -- flags a raiser unreconciled since its decision was ruled (the 01M2GTWS2 shape), clears once its BODY is touched after; a TITLE-only touch does NOT clear it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The raiser: an ordinary open task, never touched again after it raises.
+    const raiser = mintId();
+    try f.store.append(.{ .add = .{ .id = raiser, .title = "THROW THE SWITCH", .body = "what is still open is only the timing" } });
+
+    // PAIRED NEGATIVE, wired first so it can't be the reason the positive
+    // passes: an unrelated open task raising a decision that is NOT yet
+    // ruled must never be flagged -- an open fork is not this check's business.
+    const unrelated = mintId();
+    try f.store.append(.{ .add = .{ .id = unrelated, .title = "unrelated carrier, fork still open" } });
+    try f.run(&.{ "decision", "an unrelated, still-open fork", "--from", &unrelated.text });
+
+    // Raise and rule the decision on `raiser` via the REAL `trk decision` +
+    // `trk rule` sequence a session runs -- exercises cmdRule's actual
+    // setBody+setState(done) pair rather than a hand-built fixture.
+    try f.run(&.{ "decision", "throw when, and is the day-one loss acceptable?", "--from", &raiser.text });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+    try f.run(&.{ "rule", &d.text, "RULED: when the work is done." });
+
+    // RED: `raiser` has not touched its own body since -- exactly 01M2GTWS2's
+    // shape. Reported AND a nonzero exit (error.StaleRulings), not just text;
+    // the unrelated still-open fork's carrier must NOT appear.
+    const e = f.runExpectErr(&.{"stale-rulings"});
+    try testing.expectEqual(@as(anyerror, error.StaleRulings), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "THROW THE SWITCH") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 raiser task") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "unrelated carrier") == null);
+
+    // A TITLE-only touch is NOT enough to clear it -- the false-green this
+    // check must avoid. Measured live: 01M2GTWS2's title WAS edited 23h after
+    // its decision was ruled, and the carrier stayed unreconciled anyway (the
+    // very failure 01M31D03S was filed over), so a title-inclusive form would
+    // have missed the exact case that motivated this check.
+    try f.run(&.{ "edit", &raiser.text, "--title", "THROW THE SWITCH (retitled, body untouched)" });
+    const e2 = f.runExpectErr(&.{"stale-rulings"});
+    try testing.expectEqual(@as(anyerror, error.StaleRulings), e2);
+
+    // GREEN: an explicit BODY touch strictly after the ruling reconciles it.
+    // The sleep guarantees a real clock gap -- `Store.append` stamps `ts` off
+    // the wall clock, and two calls this close together can otherwise land in
+    // the same millisecond, which this check's same-millisecond-still-stale
+    // rule (see `cmdStaleRulings`) would then still flag.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .real);
+    try f.run(&.{ "edit", &raiser.text, "--append-body", "RECONCILED: ruled by the decision above -- thrown when the work is done, not on a date." });
+    try f.run(&.{"stale-rulings"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing") != null);
+}
+
+test "trk stale-rulings: rejects an unknown flag; --json emits the structured fields; a later `archive` does not hide the ruling" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    try testing.expectEqual(cli.CliError.UsageError, f.runExpectErr(&.{ "stale-rulings", "--bogus" }));
+
+    const raiser = mintId();
+    try f.store.append(.{ .add = .{ .id = raiser, .title = "carrier", .body = "orig" } });
+    try f.run(&.{ "decision", "a fork", "--from", &raiser.text });
+    const d = try tracker.ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+    try f.run(&.{ "rule", &d.text, "RULED: x." });
+
+    const e = f.runExpectErr(&.{ "stale-rulings", "--json" });
+    try testing.expectEqual(@as(anyerror, error.StaleRulings), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"raiser\":") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"body_ts\":0") != null);
+
+    // A ruled decision later graduating to `archived` (what `trk archive`
+    // does) must not erase or move the ruled-at moment `scanRulingEvents`
+    // recorded off the `setState -> done` event -- `archived` is a SECOND,
+    // LATER transition on the same id, and the guard in `scanRulingEvents`
+    // exists precisely so it can't overwrite the first.
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .real);
+    try f.store.append(.{ .setState = .{ .id = d, .state = .archived } });
+    const e2 = f.runExpectErr(&.{"stale-rulings"});
+    try testing.expectEqual(@as(anyerror, error.StaleRulings), e2);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "carrier") != null);
 }
 
 // ----------------------------------------------------------- helpers
@@ -5141,14 +5225,16 @@ test "migrate-decisions REPORTS prose forks and files nothing from the scan" {
 
     const prose = mintId();
     const clean = mintId();
-    try f.store.append(.{ .add = .{
-        .id = prose,
-        .title = "other work",
-        // Not colon-glued: the shape the old guard's classifier called
-        // "prose-shaped" and would have let through if its refusal had ever
-        // been narrowed. The finder is case-insensitive over hand-written prose.
-        .body = "Done.\nfix note — the seq ordering under a standing arc is still wrong.",
-    } });
+    try f.store.append(.{
+        .add = .{
+            .id = prose,
+            .title = "other work",
+            // Not colon-glued: the shape the old guard's classifier called
+            // "prose-shaped" and would have let through if its refusal had ever
+            // been narrowed. The finder is case-insensitive over hand-written prose.
+            .body = "Done.\nfix note — the seq ordering under a standing arc is still wrong.",
+        },
+    });
     try f.store.append(.{ .add = .{ .id = clean, .title = "ordinary", .body = "nothing to see" } });
 
     const before = f.store.count();

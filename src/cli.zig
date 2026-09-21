@@ -106,6 +106,12 @@ pub const CliError = error{
     /// no dedicated exit code for this the way `CompactedId` gets one, because
     /// nothing resolves an id through this path the way `show` does).
     TombstoneIndexIncomplete,
+    /// `trk stale-rulings` found at least one open/blocked/claimed task whose
+    /// own most recent `setBody` does not postdate the ruling of a decision it
+    /// `raises` (01M31D03S). The offending raisers are already listed in `out`
+    /// before this is returned; main.zig exits 1, same shape as
+    /// `TombstoneIndexIncomplete`.
+    StaleRulings,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -524,7 +530,7 @@ pub const Cli = struct {
         \\  e.g.  trk add "Add dark mode" --tag ui --in 01KVX4K0 --needs 01KWZJFRR
         \\        trk add "Ship v2" --arc
         },
-        .{ .name = "dep", .run = &cmdDep, .mutates = true, .tools = &dep_tools, .flags = &.{ "--needs" }, .text =
+        .{ .name = "dep", .run = &cmdDep, .mutates = true, .tools = &dep_tools, .flags = &.{"--needs"}, .text =
         \\trk dep <needer> --needs <prereq> [--needs <prereq> ...]
         \\  Make <needer> require prerequisite <prereq> (a `needs` edge). ONE positional,
         \\  the prereq(s) flagged: two bare positionals of the same type could be swapped
@@ -541,14 +547,14 @@ pub const Cli = struct {
         \\  prereq in a DIFFERENT arc — or the whole of a different arc — is unaffected.
         \\  e.g.  trk dep 01KX6H4V --needs 01KX6H48   (init needs config)
         },
-        .{ .name = "undep", .run = &cmdUndep, .mutates = true, .tools = &undep_tools, .flags = &.{ "--needs" }, .text =
+        .{ .name = "undep", .run = &cmdUndep, .mutates = true, .tools = &undep_tools, .flags = &.{"--needs"}, .text =
         \\trk undep <needer> --needs <prereq> [--needs <prereq> ...]
         \\  Remove the <needer> needs <prereq> edge (tombstoned; a no-op if absent).
         \\  Exact argument shape as `trk dep`, so undoing an edge is the same sentence
         \\  with one verb changed. The bare two-positional form is a hard usage error.
         \\  e.g.  trk undep 01KX6H4V --needs 01KX6H48
         },
-        .{ .name = "in", .run = &cmdIn, .mutates = true, .tools = &in_tools, .flags = &.{ "--seq" }, .text =
+        .{ .name = "in", .run = &cmdIn, .mutates = true, .tools = &in_tools, .flags = &.{"--seq"}, .text =
         \\trk in <task> <arc> [--seq <n>]
         \\  Add <task> to arc <arc> as a DIRECT member, optionally ordered by --seq.
         \\  <arc> MUST already be a declared arc (`trk arc <arc>` / `trk add --arc`) —
@@ -655,7 +661,7 @@ pub const Cli = struct {
         \\  migrated task, plus a summary count. A second run finds nothing — safe to
         \\  re-run blind.
         },
-        .{ .name = "migrate-shorts", .run = &cmdMigrateShorts, .mutates = true, .tools = &cli_only_tools, .flags = &.{ "--min" }, .text =
+        .{ .name = "migrate-shorts", .run = &cmdMigrateShorts, .mutates = true, .tools = &cli_only_tools, .flags = &.{"--min"}, .text =
         \\trk migrate-shorts [--min <n>]
         \\  One-time (but idempotent/re-runnable) migration: for every task with no
         \\  FROZEN short id yet, freeze it at its CURRENT dynamically-computed short
@@ -674,7 +680,7 @@ pub const Cli = struct {
         \\  or 6 chars becomes longer). Run it once, on purpose, not routinely.
         \\  e.g.  trk migrate-shorts --min 9
         },
-        .{ .name = "state", .run = &cmdState, .mutates = true, .tools = &state_tools, .flags = &.{ "--holder" }, .text =
+        .{ .name = "state", .run = &cmdState, .mutates = true, .tools = &state_tools, .flags = &.{"--holder"}, .text =
         \\trk state <id> <open|claimed|submitted|done|blocked|dropped> [--holder <who>]
         \\  Set a task's state. Lifecycle: open -> claimed -> submitted -> done, with
         \\  `trk release` (claimed -> open) as the release.
@@ -696,7 +702,7 @@ pub const Cli = struct {
         \\  e.g.  trk state 01KX6H48 claimed --holder lane-3
         \\        trk state 01KX6H48 submitted
         },
-        .{ .name = "release", .run = &cmdRelease, .mutates = true, .tools = &release_tools, .flags = &.{ "--holder" }, .text =
+        .{ .name = "release", .run = &cmdRelease, .mutates = true, .tools = &release_tools, .flags = &.{"--holder"}, .text =
         \\trk release <id> [--holder <who>]
         \\trk release --holder <who>
         \\  Release a lease (claimed -> open), putting the task back in `trk next`.
@@ -768,7 +774,7 @@ pub const Cli = struct {
         \\        trk list --state submitted           (the awaiting-verification queue)
         \\        trk list --state claimed             (tasks currently leased)
         },
-        .{ .name = "render", .run = &cmdRender, .mutates = true, .tools = &render_tools, .flags = &.{ "--out" }, .text =
+        .{ .name = "render", .run = &cmdRender, .mutates = true, .tools = &render_tools, .flags = &.{"--out"}, .text =
         \\trk render [--out <path>]
         \\  Write the TODO.md markdown projection. Destination precedence:
         \\  explicit --out > config render.out > stdout. Overwrites the target (it is
@@ -780,7 +786,7 @@ pub const Cli = struct {
         \\  unchanged in the raw bytes. The header reports an arc-less drift count
         \\  every regeneration (`trk list --no-arc` for the list).
         },
-        .{ .name = "tree", .run = &cmdTree, .tools = &tree_tools, .flags = &.{ "--json" }, .text =
+        .{ .name = "tree", .run = &cmdTree, .tools = &tree_tools, .flags = &.{"--json"}, .text =
         \\trk tree <arc-or-task> [--json]
         \\  Print the ASCII prereq hierarchy rooted at an arc or task (prereqs nested
         \\  under their dependents; a shared prereq prints once, then "(seen)").
@@ -916,7 +922,7 @@ pub const Cli = struct {
         \\  Event history, most-recent-last: the whole log, or one task's events.
         \\  --json: an array of {ts,op,task_id,summary}.
         },
-        .{ .name = "stale", .run = &cmdStale, .tools = &stale_tools, .flags = &.{ "--oneline" }, .text =
+        .{ .name = "stale", .run = &cmdStale, .tools = &stale_tools, .flags = &.{"--oneline"}, .text =
         \\trk stale
         \\  Cross-reference: which OPEN tasks have their id cited in a LANDED commit
         \\  message (this branch's `git log --oneline` ancestry — deliberately NOT
@@ -928,6 +934,35 @@ pub const Cli = struct {
         \\  queue — see `trk state --help`). Runs `git` against the store root (the
         \\  repo housing `.tracker/`, which may differ from where `trk` itself lives).
         \\  e.g.  trk stale
+        },
+        .{ .name = "stale-rulings", .run = &cmdStaleRulings, .tools = &cli_only_tools, .flags = &.{"--json"}, .text =
+        \\trk stale-rulings [--json]
+        \\  Cross-reference: which OPEN/BLOCKED/CLAIMED task RAISES a decision that
+        \\  is now RULED (done/archived) but has not touched its own BODY since?
+        \\  `trk rule` appends the ruling and closes the decision (see `trk rule
+        \\  --help`); it does NOTHING to the task that raised it, so the raiser can
+        \\  keep advertising an already-answered question — to `next`, `list`,
+        \\  TODO.md, a dispatcher, a compaction summary — none of which follow the
+        \\  `raises` pointer to the ruling (01M31D03S, measured on 01M2GTWS2 /
+        \\  01M2VMXA0C).
+        \\  STRUCTURAL, not textual: the join is `Store.raisersOf` (tombstone-
+        \\  correct) plus each side's own event TIMESTAMP, read off the raw
+        \\  `model.Event` payload in `.tracker/snapshot.jsonl` + `log.jsonl` — never
+        \\  a scan of body/title TEXT. A raiser is flagged unless its most recent
+        \\  `setBody` ts is STRICTLY AFTER the decision's `setState -> done` ts
+        \\  (a tie, or no setBody at all, flags it). Deliberately BODY-only, not
+        \\  "body or title": measured on the carrier this check exists for, a
+        \\  title-only edit written 23h after the ruling still left the actual
+        \\  question unreconciled, so a title-inclusive form would have missed the
+        \\  exact case that motivated this check.
+        \\  KNOWN LIMITATION: this is a proxy, not a content check — ANY body edit
+        \\  after the ruling clears the flag, including one that never mentions it.
+        \\  A fully sound check needs an explicit reconciliation event; this reads
+        \\  what the store has today rather than adding one (see 01M31D03S).
+        \\  --json: an array of {raiser, raiser_short, decision, decision_short,
+        \\  ruled_ts, body_ts}.
+        \\  Exits nonzero iff it found at least one stale raiser.
+        \\  e.g.  trk stale-rulings
         },
         .{ .name = "tombstones", .run = &cmdTombstones, .mutating_subcommands = &.{"--rebuild"}, .tools = &tombstones_tools, .flags = &.{ "--rebuild", "--verify", "--json" }, .text =
         \\trk tombstones [--rebuild | --verify] [--json]
@@ -4560,8 +4595,7 @@ pub const Cli = struct {
                     if (tb.title.len != 0) tb.title else "(title not recorded)",
                 });
             }
-            if (!t.state.satisfiesPrereq())
-            {
+            if (!t.state.satisfiesPrereq()) {
                 var idb: [ulid.len]u8 = undefined;
                 try self.print("  resolve with: trk rule {s} \"<the ruling>\"\n", .{try self.shortId(id, &idb)});
             }
@@ -5341,6 +5375,149 @@ pub const Cli = struct {
             const line = hits.get(id.text).?;
             try self.print("{s} {s}  {s}\n    cited in: {s}\n", .{ stateMarker(t.state), sid, t.title, line });
         }
+    }
+
+    /// Scan one append-log-shaped file (`.tracker/snapshot.jsonl` or
+    /// `.tracker/log.jsonl`) for the two raw signals `stale-rulings` needs and
+    /// nothing else: `ruled_ts[id]` = the ts of a decision's first `setState ->
+    /// done` (the exact moment `cmdRule` fires — see its doc comment), and
+    /// `body_ts[id]` = the max ts of any `setBody` targeting that task. Both are
+    /// read straight off `model.Event`'s own typed payload via `codec.decode` —
+    /// never a scan of generated summary TEXT (`readLogEntries` collapses a
+    /// `raises`/`setState` event into prose; this reads the payload itself, the
+    /// same as `cmdTombstones`'s git-history scan does).
+    fn scanRulingEvents(
+        self: *Cli,
+        name: []const u8,
+        ruled_ts: *std.AutoHashMapUnmanaged(Ulid, i64),
+        body_ts: *std.AutoHashMapUnmanaged(Ulid, i64),
+    ) Error!void {
+        var sub = self.dir.openDir(self.io, tracker.store.tracker_subdir, .{}) catch |e| switch (e) {
+            error.FileNotFound => return,
+            else => return e,
+        };
+        defer sub.close(self.io);
+        const bytes = sub.readFileAlloc(self.io, name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => return,
+            else => return e,
+        };
+        defer self.gpa.free(bytes);
+
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            const ev = codec.decode(self.gpa, trimmed) catch continue;
+            defer Store.freeEvent(self.gpa, ev);
+            switch (ev) {
+                .setBody => |x| {
+                    const cur = body_ts.get(x.id) orelse 0;
+                    if (x.ts > cur) try body_ts.put(self.gpa, x.id, x.ts);
+                },
+                .setState => |x| {
+                    // First transition INTO `done` only — a later `archive`
+                    // flips the SAME id to `archived`, which must never
+                    // overwrite the ruling moment we actually want.
+                    if (x.state == .done) {
+                        const cur = ruled_ts.get(x.id);
+                        if (cur == null or x.ts < cur.?) try ruled_ts.put(self.gpa, x.id, x.ts);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// `trk stale-rulings [--json]` — see its help text for the full argument;
+    /// in one line, a raiser is flagged unless its own most recent `setBody`
+    /// postdates the ruling of a decision it `raises` (01M31D03S).
+    fn cmdStaleRulings(self: *Cli, args: []const []const u8) Error!void {
+        var json = false;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else {
+                try self.write("trk: usage: trk stale-rulings [--json]\n");
+                return error.UsageError;
+            }
+        }
+
+        var ruled_ts = std.AutoHashMapUnmanaged(Ulid, i64){};
+        defer ruled_ts.deinit(self.gpa);
+        var body_ts = std.AutoHashMapUnmanaged(Ulid, i64){};
+        defer body_ts.deinit(self.gpa);
+        try self.scanRulingEvents(tracker.store.snapshot_name, &ruled_ts, &body_ts);
+        try self.scanRulingEvents(tracker.store.log_name, &ruled_ts, &body_ts);
+
+        const ids = try self.store.allIds(self.gpa);
+        defer self.gpa.free(ids);
+
+        const Hit = struct { raiser: Ulid, decision: Ulid, ruled: i64, body: i64 };
+        var hits: std.ArrayList(Hit) = .empty;
+        defer hits.deinit(self.gpa);
+
+        for (ids) |id| {
+            if (!self.store.isDecision(id)) continue;
+            const d = self.store.get(id) orelse continue;
+            if (d.state != .done and d.state != .archived) continue;
+            // No observed `done` transition for a task that currently reads
+            // done/archived: shouldn't happen (both states are reached only
+            // through it), but this is a read-only diagnostic — skip rather
+            // than guess a timestamp for it.
+            const rts = ruled_ts.get(id) orelse continue;
+
+            const raisers = try self.store.raisersOf(self.gpa, id);
+            defer self.gpa.free(raisers);
+            for (raisers) |tid| {
+                const t = self.store.get(tid) orelse continue;
+                if (t.state != .open and t.state != .blocked and t.state != .claimed) continue;
+                const bts = body_ts.get(tid) orelse 0;
+                // STRICTLY after, not "at or after": a same-millisecond write
+                // is not a meaningfully later one. Production timestamps are
+                // wall-clock ms and typically hours-to-days apart, so this
+                // only bites a fast synthetic fixture (see the selftest).
+                if (bts <= rts) {
+                    try hits.append(self.gpa, .{ .raiser = tid, .decision = id, .ruled = rts, .body = bts });
+                }
+            }
+        }
+
+        std.sort.pdq(Hit, hits.items, {}, struct {
+            fn lt(_: void, a: Hit, b: Hit) bool {
+                return std.mem.lessThan(u8, &a.raiser.text, &b.raiser.text);
+            }
+        }.lt);
+
+        if (json) {
+            try self.write("[");
+            for (hits.items, 0..) |h, i| {
+                if (i != 0) try self.write(",");
+                var rb: [ulid.len]u8 = undefined;
+                const rsid = try self.shortId(h.raiser, &rb);
+                var db: [ulid.len]u8 = undefined;
+                const dsid = try self.shortId(h.decision, &db);
+                try self.print(
+                    "{{\"raiser\":\"{s}\",\"raiser_short\":\"{s}\",\"decision\":\"{s}\",\"decision_short\":\"{s}\",\"ruled_ts\":{d},\"body_ts\":{d}}}",
+                    .{ &h.raiser.text, rsid, &h.decision.text, dsid, h.ruled, h.body },
+                );
+            }
+            try self.write("]\n");
+        } else if (hits.items.len == 0) {
+            try self.write("trk: stale-rulings: nothing — every open/blocked/claimed raiser has touched its body since its decision was ruled\n");
+            return;
+        } else {
+            try self.print("trk: stale-rulings: {d} raiser task(s) not reconciled since their decision was ruled:\n", .{hits.items.len});
+            for (hits.items) |h| {
+                const t = self.store.get(h.raiser).?;
+                var sb: [ulid.len]u8 = undefined;
+                const sid = try self.shortId(h.raiser, &sb);
+                var db: [ulid.len]u8 = undefined;
+                const dsid = try self.shortId(h.decision, &db);
+                try self.print("{s} {s}  {s}\n    raises ruled decision {s}\n", .{ stateMarker(t.state), sid, t.title, dsid });
+            }
+        }
+
+        if (hits.items.len != 0) return error.StaleRulings;
     }
 
     // ----------------------------------------------------------- tombstones

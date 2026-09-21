@@ -144,6 +144,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.GitLogFailed,
             error.CompactVerifyFailed,
             error.TombstoneIndexIncomplete,
+            error.StaleRulings,
             => {},
             else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),
         }
