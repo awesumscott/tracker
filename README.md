@@ -74,7 +74,8 @@ discovery).
   `trk migrate-shorts` once to freeze those in place too (current values only — see its `--help`).
   `trk migrate-shorts --min <n>` is a one-time REPAIR that also LENGTHENS an already-frozen short below
   `n` chars (e.g. bring a repo's ids up to match what's already been written down elsewhere) — run it once,
-  deliberately, since it changes existing ids.
+  deliberately, since it changes existing ids. Any unique prefix resolves too, but a printed short always
+  resolves to the task that printed it, even after later ids extend it.
 
 ## Commands
 

@@ -1314,9 +1314,40 @@ pub const Cli = struct {
         // Routing it through `unknownFlag` names the near-miss instead.
         if (s[0] == '-') return self.unknownFlag(s);
 
-        // Prefix match (case-insensitive, against the canonical upper-case text).
         const ids = try self.store.allIds(self.gpa);
         defer self.gpa.free(ids);
+
+        // Exact tier first (01M2Y2JV5): a FROZEN short is a task's stable
+        // printed name, so it must resolve to that task even when later mints
+        // took longer shorts extending it — under the prefix rule alone the
+        // input really is ambiguous, which is why this is a tier ahead of the
+        // prefix matcher rather than a tweak to it. Only when the exact tier
+        // is empty does prefix extension get a say. Two tasks CAN freeze the
+        // same short (parallel worktrees minting in one millisecond); that
+        // stays ambiguous, listed by the prefix path below.
+        {
+            var exact: ?Ulid = null;
+            var n_exact: usize = 0;
+            for (ids) |id| {
+                const sh = (self.store.get(id) orelse continue).short orelse continue;
+                if (std.ascii.eqlIgnoreCase(s, sh)) {
+                    n_exact += 1;
+                    exact = id;
+                }
+            }
+            if (n_exact == 1) return exact.?;
+            // No live task owns this short, but a COMPACTED one did: its
+            // printed name must not resolve to whatever live task happens to
+            // extend it, nor read as ambiguous among them. NoSuchId hands
+            // `show`/`tree` to their tombstone path, where the same exact tier
+            // (`Store.lookupTombstone`) names it.
+            if (n_exact == 0 and self.store.exactTombstone(s) != null) {
+                try self.print("trk: '{s}' names a compacted task, not a live one (`trk show {s}`)\n", .{ s, s });
+                return error.NoSuchId;
+            }
+        }
+
+        // Prefix match (case-insensitive, against the canonical upper-case text).
 
         var match: ?Ulid = null;
         var n_matches: usize = 0;

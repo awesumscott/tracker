@@ -405,6 +405,83 @@ test "read_only does not block read verbs, --help, or doc list/resolve" {
 
 // ----------------------------------------------------------- prefix resolution
 
+test "prefix resolution: an EXACT frozen short resolves even when longer shorts extend it (01M2Y2JV5)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The measured shape: one task froze a 9-char short, and three later
+    // mints froze 10-char shorts extending it.
+    const a = try ulid.parse("0123456789ABCDEFGHJKMNPQRS");
+    const b = try ulid.parse("0123456789BBCDEFGHJKMNPQRS");
+    const c = try ulid.parse("0123456789CBCDEFGHJKMNPQRS");
+    const g = try ulid.parse("01234567ZZZZCDEFGHJKMNPQRS");
+    try f.store.append(.{ .add = .{ .id = a, .title = "Exact", .short = "012345678" } });
+    try f.store.append(.{ .add = .{ .id = b, .title = "LongerB", .short = "0123456789B" } });
+    try f.store.append(.{ .add = .{ .id = c, .title = "LongerC", .short = "0123456789C" } });
+    // A task whose frozen short is exact but whose id the prefix would ALSO
+    // match: the exact tier alone must pick it.
+    try f.store.append(.{ .add = .{ .id = g, .title = "Other", .short = "01234567Z" } });
+
+    // POSITIVE: the printed short resolves to the task that printed it — in
+    // either case, since prefixes are case-insensitive too.
+    try f.run(&.{ "state", "012345678", "done" });
+    try testing.expectEqual(tracker.State.done, f.store.get(a).?.state);
+    try testing.expectEqual(tracker.State.open, f.store.get(b).?.state);
+    try f.run(&.{ "state", "0123456789b", "blocked" });
+    try testing.expectEqual(tracker.State.blocked, f.store.get(b).?.state);
+
+    // NEGATIVE: prefix extension is untouched — a prefix that is nobody's
+    // frozen short is still ambiguous, and still lists every candidate.
+    const e = f.runExpectErr(&.{ "state", "0123456", "done" });
+    try testing.expectEqual(cli.CliError.AmbiguousId, e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "Exact") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "LongerC") != null);
+
+    // NEGATIVE: two tasks freezing the SAME short (parallel mints) stay
+    // ambiguous — the exact tier never picks one arbitrarily.
+    const d = try ulid.parse("0123456789CCCDEFGHJKMNPQRS");
+    try f.store.append(.{ .add = .{ .id = d, .title = "TwinC", .short = "0123456789C" } });
+    try testing.expectEqual(cli.CliError.AmbiguousId, f.runExpectErr(&.{ "state", "0123456789C", "done" }));
+}
+
+test "prefix resolution: a COMPACTED task's exact short names the tombstone, not a live task extending it (01M2Y2JV5)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = try ulid.parse("0123456789ABCDEFGHJKMNPQRS");
+    const live = try ulid.parse("0123456789BBCDEFGHJKMNPQRS");
+    try f.store.append(.{ .add = .{ .id = gone, .title = "graduated work", .short = "012345678" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+    try f.store.append(.{ .add = .{ .id = live, .title = "later mint", .short = "0123456789B" } });
+
+    // Before the tier, the unique live prefix match silently answered with
+    // `live` — a different task than the one the short was printed for.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", "012345678" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "graduated work") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "later mint") == null);
+    // A write through it refuses rather than landing on `live`.
+    try testing.expectEqual(cli.CliError.NoSuchId, f.runExpectErr(&.{ "state", "012345678", "done" }));
+    try testing.expectEqual(tracker.State.open, f.store.get(live).?.state);
+    // The live task's own short still resolves.
+    try f.run(&.{ "state", "0123456789B", "done" });
+    try testing.expectEqual(tracker.State.done, f.store.get(live).?.state);
+
+    // Same tier inside the tombstone index: a second compacted task whose
+    // short extends the first must not make the first's short ambiguous.
+    const gone2 = try ulid.parse("0123456789CBCDEFGHJKMNPQRS");
+    try f.store.append(.{ .add = .{ .id = gone2, .title = "second graduate", .short = "0123456789C" } });
+    try f.store.append(.{ .setState = .{ .id = gone2, .state = .archived } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", "012345678" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "graduated work") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "second graduate") == null);
+}
+
 test "prefix resolution: unique resolves, ambiguous errors with candidates" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);

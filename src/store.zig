@@ -1073,6 +1073,10 @@ pub const Store = struct {
     /// trust, and keeps the common path free of this lookup entirely.
     pub fn lookupTombstone(self: *const Store, s: []const u8) TombstoneMatch {
         if (s.len == 0) return .none;
+        // Exact tier first, same rule as `Cli.resolve` (01M2Y2JV5): a citation
+        // that IS a tombstone's full id or frozen short names that one, however
+        // many longer shorts extend it.
+        if (self.exactTombstone(s)) |t| return .{ .one = t };
         var found: ?*const Tombstone = null;
         var n: usize = 0;
         for (self.tombstones.items) |*t| {
@@ -1085,6 +1089,20 @@ pub const Store = struct {
         if (n == 0) return .none;
         if (n > 1) return .{ .ambiguous = n };
         return .{ .one = found.? };
+    }
+
+    /// The tombstone whose full id or frozen short EQUALS `s` (case-
+    /// insensitive), if exactly one does.
+    pub fn exactTombstone(self: *const Store, s: []const u8) ?*const Tombstone {
+        var found: ?*const Tombstone = null;
+        for (self.tombstones.items) |*t| {
+            const hit = std.ascii.eqlIgnoreCase(s, &t.id.text) or
+                (t.short != null and std.ascii.eqlIgnoreCase(s, t.short.?));
+            if (!hit) continue;
+            if (found != null) return null;
+            found = t;
+        }
+        return found;
     }
 
     /// Every tombstone naming `arc` among its memberships: the GRADUATED

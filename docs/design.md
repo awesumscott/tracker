@@ -1374,6 +1374,16 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     "stable but wrong length" isn't the goal; "stable and recognizable" is. Gated behind an explicit flag
     (never the default) because it changes ids a prior run already froze — a one-time, deliberate repair,
     not something to run routinely.
+  - **Resolution has an exact tier ahead of prefix extension (01M2Y2JV5).** Freezing made the DISPLAY
+    stable, but resolution still went through the prefix matcher alone: a 9-char short that later mints
+    extended (`01M2VMXA3` beside `01M2VMXA3B`/`M`/`X`) became an ambiguous prefix, so the id trk printed for
+    a task stopped resolving to it. That input genuinely is ambiguous under the prefix rule, which is why
+    the fix is a tier, not a matcher tweak: `Cli.resolve` first looks for a task whose frozen short EQUALS
+    the input (case-insensitive) and returns it outright; prefix extension is consulted only when none
+    does. The same tier covers the tombstone index — an exact compacted short answers COMPACTED rather than
+    resolving to a live task that happens to extend it, and `Store.lookupTombstone` checks exact first too.
+    Two tasks that froze the same short (parallel mints in one millisecond) are never picked between; they
+    fall through to the ambiguous listing.
 - **Doc-id registry ownership — folds into the store as events.** A `setDocPath { doc_id, path }` event
   (not a separate file) — one append-log, one compaction story, the same merge-safety model as every other
   event (last-write-wins on fold; `Store.docPath` resolves). A doc move is one `trk doc set <doc_id>
