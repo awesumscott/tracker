@@ -545,5 +545,11 @@ test "tools/call: decision raises a node, next withholds the work it blocks, lis
     var nx2 = try r.call("next", "\"tree\":\"main\"");
     defer nx2.deinit();
     try testing.expect(contains(nx2.text(), "the display fix"));
-    try testing.expect(!contains(nx2.text(), "does TODO.md want"));
+    // Not as a ROW: the released task's own edges (`prereqs`, `raises`) do
+    // name the decision now, which is the point of carrying them (01M32AJ90).
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, nx2.text(), .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |row| {
+        try testing.expect(!contains(row.object.get("title").?.string, "does TODO.md want"));
+    }
 }

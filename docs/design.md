@@ -1250,6 +1250,17 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
   - *A string, not a decision-marker boolean.* The cheapest-looking option was a per-task flag for "the
     body matches a marker", and it was rejected: that vocabulary belongs to the caller, not to trk. trk
     stays generic and the grep stays where it belongs.
+  - *Amended by 01M32AJ90 (2026-09-21): the rows carry every EDGE too, plus an opt-OUT `--no-body`.* The
+    same omission one field over: `raises`/`raised_by`/`prereqs`/`dependents`/`arcs`/`docrefs` lived only on
+    `show`, so an orchestrator joining 221 open decisions against a frontier's `raised_by` got an ABSENT
+    field, the join matched 0, and a 10-lane wave was sized on 161 dispatchable tasks when 51 were. Rows now
+    carry exactly `show --json`'s edge block (`Cli.appendEdgesJson`, one emitter for both), always present.
+    "A caller who wants less already has `--limit`" turned out false at scale: a single-arc `--all` sweep
+    measured 540,303 characters, and `--limit` without an offset cannot reach row N+1. So `--offset` pages,
+    and `--no-body` swaps each body for `body_len`. That flag is the SAFE direction of the rule above:
+    forgetting it returns the full body, never a silently thinner one, and `body_len` still says a body is
+    there. `--not-word` is the exclusion half of the term search ("body does NOT contain X"), the one sweep
+    that still needed a shell.
 
 - **A parse failure names the argument that FAILED, and guesses the spelling** (01M1FMMFZ, 2026-09-18).
   `trk add --tags=a,b "<title>"` printed `unknown flag '<the title>'` — blaming the one argument in the

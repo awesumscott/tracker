@@ -5086,6 +5086,108 @@ test "list --arc: compacted members pass the same filters as live rows, never wi
     try testing.expect(std.mem.indexOf(u8, f.out.items, "+2 compacted member(s)") != null);
 }
 
+test "list/next --json rows carry every edge, so a client-side join is never vacuous (01M32AJ90)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gated = mintId();
+    const free = mintId();
+    try f.store.append(.{ .add = .{ .id = gated, .title = "gated work" } });
+    try f.store.append(.{ .add = .{ .id = free, .title = "free work" } });
+    try f.run(&.{ "decision", "which way?", "--from", &gated.text });
+    const did = try ulid.parse(std.mem.trimEnd(u8, f.out.items, "\n"));
+
+    // The measured join: open decisions x their `raised_by`, to drop the tasks
+    // that raised one. With the field absent it matched 0 of 221.
+    try f.run(&.{ "list", "--json", "--decision", "--state", "open" });
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+        defer parsed.deinit();
+        const rows = parsed.value.array.items;
+        try testing.expectEqual(@as(usize, 1), rows.len);
+        try testing.expect(rows[0].object.get("decision").?.bool);
+        const by = rows[0].object.get("raised_by").?.array.items;
+        try testing.expectEqual(@as(usize, 1), by.len);
+        try testing.expectEqualStrings(&gated.text, by[0].string);
+    }
+    // And from the other side, on a `next` row; every edge key is PRESENT on a
+    // task with no edges at all — an empty array, never an absent field.
+    try f.run(&.{ "next", "--json" });
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+        defer parsed.deinit();
+        var saw_gated = false;
+        for (parsed.value.array.items) |row| {
+            const o = row.object;
+            for ([_][]const u8{ "raises", "raised_by", "prereqs", "dependents", "arcs", "docrefs" }) |k| {
+                try testing.expect(o.get(k) != null);
+            }
+            if (std.mem.eql(u8, o.get("id").?.string, &gated.text)) {
+                saw_gated = true;
+                try testing.expectEqualStrings(&did.text, o.get("raises").?.array.items[0].string);
+            } else {
+                try testing.expectEqual(@as(usize, 0), o.get("raises").?.array.items.len);
+            }
+        }
+        try testing.expect(saw_gated);
+    }
+}
+
+test "list/next: --not-word excludes by title+body+tags, --offset pages, --no-body swaps body for body_len (01M32AJ90)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    var ids: [5]Ulid = undefined;
+    for (&ids, 0..) |*id, i| {
+        id.* = mintId();
+        const body: []const u8 = if (i % 2 == 0) "REC-BOT: annotated" else "not yet";
+        try f.store.append(.{ .add = .{ .id = id.*, .title = "task", .body = body } });
+    }
+
+    // --not-word: "body does NOT contain X", the sweep that needed a shell.
+    for ([_][]const u8{ "list", "next" }) |verb| {
+        try f.run(&.{ verb, "--json", "--not-word", "rec-bot" });
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+        for (parsed.value.array.items) |row| {
+            try testing.expectEqualStrings("not yet", row.object.get("body").?.string);
+        }
+    }
+
+    // --offset + --limit: pages cover the whole set once, in order, and a
+    // short page is the last.
+    for ([_][]const u8{ "list", "next" }) |verb| {
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (seen.items) |x| alloc.free(x);
+            seen.deinit(alloc);
+        }
+        // Bounded: a broken --offset returns full pages forever, and that
+        // must fail here, not hang the suite.
+        var off: usize = 0;
+        while (off <= 10) : (off += 2) {
+            var buf: [8]u8 = undefined;
+            const o = try std.fmt.bufPrint(&buf, "{d}", .{off});
+            try f.run(&.{ verb, "--json", "--limit", "2", "--offset", o });
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+            defer parsed.deinit();
+            for (parsed.value.array.items) |row| try seen.append(alloc, try alloc.dupe(u8, row.object.get("id").?.string));
+            if (parsed.value.array.items.len < 2) break;
+        }
+        try testing.expectEqual(@as(usize, 5), seen.items.len);
+        for (seen.items, 0..) |a, i| for (seen.items[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
+    }
+
+    // --no-body: no body key, and body_len still says there is one.
+    try f.run(&.{ "list", "--json", "--no-body" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"body\":") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"body_len\":18") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"body_len\":7") != null);
+}
+
 // ----- trk decision (01M2VFV83) -----
 
 test "trk decision: raises a node, separates provenance from blocking, prints only the id" {

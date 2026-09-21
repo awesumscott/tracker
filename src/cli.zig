@@ -367,15 +367,28 @@ pub const Cli = struct {
     /// so a consumer can index it without a guard. And a plain string rather
     /// than a decision-marker boolean: that vocabulary is the caller's, not
     /// trk's — trk stays generic and the grep stays where it belongs.
-    fn appendTaskJson(self: *Cli, id: Ulid, arc_id: ?Ulid) !void {
+    ///
+    /// Carries the same edge fields as `show --json` (`appendEdgesJson`), always
+    /// present (01M32AJ90): with them only on `show`, a caller joining a
+    /// frontier against `raised_by` got an ABSENT field, not an empty one, and
+    /// the join silently matched nothing — 0 of 221 decisions "blocking"
+    /// anything, 161 tasks reported dispatchable when 51 were. `with_body =
+    /// false` (`--no-body`) swaps the body for its length: bodies are the bulk
+    /// of a broad sweep, and the length still says whether there is one.
+    fn appendTaskJson(self: *Cli, id: Ulid, arc_id: ?Ulid, with_body: bool) !void {
         const t = self.store.get(id).?;
         var sb: [ulid.len]u8 = undefined;
         const sid = try self.shortId(id, &sb);
         try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"title\":", .{ &id.text, sid });
         try self.writeJsonString(t.title);
-        try self.write(",\"body\":");
-        try self.writeJsonString(t.body);
+        if (with_body) {
+            try self.write(",\"body\":");
+            try self.writeJsonString(t.body);
+        } else {
+            try self.print(",\"body_len\":{d}", .{t.body.len});
+        }
         try self.print(",\"state\":\"{s}\",\"priority\":{d}", .{ t.state.toString(), t.priority });
+        if (self.store.isDecision(id)) try self.write(",\"decision\":true");
         if (t.holder) |h| {
             try self.write(",\"holder\":");
             try self.writeJsonString(h);
@@ -387,8 +400,28 @@ pub const Cli = struct {
             if (i != 0) try self.write(",");
             try self.writeJsonString(tg);
         }
-        try self.write("]}");
+        try self.write("]");
+        try self.appendEdgesJson(id);
+        try self.write("}");
     }
+
+    /// `--offset`/`--limit` over a verb's matching rows, in its output order.
+    const Page = struct {
+        offset: usize = 0,
+        limit: ?usize = null,
+        skipped: usize = 0,
+
+        /// Consume one matching row: `.skip` it (still inside the offset),
+        /// `.stop` (limit reached), or `.emit` it. `shown` is rows emitted so far.
+        fn take(p: *Page, shown: usize) enum { skip, stop, emit } {
+            if (p.skipped < p.offset) {
+                p.skipped += 1;
+                return .skip;
+            }
+            if (p.limit) |lim| if (shown >= lim) return .stop;
+            return .emit;
+        }
+    };
 
     // ----------------------------------------------------------- dispatch
 
@@ -720,8 +753,9 @@ pub const Cli = struct {
         \\  lease. (`trk state <id> open` is the unconditional override.)
         \\  e.g.  trk release --holder lane-3        trk release 01KX6H48
         },
-        .{ .name = "next", .run = &cmdNext, .tools = &next_tools, .flags = &.{ "--arc", "--not-tag", "--limit", "--json", "--word" }, .text =
-        \\trk next [--arc <id>] [--not-tag <t> ...] [--limit <n>] [--json] [<term> | --word <term> ...]
+        .{ .name = "next", .run = &cmdNext, .tools = &next_tools, .flags = &.{ "--arc", "--not-tag", "--not-word", "--limit", "--offset", "--no-body", "--json", "--word" }, .text =
+        \\trk next [--arc <id>] [--not-tag <t> ...] [--not-word <term> ...] [--limit <n>]
+        \\         [--offset <n>] [--json [--no-body]] [<term> | --word <term> ...]
         \\  The ready frontier: open tasks whose prereqs are ALL met. An arc root is
         \\  a container: it is held back until its non-parked members are finished,
         \\  then surfaces once as the close-out prompt (`trk state <root> done` marks
@@ -740,14 +774,22 @@ pub const Cli = struct {
         \\  --json carries no such tail (an array has nowhere to put one) and no
         \\  decision rows: ask `trk list --decision --state open` instead.
         \\  --json emits a machine-readable array, one object per task, carrying the
-        \\  full BODY as well as id/short/title/state/priority/seq?/tags — the whole
-        \\  frontier is then triageable in one call, markers and all, with no
+        \\  full BODY as well as id/short/title/state/priority/seq?/tags/decision? and
+        \\  every edge `trk show --json` carries (raises, raised_by, prereqs,
+        \\  dependents, arcs, docrefs; always present, empty when there are none) —
+        \\  the whole frontier is then triageable and JOINABLE in one call, with no
         \\  follow-up `trk show` per candidate.
+        \\  --not-word <term> (repeatable) drops any task whose title+body+tags
+        \\  contain it: the exclusion half of --word. --offset <n> skips the first n
+        \\  matching rows; with --limit it pages a sweep too big for one response
+        \\  (a page shorter than --limit is the last). --no-body swaps each row's
+        \\  body for body_len — bodies are the bulk of a broad sweep.
         \\  e.g.  trk next           trk next parser windowed
         },
-        .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--decision", "--all", "--state", "--tag", "--not-tag", "--limit", "--json", "--word" }, .text =
+        .{ .name = "list", .run = &cmdList, .tools = &list_tools, .flags = &.{ "--arc", "--no-arc", "--decision", "--all", "--state", "--tag", "--not-tag", "--not-word", "--limit", "--offset", "--no-body", "--json", "--word" }, .text =
         \\trk list [--arc <id> | --no-arc] [--decision] [--all] [--state <s>] [--tag <t>]
-        \\         [--not-tag <t> ...] [--limit <n>] [--json] [<term> | --word <term> ...]
+        \\         [--not-tag <t> ...] [--not-word <term> ...] [--limit <n>] [--offset <n>]
+        \\         [--json [--no-body]] [<term> | --word <term> ...]
         \\  REMAINING work by default — open/blocked/claimed/submitted. Completed
         \\  states (done/dropped/archived) are hidden unless you ask: --state done is
         \\  the archive queue, --state archived the graduated set, --all the union.
@@ -764,7 +806,8 @@ pub const Cli = struct {
         \\  every fork ever raised: `archive` graduates a ruled decision like any
         \\  other finished task, and the RULING (not just the question) is what lands
         \\  in the changelog — see `trk archive --help`. --json for machine-readable output (same
-        \\  object shape as `next --json`, body included).
+        \\  object shape as `next --json`: body and every edge included). --not-word,
+        \\  --offset and --no-body work as in `next --help`.
         \\  With --arc, a tail line reports the arc's COMPACTED members by count and
         \\  points at `trk tree <arc>`, which names them. `list` already shows closed
         \\  work (done/submitted), and `compact` deletes the `in` edge along with the
@@ -1118,8 +1161,11 @@ pub const Cli = struct {
     const p_not_tag = Param{ .name = "not_tag", .kind = .string_list, .flag = "--not-tag", .desc = "Exclude tasks carrying any of these tags." };
     const p_limit = Param{ .name = "limit", .kind = .integer, .flag = "--limit", .desc = "At most this many." };
     const p_term = Param{ .name = "term", .kind = .string_list, .flag = "--word", .desc = "Case-insensitive substrings over title+body+tags, ANDed." };
+    const p_not_term = Param{ .name = "not_term", .kind = .string_list, .flag = "--not-word", .desc = "Exclude tasks whose title+body+tags contain any of these." };
+    const p_offset = Param{ .name = "offset", .kind = .integer, .flag = "--offset", .desc = "Skip this many matching rows first (page with limit)." };
+    const p_no_body = Param{ .name = "no_body", .kind = .boolean, .flag = "--no-body", .desc = "Omit bodies; each row carries body_len instead." };
 
-    const next_tools = [_]Tool{.{ .name = "next", .argv = &.{"--json"}, .params = &.{ p_arc_filter, p_not_tag, p_limit, p_term } }};
+    const next_tools = [_]Tool{.{ .name = "next", .argv = &.{"--json"}, .params = &.{ p_arc_filter, p_not_tag, p_limit, p_term, p_not_term, p_offset, p_no_body } }};
 
     const list_tools = [_]Tool{.{ .name = "list", .argv = &.{"--json"}, .params = &.{
         p_arc_filter,
@@ -1137,6 +1183,9 @@ pub const Cli = struct {
         p_not_tag,
         p_limit,
         p_term,
+        p_not_term,
+        p_offset,
+        p_no_body,
     } }};
 
     const p_out = Param{ .name = "out", .kind = .string, .flag = "--out", .desc = "Output path, relative to the store root." };
@@ -3300,12 +3349,24 @@ pub const Cli = struct {
         // be forgotten.
         var not_tags: std.ArrayList([]const u8) = .empty;
         defer not_tags.deinit(self.gpa);
+        // `--not-word <term>` (repeatable): drop any task whose title+body+tags
+        // contain ANY of these — the exclusion half of `--word` (01M32AJ90).
+        var not_words: std.ArrayList([]const u8) = .empty;
+        defer not_words.deinit(self.gpa);
+        var offset: usize = 0;
+        var with_body = true;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--arc")) {
                 arc_filter = try self.flagVal(args, &i, "--arc");
             } else if (std.mem.eql(u8, args[i], "--limit")) {
                 limit = try self.parseUsize(try self.flagVal(args, &i, "--limit"));
+            } else if (std.mem.eql(u8, args[i], "--offset")) {
+                offset = try self.parseUsize(try self.flagVal(args, &i, "--offset"));
+            } else if (std.mem.eql(u8, args[i], "--not-word")) {
+                try not_words.append(self.gpa, try self.flagVal(args, &i, "--not-word"));
+            } else if (std.mem.eql(u8, args[i], "--no-body")) {
+                with_body = false;
             } else if (std.mem.eql(u8, args[i], "--json")) {
                 json = true;
             } else if (std.mem.eql(u8, args[i], "--word")) {
@@ -3330,6 +3391,7 @@ pub const Cli = struct {
 
         if (json) try self.write("[");
         var shown: usize = 0;
+        var page: Page = .{ .offset = offset, .limit = limit };
         for (ready) |id| {
             if (members) |m| {
                 if (!containsId(m, id)) continue;
@@ -3337,12 +3399,15 @@ pub const Cli = struct {
             const t = self.store.get(id).?;
             if (hasAnyTag(t, not_tags.items)) continue;
             if (!allWordsMatch(t, words.items)) continue;
-            if (limit) |lim| {
-                if (shown >= lim) break;
+            if (anyWordMatches(t, not_words.items)) continue;
+            switch (page.take(shown)) {
+                .skip => continue,
+                .stop => break,
+                .emit => {},
             }
             if (json) {
                 if (shown != 0) try self.write(",");
-                try self.appendTaskJson(id, arc_id);
+                try self.appendTaskJson(id, arc_id, with_body);
             } else {
                 try self.printTaskLine(id, arc_id);
             }
@@ -3461,10 +3526,21 @@ pub const Cli = struct {
         // of this doc for the motivating case (the autonomous-eligible bucket).
         var not_tags: std.ArrayList([]const u8) = .empty;
         defer not_tags.deinit(self.gpa);
+        // `--not-word`, `--offset`, `--no-body`: see `cmdNext` (01M32AJ90).
+        var not_words: std.ArrayList([]const u8) = .empty;
+        defer not_words.deinit(self.gpa);
+        var offset: usize = 0;
+        var with_body = true;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--arc")) {
                 arc_filter = try self.flagVal(args, &i, "--arc");
+            } else if (std.mem.eql(u8, args[i], "--not-word")) {
+                try not_words.append(self.gpa, try self.flagVal(args, &i, "--not-word"));
+            } else if (std.mem.eql(u8, args[i], "--offset")) {
+                offset = try self.parseUsize(try self.flagVal(args, &i, "--offset"));
+            } else if (std.mem.eql(u8, args[i], "--no-body")) {
+                with_body = false;
             } else if (std.mem.eql(u8, args[i], "--no-arc")) {
                 no_arc = true;
             } else if (std.mem.eql(u8, args[i], "--decision")) {
@@ -3517,10 +3593,12 @@ pub const Cli = struct {
             .decisions_only = decisions_only,
             .tag = tag_filter,
             .words = words.items,
+            .not_words = not_words.items,
         };
 
         if (json) try self.write("[");
         var shown: usize = 0;
+        var page: Page = .{ .offset = offset, .limit = limit };
         for (ids) |id| {
             const t = self.store.get(id).?;
             if (state_filter) |sf| {
@@ -3551,10 +3629,15 @@ pub const Cli = struct {
             if (tag_filter) |tf| if (!hasTag(t, tf)) continue;
             if (hasAnyTag(t, not_tags.items)) continue;
             if (!allWordsMatch(t, words.items)) continue;
-            if (limit) |lim| if (shown >= lim) break;
+            if (anyWordMatches(t, not_words.items)) continue;
+            switch (page.take(shown)) {
+                .skip => continue,
+                .stop => break,
+                .emit => {},
+            }
             if (json) {
                 if (shown != 0) try self.write(",");
-                try self.appendTaskJson(id, arc_id);
+                try self.appendTaskJson(id, arc_id, with_body);
             } else {
                 try self.printListLine(id);
             }
@@ -3581,7 +3664,11 @@ pub const Cli = struct {
                 defer self.gpa.free(gone);
                 for (gone) |tb| {
                     if (!tomb_filter.admits(tb)) continue;
-                    if (limit) |lim| if (shown >= lim) break;
+                    switch (page.take(shown)) {
+                        .skip => continue,
+                        .stop => break,
+                        .emit => {},
+                    }
                     if (shown != 0) try self.write(",");
                     try self.tombstoneJsonOpen(tb);
                     try self.write("}");
@@ -3602,12 +3689,14 @@ pub const Cli = struct {
     /// state. A filter over a field it does not keep (`--decision`, `--tag`)
     /// drops it, and search terms are matched against the title alone.
     /// `--not-tag` can never exclude it: it carries no tag to exclude.
+    /// `--not-word` is matched against the title, like search terms.
     const TombFilter = struct {
         state: ?State,
         show_all: bool,
         decisions_only: bool,
         tag: ?[]const u8,
         words: []const []const u8,
+        not_words: []const []const u8,
 
         fn admits(f: TombFilter, tb: *const tracker.store.Tombstone) bool {
             if (f.state) |sf| {
@@ -3618,6 +3707,7 @@ pub const Cli = struct {
             }
             if (f.decisions_only or f.tag != null) return false;
             for (f.words) |w| if (!containsSubCI(tb.title, w)) return false;
+            for (f.not_words) |w| if (containsSubCI(tb.title, w)) return false;
             return true;
         }
     };
@@ -4764,6 +4854,15 @@ pub const Cli = struct {
         try self.write("],\"body\":");
         try self.writeJsonString(t.body);
 
+        try self.appendEdgesJson(id);
+        try self.write("}\n");
+    }
+
+    /// The edge fields of a task object — `raises`, `raised_by`, `prereqs`,
+    /// `dependents`, `arcs`, `docrefs` — each always present. Shared by `show
+    /// --json` and the `list`/`next` rows so the two schemas cannot drift.
+    fn appendEdgesJson(self: *Cli, id: Ulid) Error!void {
+        const t = self.store.get(id).?;
         // Provenance, both directions, always present so a consumer indexes
         // without a guard: `raises` on a task, `raised_by` on a decision.
         try self.write(",\"raises\":[");
@@ -4852,7 +4951,7 @@ pub const Cli = struct {
             }
             try self.write("}");
         }
-        try self.write("]}\n");
+        try self.write("]");
     }
 
     /// `{"id","short","title","state"}` for a task another object points at.
@@ -6242,6 +6341,13 @@ fn wordMatches(t: Task, word: []const u8) bool {
 fn allWordsMatch(t: Task, words: []const []const u8) bool {
     for (words) |w| if (!wordMatches(t, w)) return false;
     return true;
+}
+
+/// `--not-word`'s test: does ANY term match (same title+body+tags rule as
+/// `wordMatches`)?
+fn anyWordMatches(t: Task, words: []const []const u8) bool {
+    for (words) |w| if (wordMatches(t, w)) return true;
+    return false;
 }
 
 fn containsSubCI(haystack: []const u8, needle: []const u8) bool {
