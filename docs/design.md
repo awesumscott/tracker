@@ -567,6 +567,20 @@ The merge model is **owned** here, because it gates how parallel agents may touc
   - *Why a blanket "all appends commute" claim was rejected for the general case:* independent top-level
     declarations commute unconditionally; *same-task* events don't. *Disjoint*-task events do — which is the
     narrower property disjoint-writer actually rests on.
+  - **Body appends are the one same-task write that DOES commute: `appendBody` (01M32AHNQ).** Fan-out
+    breaks disjoint-writer for bodies routinely — several lanes report into one task — and `--append-body`
+    used to write base+text as a whole-body `setBody`, so two lanes appending from one base in separate
+    worktrees each kept only their own text once merged (measured in Enix: an evidence paragraph saying a
+    sub-task was built vanished, and the task was re-dispatched three days later). `appendBody` carries
+    only the delta and the fold joins it (`store.appendedBody`: one blank line, none onto an empty body),
+    so every concurrent append survives in ts order. Idempotent by the replay's byte-identical-line dedupe,
+    and watermark-gated like `setBody` against a pre-compact copy re-merged after the snapshot folded it.
+    `--replace-body` stays a last-write-wins `setBody` — a replace means "this is the body now".
+    `trk lost-appends` is the retroactive half: it replays each task's body writes and names every append
+    a whole-body write discarded, with the text, so damage from before the op existed can be put back.
+    The same defect had a reader side: readers took no lock, so a fold could land inside a writer's
+    pwrite and fail `NotAnObject` on the half-written line. `replayFile` now reads `log.jsonl` under a
+    SHARED lock (`Store.readLocked`), with its own concurrent-reader arm in `store_test.zig`.
 - **Edge removal (`undep`/`unin`) is a fold-time tombstone, log-replay-scoped.** `undep` appends an
   edge-tombstone the fold applies as *tombstone-beats-`dep`* — order-independent under union-merge (a
   concurrent same-edge `dep` loses regardless of append order). `unin` is the exact mirror for the `in`
@@ -824,7 +838,7 @@ The merge model is **owned** here, because it gates how parallel agents may touc
     not per field); that pattern is already outside the model, and the withheld event is reported, never
     silently dropped, and still sits in the log for a deliberate re-apply.
   - **Only last-write-wins SCALARS are withheld** (`add`, `setState`, `setTitle`, `setBody`, `setPriority`,
-    `setShort`). An edge, tag, or docref event is additive — or a tombstone that wins regardless of order —
+    `setShort` — plus `appendBody`, whose pre-watermark copy is already inside the snapshot's body). An edge, tag, or docref event is additive — or a tombstone that wins regardless of order —
     so a stale one converges to the same state and withholding it would drop a lane's real work for no
     safety gain. A stale `setState done` that *is* withheld costs nothing either: the orchestrator's
     per-wave reconcile re-closes done tasks idempotently.

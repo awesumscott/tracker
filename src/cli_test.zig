@@ -2499,7 +2499,7 @@ test "every verb supports --help/-h and add --help mints no task" {
         "init",              "add",  "dep",  "undep",  "in",            "unin",    "arc",        "migrate-arcs", "migrate-shorts",
         "state",             "next", "list", "render", "tree",          "compact", "archive",    "doc",          "show",
         "edit",              "rule", "log",  "stale",  "stale-rulings", "release", "tombstones", "mcp-serve",    "decision",
-        "migrate-decisions",
+        "migrate-decisions", "lost-appends",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -3442,6 +3442,99 @@ test "edit --append-body: appends after a blank line, and never separates from a
     try f.store.append(.{ .add = .{ .id = messy, .title = "m", .body = "line\n\n\n" } });
     try f.run(&.{ "edit", &messy.text, "--append-body", "added" });
     try testing.expectEqualStrings("line\n\nadded", f.store.get(messy).?.body);
+}
+
+test "edit --append-body from two worktrees on one base: the union merge keeps BOTH appends (01M32AHNQ)" {
+    const alloc = testing.allocator;
+    var lane_a = try Fixture.init(alloc);
+    defer lane_a.deinit();
+    var lane_b = try Fixture.init(alloc);
+    defer lane_b.deinit();
+    var main = try Fixture.init(alloc);
+    defer main.deinit();
+
+    // The shared base both lanes fork from.
+    const t = mintId();
+    try lane_a.store.append(.{ .add = .{ .id = t, .title = "t", .body = "original filing" } });
+    const base = try lane_a.tmp.dir.readFileAlloc(io, ".tracker/log.jsonl", alloc, .unlimited);
+    defer alloc.free(base);
+    try lane_b.tmp.dir.createDirPath(io, ".tracker");
+    try lane_b.tmp.dir.writeFile(io, .{ .sub_path = ".tracker/log.jsonl", .data = base });
+    try lane_b.reopen();
+
+    // Each lane appends from its own frozen fold of that base.
+    try lane_a.run(&.{ "edit", &t.text, "--append-body", "lane A: sub-task WAS built" });
+    try lane_b.run(&.{ "edit", &t.text, "--append-body", "lane B: witness still owed" });
+
+    // `merge=union` of the two logs: base once, then each side's new lines —
+    // lane B's region first, the order that made lane A's text vanish.
+    const log_a = try lane_a.tmp.dir.readFileAlloc(io, ".tracker/log.jsonl", alloc, .unlimited);
+    defer alloc.free(log_a);
+    const log_b = try lane_b.tmp.dir.readFileAlloc(io, ".tracker/log.jsonl", alloc, .unlimited);
+    defer alloc.free(log_b);
+    const merged = try std.mem.concat(alloc, u8, &.{ base, log_b[base.len..], log_a[base.len..] });
+    defer alloc.free(merged);
+    try main.tmp.dir.createDirPath(io, ".tracker");
+    try main.tmp.dir.writeFile(io, .{ .sub_path = ".tracker/log.jsonl", .data = merged });
+    try main.reopen();
+
+    const body = main.store.get(t).?.body;
+    try testing.expect(std.mem.startsWith(u8, body, "original filing\n\n"));
+    try testing.expect(std.mem.indexOf(u8, body, "lane A: sub-task WAS built") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lane B: witness still owed") != null);
+}
+
+test "lost-appends: names every append a whole-body write discarded, with its text (01M32AHNQ)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // The measured history, as the pre-fix `--append-body` wrote it: whole
+    // bodies. Lane A appended to the filing; lane B appended to the same
+    // filing (A's text gone); lane C appended to A's body (B's text gone).
+    const t = mintId();
+    const base = "original filing";
+    const a_body = base ++ "\n\nA: sub-task WAS built";
+    try f.store.append(.{ .add = .{ .id = t, .title = "clobbered", .body = base } });
+    try f.store.append(.{ .setBody = .{ .id = t, .body = a_body } });
+    try f.store.append(.{ .setBody = .{ .id = t, .body = base ++ "\n\nB: witness owed" } });
+    try f.store.append(.{ .setBody = .{ .id = t, .body = a_body ++ "\n\nC: re-verified" } });
+
+    // NEGATIVES that must stay silent: ordinary appends, a --replace-body
+    // unrelated to any earlier body, and appends onto an EMPTY body.
+    const quiet = mintId();
+    try f.store.append(.{ .add = .{ .id = quiet, .title = "quiet", .body = "x" } });
+    try f.store.append(.{ .setBody = .{ .id = quiet, .body = "x\n\ny" } });
+    try f.store.append(.{ .setBody = .{ .id = quiet, .body = "rewritten from scratch" } });
+    try f.store.append(.{ .appendBody = .{ .id = quiet, .text = "delta" } });
+    const empty = mintId();
+    try f.store.append(.{ .add = .{ .id = empty, .title = "empty" } });
+    try f.store.append(.{ .setBody = .{ .id = empty, .body = "p" } });
+    try f.store.append(.{ .setBody = .{ .id = empty, .body = "q" } });
+
+    try testing.expectEqual(@as(anyerror, error.LostAppends), f.runExpectErr(&.{"lost-appends"}));
+    // Only B's text is lost TODAY: C's write carried A's back.
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 append(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "| B: witness owed") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "A: sub-task") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "quiet") == null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "empty") == null);
+
+    try testing.expectEqual(@as(anyerror, error.LostAppends), f.runExpectErr(&.{ "lost-appends", "--json" }));
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+        defer parsed.deinit();
+        const rows = parsed.value.array.items;
+        try testing.expectEqual(@as(usize, 1), rows.len);
+        try testing.expectEqualStrings(&t.text, rows[0].object.get("id").?.string);
+        try testing.expectEqualStrings("B: witness owed", rows[0].object.get("text").?.string);
+        try testing.expect(rows[0].object.get("lost_ts").?.integer < rows[0].object.get("clobber_ts").?.integer);
+    }
+
+    // Putting the text back is the remedy, and clears the report.
+    try f.run(&.{ "edit", &t.text, "--append-body", "B: witness owed" });
+    try f.run(&.{"lost-appends"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing") != null);
 }
 
 test "edit --append-body reads a body that lives ONLY in the snapshot (the truncation this verb exists to stop)" {

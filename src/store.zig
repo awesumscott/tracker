@@ -45,6 +45,16 @@ fn edgeKey(from: Ulid, to: Ulid) [ulid.len * 2]u8 {
     return k;
 }
 
+/// `current` with `text` appended the way `appendBody` folds it: exactly one
+/// blank line between the old body and the new text, whatever trailing
+/// newlines the body has, and no separator when there is nothing to separate
+/// from — so an accumulated diagnosis trail reads as distinct entries.
+pub fn appendedBody(alloc: std.mem.Allocator, current: []const u8, text: []const u8) ![]const u8 {
+    const head = std.mem.trimEnd(u8, current, "\n");
+    if (head.len == 0) return alloc.dupe(u8, text);
+    return std.mem.concat(alloc, u8, &.{ head, "\n\n", text });
+}
+
 pub const tracker_subdir = ".tracker";
 pub const log_name = "log.jsonl";
 pub const snapshot_name = "snapshot.jsonl";
@@ -342,6 +352,18 @@ pub const Tombstone = struct {
     src: []const u8 = "compact",
 };
 
+/// One body append that a later WHOLE-body write discarded (01M32AHNQ). See
+/// `Store.findLostAppends`.
+pub const LostAppend = struct {
+    id: Ulid,
+    /// `ts` of the body write whose text was lost.
+    lost_ts: i64,
+    /// `ts` of the whole-body `setBody` that discarded it.
+    clobber_ts: i64,
+    /// The discarded text, separator trimmed. Owned by the caller's allocator.
+    text: []const u8,
+};
+
 /// What `Store.lookupTombstone` found for one citation.
 pub const TombstoneMatch = union(enum) {
     /// No tombstone matches — genuinely nothing the store has ever heard of.
@@ -583,6 +605,7 @@ pub const Store = struct {
             .setState => |x| x.id,
             .setTitle => |x| x.id,
             .setBody => |x| x.id,
+            .appendBody => |x| x.id,
             .setPriority => |x| x.id,
             .setShort => |x| x.id,
             .release => |x| x.id,
@@ -628,6 +651,7 @@ pub const Store = struct {
             .setState => |x| x.id,
             .setTitle => |x| x.id,
             .setBody => |x| x.id,
+            .appendBody => |x| x.id,
             .setPriority => |x| x.id,
             .setShort => |x| x.id,
             .release => |x| x.id,
@@ -773,6 +797,10 @@ pub const Store = struct {
             .setBody => |x| {
                 const t = try self.ensureNode(x.id);
                 t.body = try self.a().dupe(u8, x.body);
+            },
+            .appendBody => |x| {
+                const t = try self.ensureNode(x.id);
+                t.body = try appendedBody(self.a(), t.body, x.text);
             },
             .untag => |x| {
                 const t = try self.ensureNode(x.id);
@@ -1452,7 +1480,10 @@ pub const Store = struct {
         };
         defer sub.close(self.io);
 
-        const bytes = sub.readFileAlloc(self.io, name, self.gpa, .unlimited) catch |e| switch (e) {
+        const bytes = (if (reorder)
+            self.readLocked(sub, name)
+        else
+            sub.readFileAlloc(self.io, name, self.gpa, .unlimited)) catch |e| switch (e) {
             error.FileNotFound => return,
             else => return e,
         };
@@ -1529,6 +1560,143 @@ pub const Store = struct {
         }
     }
 
+    /// Read the whole of `name` under a SHARED advisory lock — the reader half
+    /// of `persistAppend`'s exclusive one (01M32AHNQ). Without it a reader can
+    /// land between a writer's length and pwrite and see a half-written last
+    /// line; measured mid-wave as one `list` failing `NotAnObject` while the
+    /// `show` right after it on the same tree loaded fine. Readers never block
+    /// each other, and the handle is closed before any append this process
+    /// makes, so a verb never waits on its own lock.
+    fn readLocked(self: *Store, sub: Io.Dir, name: []const u8) ![]u8 {
+        var f = try sub.openFile(self.io, name, .{ .lock = .shared });
+        defer f.close(self.io);
+        const len = try f.length(self.io);
+        const buf = try self.gpa.alloc(u8, @intCast(len));
+        errdefer self.gpa.free(buf);
+        const n = try f.readPositionalAll(self.io, buf, 0);
+        if (n == buf.len) return buf;
+        // Shorter than its length: truncated underneath us (a `compact`
+        // rename or a git checkout, neither of which takes the lock).
+        return self.gpa.realloc(buf, n);
+    }
+
+    /// Every body append a later whole-body `setBody` silently discarded
+    /// (01M32AHNQ), and whose text is not in the live body today.
+    ///
+    /// The retroactive half of that fix. `appendBody` stops NEW clobbers, but
+    /// every `--append-body` written before it landed as a `setBody` of
+    /// base+text, and two of those forked from one base in separate worktrees
+    /// leave the later-folded one's body missing the other's text. The events
+    /// are all still in the log; only the fold lost them — so replaying each
+    /// task's body writes in fold order (snapshot, then the log deduped and
+    /// ts-sorted, watermark-withheld events skipped, exactly as `replayFile`)
+    /// finds them mechanically:
+    ///
+    ///   a `setBody` S whose previous body P is NOT a prefix of it, but which
+    ///   extends an earlier non-empty body B that P also extends, discarded
+    ///   P's text after B.
+    ///
+    /// B is the longest such earlier body — the fork point. Prefixes compare
+    /// with trailing newlines trimmed, the way `appendedBody` joins. An EMPTY
+    /// base is never a fork point: onto an empty body a clobbering append and a
+    /// deliberate `--replace-body` are the same bytes. The converse limit is
+    /// real too: a `--replace-body` that deliberately kept an older body as its
+    /// prefix and dropped the text after it matches — the report is "this text
+    /// left the body", and whether that was meant is the reader's call. Text
+    /// that is back in the live body (re-appended by hand, or carried by a
+    /// later write) is not reported. History folded into `snapshot.jsonl` by a
+    /// `compact` is beyond reach: the snapshot keeps the result, not the writes.
+    pub fn findLostAppends(self: *Store, gpa: std.mem.Allocator) ![]LostAppend {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var evs: std.ArrayList(Pending) = .empty;
+        var sub = self.dir.openDir(self.io, tracker_subdir, .{}) catch |e| switch (e) {
+            error.FileNotFound => return &.{},
+            else => return e,
+        };
+        defer sub.close(self.io);
+        var idx: usize = 0;
+        for ([_][]const u8{ snapshot_name, log_name }) |name| {
+            const is_log = std.mem.eql(u8, name, log_name);
+            const bytes = (if (is_log)
+                self.readLocked(sub, name)
+            else
+                sub.readFileAlloc(self.io, name, gpa, .unlimited)) catch |e| switch (e) {
+                error.FileNotFound => continue,
+                else => return e,
+            };
+            defer gpa.free(bytes);
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            var it = std.mem.splitScalar(u8, bytes, '\n');
+            const first = evs.items.len;
+            while (it.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len == 0) continue;
+                if (is_log and (try seen.getOrPut(arena, trimmed)).found_existing) continue;
+                // Unknown ops and malformed lines are `load`'s to report; this
+                // diagnostic only reads the body writes it understands.
+                const ev = codec.decode(arena, trimmed) catch continue;
+                switch (ev) {
+                    .add, .setBody, .appendBody => {},
+                    else => continue,
+                }
+                if (is_log and self.supersededBy(ev) != null) continue;
+                // The snapshot folds in file order, so it keeps ts 0 here and
+                // sorts ahead of every log event, in file order.
+                try evs.append(arena, .{ .ev = ev, .ts = if (is_log) model.eventTs(ev) else 0, .idx = idx });
+                idx += 1;
+            }
+            if (is_log) std.sort.pdq(Pending, evs.items[first..], {}, Pending.less);
+        }
+
+        const Write = struct { body: []const u8, ts: i64 };
+        var history: std.AutoHashMapUnmanaged(Key, std.ArrayList(Write)) = .empty;
+        var out: std.ArrayList(LostAppend) = .empty;
+        errdefer {
+            for (out.items) |l| gpa.free(l.text);
+            out.deinit(gpa);
+        }
+        for (evs.items) |p| {
+            const id, const new_body: ?[]const u8 = switch (p.ev) {
+                .add => |x| .{ x.id, x.body },
+                .setBody => |x| .{ x.id, x.body },
+                .appendBody => |x| .{ x.id, null },
+                else => unreachable,
+            };
+            const gop = try history.getOrPut(arena, key(id));
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            const h = gop.value_ptr;
+            const prev: []const u8 = if (h.items.len == 0) "" else h.items[h.items.len - 1].body;
+            const body = new_body orelse try appendedBody(arena, prev, p.ev.appendBody.text);
+            if (p.ev == .setBody and h.items.len >= 2) clobber: {
+                const s_body = p.ev.setBody.body;
+                const p_head = std.mem.trimEnd(u8, prev, "\n");
+                if (std.mem.startsWith(u8, s_body, p_head)) break :clobber; // an append
+                var base: ?[]const u8 = null;
+                for (h.items[0 .. h.items.len - 1]) |w| {
+                    const b = std.mem.trimEnd(u8, w.body, "\n");
+                    if (b.len == 0 or b.len >= p_head.len) continue;
+                    if (!std.mem.startsWith(u8, s_body, b) or !std.mem.startsWith(u8, p_head, b)) continue;
+                    if (base == null or b.len > base.?.len) base = b;
+                }
+                const b = base orelse break :clobber;
+                const lost = std.mem.trim(u8, p_head[b.len..], "\n");
+                if (lost.len == 0) break :clobber;
+                if (self.get(id)) |t| if (std.mem.indexOf(u8, t.body, lost) != null) break :clobber;
+                try out.append(gpa, .{
+                    .id = id,
+                    .lost_ts = h.items[h.items.len - 1].ts,
+                    .clobber_ts = p.ts,
+                    .text = try gpa.dupe(u8, lost),
+                });
+            }
+            try h.append(arena, .{ .body = body, .ts = p.ts });
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
     /// Record (or bump the count of) a task whose stale event was withheld.
     fn noteSuperseded(self: *Store, id: Ulid) !void {
         for (self.superseded.items) |*sd| {
@@ -1577,6 +1745,7 @@ pub const Store = struct {
             },
             .setTitle => |x| gpa.free(x.title),
             .setBody => |x| gpa.free(x.body),
+            .appendBody => |x| gpa.free(x.text),
             .untag => |x| gpa.free(x.tag),
             .undocref => |x| gpa.free(x.doc_id),
             .setShort => |x| gpa.free(x.short),
@@ -2852,6 +3021,11 @@ pub const Store = struct {
                     ts = x.ts;
                     task_id = x.id;
                     break :blk try alloc.dupe(u8, "body updated");
+                },
+                .appendBody => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "body appended (+{d} bytes)", .{x.text.len});
                 },
                 .docref => |x| blk: {
                     ts = x.ts;

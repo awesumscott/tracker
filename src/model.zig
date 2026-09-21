@@ -321,6 +321,32 @@ pub const Op = enum {
     /// list removal) because it is authorable from either endpoint and so can
     /// genuinely be raced.
     unraises,
+    /// Append `text` to a task's body, carrying only the DELTA (01M32AHNQ).
+    ///
+    /// `setBody` carries a WHOLE body, so it is last-writer-wins: two lanes in
+    /// separate worktrees that each `--append-body` from the same base both
+    /// write base+theirs, and after the union merge the later one's full body
+    /// silently discards the other's text. The events survive in the log; only
+    /// the FOLD loses them. Measured in Enix: an evidence paragraph recording
+    /// that a sub-task was built vanished and the task was re-dispatched three
+    /// days later.
+    ///
+    /// A delta commutes where a whole body cannot: the fold concatenates in
+    /// replay (ts) order, so every concurrent append survives, just in a
+    /// deterministic order. The separator is the FOLD's job, not the writer's
+    /// (one blank line between entries, none on an empty body), so it is right
+    /// relative to whatever body the fold actually has at that point — which a
+    /// writer in another worktree cannot know.
+    ///
+    /// Idempotence is by the replay's byte-identical-line dedupe (same ts, same
+    /// text = the same event re-merged), and against the snapshot by the
+    /// watermark like every other body write (`Store.scalarTarget`) — `compact`
+    /// folds the appended text into the snapshot `add`, so a re-merged copy is
+    /// provably already applied.
+    ///
+    /// Safe for an older binary to skip: it then shows a body missing the
+    /// appended text, which changes no readiness, satisfaction or state.
+    appendBody,
 };
 
 /// One log event — a tagged union over the op kinds. Fields mirror the JSON
@@ -348,6 +374,7 @@ pub fn eventTaskIds(ev: Event) [2]?Ulid {
         .setPriority => |x| .{ x.id, null },
         .setTitle => |x| .{ x.id, null },
         .setBody => |x| .{ x.id, null },
+        .appendBody => |x| .{ x.id, null },
         .setShort => |x| .{ x.id, null },
         .tag => |x| .{ x.id, null },
         .untag => |x| .{ x.id, null },
@@ -446,4 +473,6 @@ pub const Event = union(Op) {
     raises: struct { task: Ulid, decision: Ulid, ts: i64 = 0 },
     /// Remove a `raises` edge. See `Op.unraises`.
     unraises: struct { task: Ulid, decision: Ulid, ts: i64 = 0 },
+    /// Append `text` to a task's body. See `Op.appendBody`.
+    appendBody: struct { id: Ulid, text: []const u8, ts: i64 = 0 },
 };

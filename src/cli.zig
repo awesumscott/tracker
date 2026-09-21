@@ -112,6 +112,10 @@ pub const CliError = error{
     /// before this is returned; main.zig exits 1, same shape as
     /// `TombstoneIndexIncomplete`.
     StaleRulings,
+    /// `trk lost-appends` found at least one body append a later whole-body
+    /// write discarded (01M32AHNQ). Listed in `out` before this is returned;
+    /// main.zig exits 1, same shape as `StaleRulings`.
+    LostAppends,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -952,8 +956,8 @@ pub const Cli = struct {
         \\  correct) plus each side's own event TIMESTAMP, read off the raw
         \\  `model.Event` payload in `.tracker/snapshot.jsonl` + `log.jsonl` — never
         \\  a scan of body/title TEXT. A raiser is flagged unless its most recent
-        \\  `setBody` ts is STRICTLY AFTER the decision's `setState -> done` ts
-        \\  (a tie, or no setBody at all, flags it). Deliberately BODY-only, not
+        \\  body write (`setBody`/`appendBody`) ts is STRICTLY AFTER the decision's
+        \\  `setState -> done` ts (a tie, or no body write at all, flags it). Deliberately BODY-only, not
         \\  "body or title": measured on the carrier this check exists for, a
         \\  title-only edit written 23h after the ruling still left the actual
         \\  question unreconciled, so a title-inclusive form would have missed the
@@ -966,6 +970,27 @@ pub const Cli = struct {
         \\  ruled_ts, body_ts}.
         \\  Exits nonzero iff it found at least one stale raiser.
         \\  e.g.  trk stale-rulings
+        },
+        .{ .name = "lost-appends", .run = &cmdLostAppends, .tools = &cli_only_tools, .flags = &.{"--json"}, .text =
+        \\trk lost-appends [--json]
+        \\  Body text a later whole-body write silently discarded (01M32AHNQ). Until
+        \\  `--append-body` wrote a delta (`appendBody`), it wrote base+text as a
+        \\  WHOLE body, and whole bodies are last-writer-wins: two worktrees that
+        \\  appended to the same base each kept only their own text once merged.
+        \\  The writes are all still in the log; only the fold lost one.
+        \\  Replays each task's body writes in fold order and reports every write
+        \\  that extended an earlier body while dropping what the write before it
+        \\  had added — with the dropped TEXT, so it can be put back
+        \\  (`trk edit <id> --append-body -`). Text already back in the live body
+        \\  is not reported.
+        \\  Limits: onto an EMPTY body a clobber and a deliberate --replace-body are
+        \\  the same bytes, so those are never flagged; a --replace-body that kept an
+        \\  older body as its prefix and dropped the rest IS flagged (the text did
+        \\  leave the body; whether that was meant is yours to judge); history a
+        \\  `compact` folded into the snapshot is out of reach.
+        \\  --json: an array of {id, short, lost_ts, clobber_ts, text}.
+        \\  Exits nonzero iff it found at least one.
+        \\  e.g.  trk lost-appends
         },
         .{ .name = "tombstones", .run = &cmdTombstones, .mutating_subcommands = &.{"--rebuild"}, .tools = &tombstones_tools, .flags = &.{ "--rebuild", "--verify", "--json" }, .text =
         \\trk tombstones [--rebuild | --verify] [--json]
@@ -5230,22 +5255,14 @@ pub const Cli = struct {
             return;
         }
 
-        // Append: blank line between the old body and the new text, so an
-        // accumulated diagnosis trail stays readable as distinct entries. No
-        // separator when there is nothing to separate from.
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.gpa);
-        if (current.len > 0) {
-            try buf.appendSlice(self.gpa, current);
-            // Exactly one blank line, whatever trailing newlines the body has.
-            var end = buf.items.len;
-            while (end > 0 and buf.items[end - 1] == '\n') end -= 1;
-            buf.shrinkRetainingCapacity(end);
-            try buf.appendSlice(self.gpa, "\n\n");
-        }
-        try buf.appendSlice(self.gpa, text);
-        try self.store.append(.{ .setBody = .{ .id = id, .body = buf.items } });
-        try self.print("{s}: body appended (+{d} bytes, now {d})\n", .{ sid, text.len, buf.items.len });
+        // Append: the DELTA, never a recomputed whole body (01M32AHNQ). A
+        // `setBody` of current+text is last-writer-wins, so two worktrees
+        // appending from the same base each overwrite the other once merged;
+        // `appendBody` commutes, and the fold owns the separator
+        // (`tracker.store.appendedBody`).
+        try self.store.append(.{ .appendBody = .{ .id = id, .text = text } });
+        const now = if (self.store.get(id)) |t| t.body.len else 0;
+        try self.print("{s}: body appended (+{d} bytes, now {d})\n", .{ sid, text.len, now });
     }
 
     // ----------------------------------------------------------- log
@@ -5495,7 +5512,9 @@ pub const Cli = struct {
             const ev = codec.decode(self.gpa, trimmed) catch continue;
             defer Store.freeEvent(self.gpa, ev);
             switch (ev) {
-                .setBody => |x| {
+                // Either body write reconciles a raiser: `--append-body` (and
+                // `rule`) now land as `appendBody`.
+                inline .setBody, .appendBody => |x| {
                     const cur = body_ts.get(x.id) orelse 0;
                     if (x.ts > cur) try body_ts.put(self.gpa, x.id, x.ts);
                 },
@@ -5603,6 +5622,57 @@ pub const Cli = struct {
         }
 
         if (hits.items.len != 0) return error.StaleRulings;
+    }
+
+    /// `trk lost-appends [--json]` — see its help text; the scan is
+    /// `Store.findLostAppends`.
+    fn cmdLostAppends(self: *Cli, args: []const []const u8) Error!void {
+        var json = false;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else {
+                try self.write("trk: usage: trk lost-appends [--json]\n");
+                return error.UsageError;
+            }
+        }
+        const lost = try self.store.findLostAppends(self.gpa);
+        defer {
+            for (lost) |l| self.gpa.free(l.text);
+            self.gpa.free(lost);
+        }
+
+        if (json) {
+            try self.write("[");
+            for (lost, 0..) |l, i| {
+                if (i != 0) try self.write(",");
+                var sb: [ulid.len]u8 = undefined;
+                try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"lost_ts\":{d},\"clobber_ts\":{d},\"text\":", .{
+                    &l.id.text, try self.shortId(l.id, &sb), l.lost_ts, l.clobber_ts,
+                });
+                try self.writeJsonString(l.text);
+                try self.write("}");
+            }
+            try self.write("]\n");
+        } else if (lost.len == 0) {
+            try self.write("trk: lost-appends: nothing — no body write in the log discarded an earlier append\n");
+            return;
+        } else {
+            try self.print("trk: lost-appends: {d} append(s) discarded by a later whole-body write:\n", .{lost.len});
+            for (lost) |l| {
+                var sb: [ulid.len]u8 = undefined;
+                const sid = try self.shortId(l.id, &sb);
+                const title = if (self.store.get(l.id)) |t| t.title else "";
+                var b1: [32]u8 = undefined;
+                var b2: [32]u8 = undefined;
+                try self.print("{s}  {s}\n    {d} bytes written {s}, discarded {s}:\n", .{
+                    sid, title, l.text.len, fmtTs(l.lost_ts, &b1), fmtTs(l.clobber_ts, &b2),
+                });
+                var it = std.mem.splitScalar(u8, l.text, '\n');
+                while (it.next()) |line| try self.print("    | {s}\n", .{line});
+            }
+        }
+        if (lost.len != 0) return error.LostAppends;
     }
 
     // ----------------------------------------------------------- tombstones

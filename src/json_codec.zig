@@ -26,6 +26,7 @@
 //!   {"op":"setDocPath","doc_id":"...","path":"docs/design/foo.md","ts":0}
 //!   {"op":"setTitle","id":"<ulid>","title":"...","ts":0}
 //!   {"op":"setBody","id":"<ulid>","body":"...","ts":0}
+//!   {"op":"appendBody","id":"<ulid>","text":"...","ts":0}
 //!   {"op":"untag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"undep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"unin","task":"<ulid>","arc":"<ulid>","ts":0}
@@ -254,6 +255,14 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeJsonString(buf, gpa, b.id.slice());
             try writeKey(buf, gpa, "body", &first);
             try writeJsonString(buf, gpa, b.body);
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, b.ts);
+        },
+        .appendBody => |b| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, b.id.slice());
+            try writeKey(buf, gpa, "text", &first);
+            try writeJsonString(buf, gpa, b.text);
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, b.ts);
         },
@@ -549,6 +558,11 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
         .setBody => return .{ .setBody = .{
             .id = try getUlid(obj, "id"),
             .body = try gpa.dupe(u8, try getStr(obj, "body")),
+            .ts = getIntDefault(obj, "ts", 0),
+        } },
+        .appendBody => return .{ .appendBody = .{
+            .id = try getUlid(obj, "id"),
+            .text = try gpa.dupe(u8, try getStr(obj, "text")),
             .ts = getIntDefault(obj, "ts", 0),
         } },
         .untag => return .{ .untag = .{

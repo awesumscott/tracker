@@ -349,6 +349,77 @@ test "replay: a log event older than its task's snapshot watermark is withheld, 
     try testing.expectEqual(@as(usize, 2), s.superseded.items[0].events);
 }
 
+test "appendBody: concurrent appends from one base BOTH survive the union merge (01M32AHNQ)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    // The measured shape: two lanes each appended to the same 'base' in their
+    // own worktree, and the union merge put the later lane FIRST in the file.
+    // As whole-body `setBody` writes, the fold kept whichever sorted last and
+    // discarded the other lane's text. As deltas, both land, in ts order, and
+    // a re-merged copy of one line is collapsed rather than doubled.
+    const lane_b: Event = .{ .appendBody = .{ .id = a, .text = "lane B found X", .ts = 300 } };
+    try writeRawLog(tmp.dir, &.{
+        .{ .add = .{ .id = a, .title = "T", .body = "base\n\n\n", .ts = 100 } },
+        lane_b,
+        .{ .appendBody = .{ .id = a, .text = "lane A found Y", .ts = 200 } },
+        lane_b,
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    // One blank line between entries, whatever trailing newlines the base had.
+    try testing.expectEqualStrings("base\n\nlane A found Y\n\nlane B found X", s.get(a).?.body);
+
+    // An append onto an EMPTY body carries no separator.
+    const b = mintId();
+    try s.append(.{ .add = .{ .id = b, .title = "empty" } });
+    try s.append(.{ .appendBody = .{ .id = b, .text = "first" } });
+    try testing.expectEqualStrings("first", s.get(b).?.body);
+
+    // Round-trips through the codec from disk exactly as folded live.
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqualStrings("first", s2.get(b).?.body);
+    try testing.expectEqualStrings(s.get(a).?.body, s2.get(a).?.body);
+}
+
+test "appendBody: compact folds it into the snapshot, and a re-merged pre-compact copy is withheld, not doubled" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = mintId();
+
+    // The snapshot already carries the appended text (compact folded it), at
+    // watermark 1000. A lane whose base predates the compact merges the same
+    // append back in (ts 500) plus a genuinely new one (ts 1500).
+    try writeRawSnapshot(tmp.dir, &.{
+        .{ .add = .{ .id = a, .title = "T", .body = "base\n\nold note", .wm = 1000 } },
+    });
+    try writeRawLog(tmp.dir, &.{
+        .{ .appendBody = .{ .id = a, .text = "new note", .ts = 1500 } },
+        .{ .appendBody = .{ .id = a, .text = "old note", .ts = 500 } },
+    });
+
+    var s = Store.open(testing.allocator, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    try testing.expectEqualStrings("base\n\nold note\n\nnew note", s.get(a).?.body);
+    try testing.expectEqual(@as(usize, 1), s.superseded.items.len);
+
+    // And compact itself carries the folded body through.
+    const c = mintId();
+    try s.append(.{ .add = .{ .id = c, .title = "C", .body = "x" } });
+    try s.append(.{ .appendBody = .{ .id = c, .text = "y" } });
+    _ = try s.compact();
+    var s2 = Store.open(testing.allocator, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqualStrings("x\n\ny", s2.get(c).?.body);
+}
+
 test "replay: the watermark withholds only SCALARS — a stale lane's edges and tags still land" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3338,4 +3409,98 @@ test "a decision is not work, and is not an arc: both refusals are write-time" {
     try s.append(.{ .decisionDeclare = .{ .id = d, .declared = false } });
     try testing.expect(!s.isDecision(d));
     try s.append(.{ .arcDeclare = .{ .id = d, .declared = true } });
+}
+
+/// One reader in the concurrent-read arm: folds the shared log from scratch,
+/// over and over, until the writers finish. Any load error is the defect.
+const RaceReader = struct {
+    dir: std.Io.Dir,
+    done: *std.atomic.Value(bool),
+    loads: usize = 0,
+    err: ?anyerror = null,
+
+    fn run(self: *RaceReader) void {
+        while (!self.done.load(.acquire)) {
+            var s = Store.open(testing.allocator, io, self.dir);
+            defer s.deinit();
+            s.load() catch |e| {
+                self.err = e;
+                return;
+            };
+            self.loads += 1;
+        }
+    }
+};
+
+/// A writer that appends BIG bodies, so each pwrite is long enough for an
+/// unlocked reader to land inside it.
+const BigWriter = struct {
+    store: *Store,
+    id: tracker.Ulid,
+    body: []const u8,
+    err: ?anyerror = null,
+
+    fn run(self: *BigWriter) void {
+        for (0..race_per_writer) |_| {
+            self.store.append(.{ .appendBody = .{ .id = self.id, .text = self.body } }) catch |e| {
+                self.err = e;
+                return;
+            };
+        }
+    }
+};
+
+// The reader half of 01M2V2NPA, found in 01M32AHNQ: a `list` mid-wave failed
+// `NotAnObject` while the `show` right after it loaded fine. `persistAppend`
+// serialized WRITERS against each other, but a reader took no lock, so it
+// could fold a line a writer had only half written. Readers now take a shared
+// lock on the log (`Store.readLocked`).
+test "concurrent reads: a fold never sees a half-written line (01M32AHNQ)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const id = mintId();
+    {
+        var s = Store.open(testing.allocator, io, tmp.dir);
+        defer s.deinit();
+        try s.load();
+        try s.append(.{ .add = .{ .id = id, .title = "shared" } });
+    }
+    const body = try testing.allocator.alloc(u8, 256 * 1024);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+
+    const n_writers = 2;
+    const n_readers = 4;
+    var stores: [n_writers]Store = undefined;
+    var opened: usize = 0;
+    defer for (stores[0..opened]) |*s| s.deinit();
+    while (opened < n_writers) : (opened += 1) {
+        stores[opened] = Store.open(testing.allocator, io, tmp.dir);
+        try stores[opened].load();
+    }
+
+    var done = std.atomic.Value(bool).init(false);
+    var readers: [n_readers]RaceReader = undefined;
+    var rthreads: [n_readers]std.Thread = undefined;
+    for (&readers, &rthreads) |*r, *th| {
+        r.* = .{ .dir = tmp.dir, .done = &done };
+        th.* = try std.Thread.spawn(.{}, RaceReader.run, .{r});
+    }
+    var writers: [n_writers]BigWriter = undefined;
+    var wthreads: [n_writers]std.Thread = undefined;
+    for (&writers, &wthreads, 0..) |*w, *th, t| {
+        w.* = .{ .store = &stores[t], .id = id, .body = body };
+        th.* = try std.Thread.spawn(.{}, BigWriter.run, .{w});
+    }
+    for (&wthreads) |*th| th.join();
+    done.store(true, .release);
+    for (&rthreads) |*th| th.join();
+    for (&writers) |*w| if (w.err) |e| return e;
+    for (&readers) |*r| if (r.err) |e| {
+        std.debug.print("reader failed after {d} clean loads: {s}\n", .{ r.loads, @errorName(e) });
+        return e;
+    };
 }
