@@ -1175,6 +1175,12 @@ adjacent-prereq view. No novelty is claimed for the append-log or the record sto
     footer, so the choice is rows or nothing, and nothing would leave the agent-facing half of the same
     view carrying the defect the human half just stopped carrying. The key is the one `show --json`
     already uses, so filtering it yields exactly the pre-fix set.
+    Rows and footer alike pass the listing's OWN filters (01M31H1JA): appended unfiltered, `--arc X --state
+    open` measured 33 compacted rows out of 45 on Enix's store, and under `--decision` they read as 33
+    unanswered forks. `--arc` narrows; it never widens what another flag excluded. A tombstone keeps only
+    id, short, title and end state, so it is admitted only where it can show it matches: its end state
+    (`reason`) against `--state` (completed, so hidden by default, shown by `--all`), its title against
+    search terms, and never under `--tag`/`--decision`, whose fields it does not keep.
   - **`next` does not, because it is not that kind of view.** A ready frontier already omits done, blocked
     and leased members and nobody calls that a silent absence; a graduated member is never an answer to
     "what can I work on".

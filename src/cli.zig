@@ -767,7 +767,10 @@ pub const Cli = struct {
         \\  member it collects — so without this a fully-built, graduated arc lists
         \\  identically to one nobody ever sliced. In --json they arrive as extra rows
         \\  carrying \"compacted\": true (an array has nowhere to put a footer); filter
-        \\  on that key for the live-only set. `next` and docs/TODO.md deliberately do
+        \\  on that key for the live-only set. They pass the same filters as live rows:
+        \\  a compacted member is completed work (hidden by default; shown by --all or
+        \\  --state archived|dropped), and keeps no tags or decision flag, so --tag and
+        \\  --decision drop it; search terms match its title. `next` and docs/TODO.md deliberately do
         \\  NOT report them: `next` is a ready frontier, and TODO.md projects only
         \\  not-yet-built work.
         \\  e.g.  trk list --state open net           trk list --no-arc
@@ -3483,6 +3486,14 @@ pub const Cli = struct {
         const ids = try self.store.allIds(self.gpa);
         defer self.gpa.free(ids);
 
+        const tomb_filter: TombFilter = .{
+            .state = state_filter,
+            .show_all = show_all,
+            .decisions_only = decisions_only,
+            .tag = tag_filter,
+            .words = words.items,
+        };
+
         if (json) try self.write("[");
         var shown: usize = 0;
         for (ids) |id| {
@@ -3534,10 +3545,18 @@ pub const Cli = struct {
             // design.md rules a machine reader should branch on, so a consumer
             // that wants today's output filters on one key rather than parsing
             // for an absence.
+            //
+            // They pass the SAME filters as the live rows (01M31H1JA). Appended
+            // unfiltered, `--arc X --state open` answered 45 rows of which 33
+            // were closed-and-GC'd work with no state at all — and under
+            // `--decision` they read as unanswered questions. `--arc` narrows;
+            // it must never widen what the other flags excluded.
             if (arc_id) |a| {
                 const gone = try self.store.compactedMembers(self.gpa, a);
                 defer self.gpa.free(gone);
                 for (gone) |tb| {
+                    if (!tomb_filter.admits(tb)) continue;
+                    if (limit) |lim| if (shown >= lim) break;
                     if (shown != 0) try self.write(",");
                     try self.tombstoneJsonOpen(tb);
                     try self.write("}");
@@ -3548,8 +3567,35 @@ pub const Cli = struct {
             return;
         }
         if (shown == 0) try self.write("(no matching tasks)\n");
-        try self.compactedMemberFooter(arc_id);
+        try self.compactedMemberFooter(arc_id, tomb_filter);
     }
+
+    /// Whether a compacted arc member passes `list`'s filters (01M31H1JA).
+    /// A tombstone keeps id, short, title and end state — never tags, body or
+    /// decision nature — so the rule is: admit only what the record can SHOW
+    /// it satisfies. Its end state is `reason`; `ghost`/`unknown` match no
+    /// state. A filter over a field it does not keep (`--decision`, `--tag`)
+    /// drops it, and search terms are matched against the title alone.
+    /// `--not-tag` can never exclude it: it carries no tag to exclude.
+    const TombFilter = struct {
+        state: ?State,
+        show_all: bool,
+        decisions_only: bool,
+        tag: ?[]const u8,
+        words: []const []const u8,
+
+        fn admits(f: TombFilter, tb: *const tracker.store.Tombstone) bool {
+            if (f.state) |sf| {
+                if (State.fromString(tb.reason) != sf) return false;
+            } else if (!f.show_all) {
+                // Every tombstone is completed work, which the default hides.
+                return false;
+            }
+            if (f.decisions_only or f.tag != null) return false;
+            for (f.words) |w| if (!containsSubCI(tb.title, w)) return false;
+            return true;
+        }
+    };
 
     /// `list --arc <id>`'s graduated tail (01M2V2TSA).
     ///
@@ -3569,16 +3615,24 @@ pub const Cli = struct {
     /// ready frontier that already omits done/blocked/leased members without
     /// anyone calling that a silent absence, and the projection's own contract
     /// is "only not-yet-built work" (Scott's call, 2026-09-18).
-    fn compactedMemberFooter(self: *Cli, arc_id: ?Ulid) Error!void {
+    ///
+    /// Counts only the members the listing's filters admit (`TombFilter`,
+    /// 01M31H1JA): the footer is the human half of the `--json` rows, and the
+    /// two halves answer one question.
+    fn compactedMemberFooter(self: *Cli, arc_id: ?Ulid, filter: TombFilter) Error!void {
         const a = arc_id orelse return;
         const gone = try self.store.compactedMembers(self.gpa, a);
         defer self.gpa.free(gone);
-        if (gone.len == 0) return;
+        var n: usize = 0;
+        for (gone) |tb| {
+            if (filter.admits(tb)) n += 1;
+        }
+        if (n == 0) return;
         var sb: [ulid.len]u8 = undefined;
         try self.print(
             "\n  +{d} compacted member(s) not shown — graduated out of the live store;\n" ++
                 "  `trk tree {s}` names them.\n",
-            .{ gone.len, try self.shortId(a, &sb) },
+            .{ n, try self.shortId(a, &sb) },
         );
     }
 

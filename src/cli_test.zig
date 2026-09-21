@@ -4923,6 +4923,76 @@ test "list --arc reports an arc's compacted members; next and render deliberatel
     try testing.expect(std.mem.indexOf(u8, md, "compacted") == null);
 }
 
+test "list --arc: compacted members pass the same filters as live rows, never widening them (01M31H1JA)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const arc = mintId();
+    const open_q = mintId();
+    const open_work = mintId();
+    const gone_a = mintId();
+    const gone_d = mintId();
+    try f.store.append(.{ .add = .{ .id = arc, .title = "Arc" } });
+    try f.store.append(.{ .arcDeclare = .{ .id = arc, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = open_q, .title = "open fork", .tags = &.{"t"} } });
+    try f.store.append(.{ .decisionDeclare = .{ .id = open_q, .declared = true } });
+    try f.store.append(.{ .add = .{ .id = open_work, .title = "open work" } });
+    try f.store.append(.{ .add = .{ .id = gone_a, .title = "archived work", .tags = &.{"t"} } });
+    try f.store.append(.{ .add = .{ .id = gone_d, .title = "dropped work" } });
+    for ([_]Ulid{ open_q, open_work, gone_a, gone_d }) |m| try f.store.append(.{ .in = .{ .task = m, .arc = arc } });
+    try f.store.append(.{ .setState = .{ .id = gone_a, .state = .archived } });
+    try f.store.append(.{ .setState = .{ .id = gone_d, .state = .dropped } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    // Rows below count the arc root too: it is its own member.
+    const Case = struct { args: []const []const u8, rows: usize, compacted: usize };
+    const cases = [_]Case{
+        // The measured shape: `--state open` returned the tombstones too.
+        .{ .args = &.{ "--state", "open" }, .rows = 3, .compacted = 0 },
+        .{ .args = &.{ "--decision", "--state", "open" }, .rows = 1, .compacted = 0 },
+        // The default hides completed work; a tombstone is always completed.
+        .{ .args = &.{}, .rows = 3, .compacted = 0 },
+        // Asked for by end state, they come back — just the matching one.
+        .{ .args = &.{ "--state", "archived" }, .rows = 1, .compacted = 1 },
+        .{ .args = &.{ "--state", "dropped" }, .rows = 1, .compacted = 1 },
+        .{ .args = &.{"--all"}, .rows = 5, .compacted = 2 },
+        // A record that keeps no tags or decision flag cannot satisfy them.
+        .{ .args = &.{ "--all", "--decision" }, .rows = 1, .compacted = 0 },
+        .{ .args = &.{ "--all", "--tag", "t" }, .rows = 1, .compacted = 0 },
+        // Search terms: its title is what it keeps.
+        .{ .args = &.{ "--all", "archived" }, .rows = 1, .compacted = 1 },
+        .{ .args = &.{ "--all", "--limit", "4" }, .rows = 4, .compacted = 1 },
+    };
+    for (cases) |cs| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(alloc);
+        try argv.appendSlice(alloc, &.{ "list", "--arc", &arc.text, "--json" });
+        try argv.appendSlice(alloc, cs.args);
+        try f.run(argv.items);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+        defer parsed.deinit();
+        var compacted: usize = 0;
+        for (parsed.value.array.items) |row| {
+            if (row.object.get("compacted") != null) compacted += 1;
+        }
+        testing.expectEqual(cs.rows, parsed.value.array.items.len) catch |e| {
+            std.debug.print("case {any}: {s}\n", .{ cs.args, f.out.items });
+            return e;
+        };
+        try testing.expectEqual(cs.compacted, compacted);
+    }
+
+    // The human footer counts the same admitted set.
+    try f.run(&.{ "list", "--arc", &arc.text, "--state", "open" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted member") == null);
+    try f.run(&.{ "list", "--arc", &arc.text, "--state", "dropped" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "+1 compacted member(s)") != null);
+    try f.run(&.{ "list", "--arc", &arc.text, "--all" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "+2 compacted member(s)") != null);
+}
+
 // ----- trk decision (01M2VFV83) -----
 
 test "trk decision: raises a node, separates provenance from blocking, prints only the id" {
