@@ -58,13 +58,18 @@ discovery).
 - **`T in X`** — task `T` belongs to arc `X`. An **arc** is a task that's either **declared**
   (`trk arc <id>`, or `trk add --arc` — works even with zero members) or has ≥1 direct `in` member.
   `trk in <task> <arc>`. `trk list --no-arc` lists every task in no arc.
+- **Decision** — an open question is its own node, not a tag or a note in a body: `trk decision "<q>"
+  --from <raiser> --blocks <id>` files it and wires the work that waits on it (an ordinary `needs` edge).
+  `trk rule <id> <ruling>` appends the answer and closes it, releasing what it blocked. A decision stays
+  one once ruled; `trk list --decision --state open` is the sweep of what's still waiting on a call.
 - **State** — `open` → `claimed` (the lease: taken, hidden from `next`) → `submitted` (completion pending
   verification) → `done` → `archived` (via `trk archive`, which graduates done tasks to changelog bullets
   and tombstones them), plus `blocked` (held) and `dropped` (won't-do).
 - **`next`** — the ready frontier: every `open` task whose prerequisites are all satisfied. An arc root
   is a container ("do the arc" = do its non-parked members): `next` holds it back until the members are
   finished, then surfaces it once as the close-out prompt — closing the root is what marks the goal
-  complete and unblocks anything that `needs` the arc.
+  complete and unblocks anything that `needs` the arc. Decisions never appear in `next` (a question isn't
+  buildable work); when that withholds ready work, `next` says so and points at `trk list --decision`.
 - **`.tracker/`** — the append-only `log.jsonl` (+ an optional compacted `snapshot.jsonl`). It union-merges
   on concurrent appends, so parallel workers on disjoint tasks can each close their own without conflict.
 - **Short ids are frozen at mint time and never change.** `trk add` prints the full ULID, and every human
@@ -79,7 +84,7 @@ discovery).
 
 ## Commands
 
-`add · dep · undep · in · unin · arc · migrate-arcs · migrate-shorts · state · release · edit · rule · show · next · list · render · tree · log · stale · stale-rulings · lost-appends · doc · compact · archive · tombstones · init · mcp-serve`
+`add · dep · undep · in · unin · arc · decision · rule · migrate-arcs · migrate-shorts · migrate-decisions · state · release · edit · show · next · list · render · tree · log · stale · stale-rulings · lost-appends · doc · compact · archive · tombstones · init · mcp-serve`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.
@@ -100,7 +105,7 @@ instead of a shell. Register it in `.mcp.json`:
 
 Every tool takes a required `tree`: `"main"`, or the path of one of the repository's linked git
 worktrees — a lane's write lands in exactly the store it names. `show`/`list`/`next`/`tree`/`log` return
-JSON. `init`, `migrate-arcs` and `migrate-shorts` stay CLI-only. See `trk mcp-serve --help`.
+JSON. `init`, the `migrate-*` verbs, `stale-rulings` and `lost-appends` stay CLI-only. See `trk mcp-serve --help`.
 
 ## Config
 
@@ -129,10 +134,12 @@ of the configured tags falls back to `archive.out` as before. An explicit `--out
 (one file, full stop). A task matching more than one configured route is a hard error naming the task and
 both routes — see [`docs/design.md`](docs/design.md).
 
-`rule.tag` names the tag `trk rule` looks for and removes (default `"scott-decision"`):
+Ruled decisions graduate too, with their ruling as the bullet body. `archive.decisions_out` sends them to
+their own file — matched on the task being a decision, not on a tag — and falls back to the ordinary
+destination when unset:
 
 ```json
-{ "rule": { "tag": "needs-decision" } }
+{ "archive": { "out": "docs/CHANGELOG.md", "decisions_out": "docs/DECISIONS.md" } }
 ```
 
 ## Design
