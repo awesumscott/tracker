@@ -1331,7 +1331,7 @@ pub const Cli = struct {
             \\      (appended to --out/config target under a dated heading, else stdout),
             \\      then flip each to `archived` so it leaves every view (structural
             \\      dedup). --dry-run previews on stdout without archiving.
-            \\  trk compact [--force]        rewrite snapshot + truncate log (drops archived/dropped)
+            \\  trk compact [--dry-run]      rewrite snapshot + truncate log (drops archived/dropped)
             \\  trk doc set <doc_id> <path>  register/update a doc_id -> repo-relative path
             \\  trk doc list                 print all registered doc_id -> path mappings
             \\  trk doc resolve <doc_id>     print the path for a doc_id

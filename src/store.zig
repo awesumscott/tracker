@@ -160,8 +160,8 @@ pub const gitignore_text =
     \\# Written by `trk init`. Kept INSIDE .tracker/ deliberately: git resolves
     \\# ignores per directory, so this is immune to a root .gitignore never
     \\# mentioning it. log.jsonl, snapshot.jsonl, config.json, .gitattributes,
-    \\# quarantine.jsonl and tombstones.jsonl are all meant to be committed —
-    \\# nothing here ignores them.
+    \\# quarantine.jsonl, tombstones.jsonl and tombstone-bodies.jsonl are all
+    \\# meant to be committed — nothing here ignores them.
     \\#
     \\# compact's pre-rewrite backups (Config.backup_retain bounds how many it
     \\# keeps, but even one full log+snapshot copy is a permanent untracked

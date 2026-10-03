@@ -19,3 +19,16 @@ log.jsonl merge=union
 # reason and to keep the pair symmetric.
 snapshot.jsonl merge=text
 quarantine.jsonl merge=text
+#
+# The tombstone index: one append-only line per task `compact` physically
+# GC'd, so a citation of a compacted id still RESOLVES (`trk show`) instead
+# of reading as never-existed. Per-line independent and append-only exactly
+# like log.jsonl, so union — two branches that each carry a compact combine
+# their tombstones instead of one erasing the other's. A duplicate line is
+# harmless: the reader keys by id, last line wins.
+tombstones.jsonl merge=union
+#
+# The tombstone BODIES: one line per compacted id carrying its final body,
+# kept apart from the index so no ordinary command ever parses it. Same
+# per-line, append-only, last-line-wins shape as the index, so union.
+tombstone-bodies.jsonl merge=union
