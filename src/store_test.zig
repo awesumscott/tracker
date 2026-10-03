@@ -3504,3 +3504,25 @@ test "concurrent reads: a fold never sees a half-written line (01M32AHNQ)" {
         return e;
     };
 }
+
+test "foldBodyEvents: latest set is the base, later appends layer on, ties follow ord, duplicates fold once (01M3YMBZP)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var evs = [_]tracker.store.BodyEvent{
+        .{ .ts = 40, .append = true, .text = "D", .ord = 4 },
+        .{ .ts = 10, .append = false, .text = "A", .ord = 1 },
+        .{ .ts = 20, .append = true, .text = "B", .ord = 2 },
+        .{ .ts = 30, .append = false, .text = "C", .ord = 3 },
+        .{ .ts = 40, .append = true, .text = "D", .ord = 9 }, // same line seen on another branch
+    };
+    try testing.expectEqualStrings("C\n\nD", try tracker.store.foldBodyEvents(a, &evs));
+    // Same ms: file order (ord), not set-before-append.
+    var tie = [_]tracker.store.BodyEvent{
+        .{ .ts = 5, .append = true, .text = "B", .ord = 2 },
+        .{ .ts = 5, .append = false, .text = "A", .ord = 1 },
+        .{ .ts = 5, .append = false, .text = "C", .ord = 3 },
+    };
+    try testing.expectEqualStrings("C", try tracker.store.foldBodyEvents(a, &tie));
+    try testing.expectEqualStrings("", try tracker.store.foldBodyEvents(a, &.{}));
+}

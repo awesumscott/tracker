@@ -2255,6 +2255,7 @@ test "compact warns for tombstones.jsonl specifically on a PRE-EXISTING store's 
     try f.run(&.{"compact"});
     // POSITIVE: the one pin this legacy file lacks is named.
     try testing.expect(std.mem.indexOf(u8, f.warn.items, "tombstones.jsonl merge=union") != null);
+    try testing.expect(std.mem.indexOf(u8, f.warn.items, "tombstone-bodies.jsonl merge=union") != null);
     // NEGATIVE: the three pins the legacy file already carries are NOT
     // re-flagged — a check that warned on everything regardless of content
     // would pass this same assertion for the wrong reason.
@@ -4082,7 +4083,7 @@ test "compact entombs ONLY what it collects — a live task never gets a tombsto
     try testing.expect(std.mem.indexOf(u8, f.out.items, &live.text) == null);
 }
 
-test "show --json/--body on a compacted id: a machine-readable flag, and an EMPTY stdout for the pipe" {
+test "show --json/--body on a compacted id: a machine-readable flag, and the stored body on stdout" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -4103,12 +4104,12 @@ test "show --json/--body on a compacted id: a machine-readable flag, and an EMPT
     try f.run(&.{ "show", &live.text, "--json" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "compacted") == null);
 
-    // POSITIVE: `--body` is the read half of `... | trk edit --replace-body -`.
-    // A tombstone has no body, so stdout stays EMPTY (which that flag refuses)
-    // and the explanation goes to stderr — never plausible body bytes.
+    // POSITIVE: `--json` carries the stored body; `--body` prints exactly it
+    // (the read half of a pipe), still exit 2.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--json" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"body\":\"a real body\"") != null);
     try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--body" }));
-    try testing.expectEqual(@as(usize, 0), f.out.items.len);
-    try testing.expect(std.mem.indexOf(u8, f.warn.items, "COMPACTED") != null);
+    try testing.expectEqualStrings("a real body\n", f.out.items);
     // NEGATIVE: a live task's --body still emits its bytes, on stdout.
     try f.run(&.{ "show", &live.text, "--body" });
     try testing.expectEqualStrings("live body\n", f.out.items);
@@ -4968,7 +4969,7 @@ test "compact --dry-run names exactly what the real run would collect, and write
     try testing.expect(std.mem.indexOf(u8, preview, "finished, not graduated") == null);
     // It says the part a tombstone cannot answer, which is the whole reason the
     // external-citation problem survives the tombstone index.
-    try testing.expect(std.mem.indexOf(u8, preview, "does NOT keep is the BODY") != null);
+    try testing.expect(std.mem.indexOf(u8, preview, "final body is kept in .tracker/tombstone-bodies.jsonl") != null);
 
     // Nothing was written: not the log, not a snapshot, not a tombstone file.
     const after = try f.tmp.dir.readFileAlloc(io, ".tracker/log.jsonl", alloc, .unlimited);
@@ -5783,4 +5784,209 @@ test "list hides completed work by default; --all and --state reach it (01M2VPC6
     try testing.expect(std.mem.indexOf(u8, f.out.items, "way A or B?") == null);
     try f.run(&.{ "list", "--decision", "--state", "done" });
     try testing.expect(std.mem.indexOf(u8, f.out.items, "way A or B?") != null);
+}
+
+fn readTrackerFile(alloc: std.mem.Allocator, dir: std.Io.Dir, name: []const u8) !?[]u8 {
+    return dir.readFileAlloc(io, name, alloc, .unlimited) catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => return e,
+    };
+}
+
+test "compact stores the FINAL body (appendBody delta included); show prints it, --json carries it, --body emits it, all exit 2 (01M3YMBZP)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    const bare = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "graduated", .body = "base body" } });
+    try f.store.append(.{ .setBody = .{ .id = gone, .body = "rewritten body" } });
+    try f.store.append(.{ .appendBody = .{ .id = gone, .text = "later append" } });
+    try f.store.append(.{ .add = .{ .id = bare, .title = "no body at all" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+    try f.store.append(.{ .setState = .{ .id = bare, .state = .dropped } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+
+    const want = "rewritten body\n\nlater append";
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "COMPACTED") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "body:\n  rewritten body\n  \n  later append\n") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "(no body recorded)") == null);
+
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--json" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"body\":\"rewritten body\\n\\nlater append\"") != null);
+
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--body" }));
+    try testing.expectEqualStrings(want ++ "\n", f.out.items);
+
+    // A body-less task: a clear answer, null in json, EMPTY stdout for --body.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &bare.text }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "(no body recorded)") != null);
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &bare.text, "--json" }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"body\":null") != null);
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &bare.text, "--body" }));
+    try testing.expectEqual(@as(usize, 0), f.out.items.len);
+
+    // One line per body, hand-rolled in the documented key order; none for the empty one.
+    const bytes = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/tombstone-bodies.jsonl")).?;
+    defer alloc.free(bytes);
+    try testing.expect(std.mem.startsWith(u8, bytes, "{\"id\":\"" ++ ""));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n"));
+    try testing.expect(std.mem.indexOf(u8, bytes, &bare.text) == null);
+}
+
+test "an ordinary load never reads tombstone-bodies.jsonl; only show on a compacted id does (01M3YMBZP)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    const live = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "graduated", .body = "kept body" } });
+    try f.store.append(.{ .add = .{ .id = live, .title = "live one", .body = "live body" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+    try f.run(&.{"compact"});
+
+    // Garble the file too: load and every other verb must be indifferent to it.
+    try f.tmp.dir.writeFile(io, .{ .sub_path = ".tracker/tombstone-bodies.jsonl", .data = "\xff\xfe not json\n{\n", .flags = .{} });
+    try f.reopen();
+    try testing.expectEqual(@as(usize, 0), f.store.bodies_file_reads);
+    try f.run(&.{"list"});
+    try f.run(&.{ "show", &live.text });
+    try f.run(&.{"tombstones"});
+    try f.run(&.{"render"});
+    try testing.expectEqual(@as(usize, 0), f.store.bodies_file_reads);
+
+    // The garbled file degrades to "no body recorded", not a failure.
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text }));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "(no body recorded)") != null);
+    try testing.expectEqual(@as(usize, 1), f.store.bodies_file_reads);
+}
+
+test "a REFUSED compact restores tombstone-bodies.jsonl byte-for-byte, and a first-ever one back to absent (01M3YMBZP)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const keep = mintId();
+    const g1 = mintId();
+    const g2 = mintId();
+    try f.store.append(.{ .add = .{ .id = keep, .title = "Keep", .body = "keep's real body" } });
+    try f.store.append(.{ .add = .{ .id = g1, .title = "Gone 1", .body = "first gone body" } });
+    try f.store.append(.{ .setState = .{ .id = g1, .state = .archived } });
+
+    // First-ever compact refused: the bodies file must go back to ABSENT.
+    f.store.test_sabotage_body = .{ .id = keep, .replacement = "CORRUPTED" };
+    try testing.expectEqual(@as(anyerror, error.CompactVerifyFailed), f.runExpectErr(&.{"compact"}));
+    try testing.expect((try readTrackerFile(alloc, f.tmp.dir, ".tracker/tombstone-bodies.jsonl")) == null);
+
+    // A real compact establishes the file; the next, refused, one restores it.
+    f.store.test_sabotage_body = null;
+    try f.run(&.{"compact"});
+    const before = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/tombstone-bodies.jsonl")).?;
+    defer alloc.free(before);
+    try testing.expect(std.mem.indexOf(u8, before, "first gone body") != null);
+
+    try f.reopen();
+    try f.store.append(.{ .add = .{ .id = g2, .title = "Gone 2", .body = "second gone body" } });
+    try f.store.append(.{ .setState = .{ .id = g2, .state = .archived } });
+    f.store.test_sabotage_body = .{ .id = keep, .replacement = "CORRUPTED" };
+    try testing.expectEqual(@as(anyerror, error.CompactVerifyFailed), f.runExpectErr(&.{"compact"}));
+    const after = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/tombstone-bodies.jsonl")).?;
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+    try testing.expect(std.mem.indexOf(u8, after, "second gone body") == null);
+
+    // The backup run dir carries the bodies file too.
+    var backup = try f.tmp.dir.openDir(io, ".tracker/backup", .{ .iterate = true });
+    defer backup.close(io);
+    var it = backup.iterate();
+    var found = false;
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .directory) continue;
+        var rd = try backup.openDir(io, ent.name, .{});
+        defer rd.close(io);
+        if (rd.access(io, "tombstone-bodies.jsonl", .{})) |_| {
+            found = true;
+        } else |_| {}
+    }
+    try testing.expect(found);
+}
+
+test "a compacted id is READ-ONLY: edit, append-body and state are refused and mint no ghost (01M3YMBZP)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "graduated", .short = gone.text[0..9], .body = "kept body" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+    try f.run(&.{"compact"});
+    try f.reopen();
+    const log_before = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/log.jsonl")).?;
+    defer alloc.free(log_before);
+
+    const spellings = [_][]const u8{ &gone.text, gone.text[0..9], gone.text[0..14] };
+    for (spellings) |id| {
+        try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "edit", id, "--append-body", "new prose" }));
+        try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "edit", id, "--replace-body", "new prose" }));
+        try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "edit", id, "--title", "x" }));
+        try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "state", id, "open" }));
+    }
+
+    // Nothing was written, so no ghost node can exist, and the body is untouched.
+    const log_after = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/log.jsonl")).?;
+    defer alloc.free(log_after);
+    try testing.expectEqualStrings(log_before, log_after);
+    try f.reopen();
+    try testing.expect(f.store.get(gone) == null);
+    try testing.expectEqual(@as(usize, 0), f.store.ghost_tasks.items.len);
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--body" }));
+    try testing.expectEqualStrings("kept body\n", f.out.items);
+}
+
+test "tombstones --rebuild backfills BODIES from history: latest setBody is the base, later appends layer on, idempotent (01M3YMBZP)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const gone = mintId();
+    const live = mintId();
+    try f.store.append(.{ .add = .{ .id = gone, .title = "pre-index work", .body = "original" } });
+    try f.store.append(.{ .appendBody = .{ .id = gone, .text = "lost to the rewrite" } });
+    try f.store.append(.{ .setBody = .{ .id = gone, .body = "rewritten" } });
+    try f.store.append(.{ .appendBody = .{ .id = gone, .text = "final note" } });
+    try f.store.append(.{ .add = .{ .id = live, .title = "kept", .body = "live body" } });
+    try f.store.append(.{ .setState = .{ .id = gone, .state = .archived } });
+
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "init", "-q" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.email", "trk-test@example.com" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "config", "user.name", "trk test" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "add", ".tracker/log.jsonl" });
+    try runGitOk(alloc, f.tmp.dir, &.{ "git", "commit", "-q", "-m", "log before the compact" });
+
+    try f.run(&.{"compact"});
+    // Pre-index (and pre-bodies) era: neither file exists.
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstones.jsonl");
+    try f.tmp.dir.deleteFile(io, ".tracker/tombstone-bodies.jsonl");
+    try f.reopen();
+    try testing.expectEqual(@as(anyerror, error.NoSuchId), f.runExpectErr(&.{ "show", &gone.text }));
+
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "1 body line(s) backfilled") != null);
+    try testing.expectEqual(@as(anyerror, error.CompactedId), f.runExpectErr(&.{ "show", &gone.text, "--body" }));
+    try testing.expectEqualStrings("rewritten\n\nfinal note\n", f.out.items);
+    // The live task never gets a body line.
+    const bytes = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/tombstone-bodies.jsonl")).?;
+    defer alloc.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, &live.text) == null);
+
+    // Idempotent: nothing more to backfill, file unchanged.
+    try f.run(&.{ "tombstones", "--rebuild" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "0 body line(s) backfilled") != null);
+    const again = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/tombstone-bodies.jsonl")).?;
+    defer alloc.free(again);
+    try testing.expectEqualStrings(bytes, again);
 }

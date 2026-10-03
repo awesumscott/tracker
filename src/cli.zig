@@ -913,6 +913,11 @@ pub const Cli = struct {
         \\  Full detail for one task: body, state, priority, tags, prereqs,
         \\  dependents, arc memberships, and doc pointers. Ids accept any unique prefix.
         \\  --json emits the same facts as one object.
+        \\  A COMPACTED id (exit 2) prints its stored final body under the COMPACTED
+        \\  header, `--json` carries it as "body" (null if none), and `--body` prints
+        \\  it and still exits 2. With none recorded (see `trk tombstones --rebuild`)
+        \\  the header says so and `--body` prints nothing on stdout. Compacted ids
+        \\  are read-only: edit/state refuse them.
         \\  --body prints ONLY the raw body bytes (no header, no indent) — the safe
         \\  read half of an edit round-trip — pipe it back with `--replace-body -`:
         \\  trk show <id> --body | trk edit <id> --replace-body -
@@ -1044,7 +1049,9 @@ pub const Cli = struct {
         \\  answer for an id that NEVER existed. Those are opposite facts, and the
         \\  wrong one invites someone to "fix" a citation that was correct.
         \\  With the index, `trk show` resolves a compacted id and says COMPACTED,
-        \\  exiting 2 (0 = live, 2 = compacted, 1 = no such id).
+        \\  exiting 2 (0 = live, 2 = compacted, 1 = no such id), with the task's final
+        \\  body, which `compact` writes to the sibling .tracker/tombstone-bodies.jsonl
+        \\  (kept out of the index so no ordinary command parses it; only `show` reads it).
         \\  No flags: list every tombstone (id, short, why it left, title).
         \\  --rebuild: RECOVER tombstones for ids compacted BEFORE this index existed,
         \\  by replaying .tracker/log.jsonl's full git history (`git log --all -p`) and
@@ -1067,6 +1074,9 @@ pub const Cli = struct {
         \\  recovered record — memberships where it had none — is re-appended and
         \\  supersedes it, so a fix to the reconstruction reaches a store that
         \\  already ran the old one. A src=compact record is never overwritten.
+        \\  --rebuild also backfills BODIES from the same history for every tombstoned
+        \\  id with no body line yet: setBody/appendBody events folded in ts order (latest
+        \\  setBody is the base, later appends go on top), appended to the bodies file.
         \\  --verify: the STANDING CHECK — same git-history walk as --rebuild, but
         \\  asserts (never repairs) that every id it finds is either live or already
         \\  entombed. Exits nonzero and lists the gap if not — the check
@@ -2857,9 +2867,10 @@ pub const Cli = struct {
             "  Each id above still RESOLVES after the compact — it is entombed in .tracker/" ++
                 tracker.store.tombstones_name ++ " first,\n" ++
                 "  and `trk show <id>` then reports it COMPACTED (exit 2) with its title and end state.\n" ++
-                "  What a tombstone does NOT keep is the BODY. If anything OUTSIDE the tracker cites one of\n" ++
-                "  these — a registry column, a source comment, a design doc — grep for it now, while the\n" ++
-                "  task is still here to read. trk cannot see those citations, so it cannot check them for you.\n",
+                "  Its final body is kept in .tracker/" ++ tracker.store.tombstone_bodies_name ++ " and `trk show` prints it. If anything\n" ++
+                "  OUTSIDE the tracker cites one of these — a registry column, a source comment, a design\n" ++
+                "  doc — grep for it now, while the task is still here to read. trk cannot see those\n" ++
+                "  citations, so it cannot check them for you.\n",
         );
     }
 
@@ -2910,6 +2921,7 @@ pub const Cli = struct {
             tracker.store.snapshot_name ++ " merge=text",
             tracker.store.quarantine_name ++ " merge=text",
             tracker.store.tombstones_name ++ " merge=union",
+            tracker.store.tombstone_bodies_name ++ " merge=union",
         };
         for (pins) |pin| {
             var found = false;
@@ -4689,7 +4701,8 @@ pub const Cli = struct {
         try self.print(
             "\nThis is NOT a dangling citation: the id was real, the work closed, and `trk compact`\n" ++
                 "physically GC'd the task out of .tracker/. Do not \"fix\" a reference to it. The full\n" ++
-                "record — body, events, edges — is still in git history and in .tracker/backup/:\n" ++
+                "record — events and edges, and the body if none is shown above — is still in git\n" ++
+                "history and in .tracker/backup/:\n" ++
                 "  git log --all -p -- .tracker/{s} | grep {s}\n",
             .{ tracker.store.log_name, &tb.id.text },
         );
@@ -4770,23 +4783,48 @@ pub const Cli = struct {
                 },
                 .one => |tb| {
                     self.out.shrinkRetainingCapacity(mark);
+                    // The stored final body (01M3YMBZP), read ONLY here: the
+                    // bodies file is never part of `load`. Null = none recorded.
+                    const stored = try self.store.lookupTombstoneBody(self.gpa, tb.id);
+                    defer if (stored) |b| self.gpa.free(b);
                     if (raw_body) {
                         // `--body` is the READ HALF OF A PIPE (`trk show X
-                        // --body | trk edit Y --replace-body -`). A tombstone
-                        // has no body, and printing its record on stdout here
-                        // would hand that pipe plausible-looking body bytes. So
-                        // stdout stays EMPTY — which `--replace-body -` refuses
-                        // outright — and the explanation goes to stderr.
-                        try self.warn.print(
-                            self.gpa,
-                            "trk: {s} is COMPACTED — it existed and `trk compact` GC'd it out of the live " ++
-                                "store, so there is no body to read. `trk show {s}` prints what the tombstone " ++
-                                "index kept.\n",
-                            .{ &tb.id.text, tb.short orelse &tb.id.text },
-                        );
+                        // --body | trk edit Y --replace-body -`). With a stored
+                        // body it prints exactly those bytes (the edit target
+                        // is read-only, so nothing can round-trip into the
+                        // compacted id). With none, stdout stays EMPTY — which
+                        // `--replace-body -` refuses outright — and the
+                        // explanation goes to stderr, never plausible bytes.
+                        if (stored) |b| {
+                            try self.write(b);
+                            if (b.len != 0 and b[b.len - 1] != '\n') try self.write("\n");
+                        } else {
+                            try self.warn.print(
+                                self.gpa,
+                                "trk: {s} is COMPACTED and no body was recorded for it (no body line in " ++
+                                    ".tracker/" ++ tracker.store.tombstone_bodies_name ++ "). `trk show {s}` prints what the tombstone " ++
+                                    "index kept.\n",
+                                .{ &tb.id.text, tb.short orelse &tb.id.text },
+                            );
+                        }
                         return error.CompactedId;
                     }
-                    if (json) try self.showTombstoneJson(tb) else try self.showTombstone(tb);
+                    if (json) {
+                        try self.tombstoneJsonOpen(tb);
+                        try self.write(",\"body\":");
+                        if (stored) |b| try self.writeJsonString(b) else try self.write("null");
+                        try self.write("}\n");
+                    } else {
+                        try self.tombstoneRecord(tb);
+                        try self.write("\nbody:\n");
+                        if (stored) |b| {
+                            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, b, "\n"), '\n');
+                            while (lines.next()) |l| try self.print("  {s}\n", .{l});
+                        } else {
+                            try self.write("  (no body recorded)\n");
+                        }
+                        try self.tombstoneFooter(tb);
+                    }
                     return error.CompactedId;
                 },
             }
@@ -6020,6 +6058,9 @@ pub const Cli = struct {
         /// `unraises` events in the same history by the identical
         /// surviving-pair rule (01M2VFW5F).
         raised: std.ArrayListUnmanaged(Ulid) = .empty,
+        /// Every `setBody`/`appendBody` seen for this id, in history order
+        /// (NOT fold order); `Store.foldBodyEvents` orders and folds them.
+        body_events: std.ArrayListUnmanaged(tracker.store.BodyEvent) = .empty,
     };
 
     /// Replay `.tracker/log.jsonl`'s FULL git history (`git log --all -p`) —
@@ -6125,7 +6166,16 @@ pub const Cli = struct {
         defer unraises_pairs.deinit(self.gpa);
 
         var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        // `git log` lists newest first; (commit_no, line_no) recovers file
+        // order for the body fold's equal-ts tie-break (`BodyEvent.ord`).
+        var commit_no: u64 = 0;
+        var line_no: u64 = 0;
         while (lines.next()) |raw| {
+            if (std.mem.startsWith(u8, raw, "commit ")) {
+                commit_no += 1;
+                line_no = 0;
+            }
+            line_no += 1;
             // Only ADDED diff lines are log content; `-` lines are the same
             // content leaving (a compact's truncation) and `+++`/`---` are
             // headers. A log line is a JSON object, so require the brace.
@@ -6172,6 +6222,17 @@ pub const Cli = struct {
                         gop.value_ptr.reason = s.state.toString();
                         gop.value_ptr.reason_ts = s.ts;
                     }
+                },
+                inline .setBody, .appendBody => |b, tag| {
+                    const gop = try recs.getOrPut(self.gpa, b.id.text);
+                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    const text = if (tag == .setBody) b.body else b.text;
+                    try gop.value_ptr.body_events.append(ra, .{
+                        .ts = b.ts,
+                        .append = tag == .appendBody,
+                        .text = try ra.dupe(u8, text),
+                        .ord = ((std.math.maxInt(u32) - commit_no) << 32) | line_no,
+                    });
                 },
                 .in => |x| try in_pairs.put(self.gpa, pairKey(x.task, x.arc), {}),
                 .unin => |x| try unin_pairs.put(self.gpa, pairKey(x.task, x.arc), {}),
@@ -6267,14 +6328,38 @@ pub const Cli = struct {
         };
         defer sub.close(self.io);
         const written = try self.store.appendTombstones(sub, rows.items);
+
+        // Backfill final bodies (01M3YMBZP) for every id that is tombstoned
+        // now (just entombed or already on record) and has no body line yet.
+        // Idempotent: a second run finds the line and skips the id.
+        var have = try self.store.tombstoneBodyIds(self.gpa);
+        defer have.deinit(self.gpa);
+        var body_rows: std.ArrayList(Store.BodyRow) = .empty;
+        defer body_rows.deinit(self.gpa);
+        var bit = recs.iterator();
+        while (bit.next()) |e| {
+            const id = Ulid{ .text = e.key_ptr.* };
+            if (self.store.get(id) != null) continue;
+            if (have.contains(id.text)) continue;
+            if (e.value_ptr.body_events.items.len == 0) continue;
+            if (self.store.lookupTombstone(&id.text) == .none and !rowsContain(rows.items, id)) continue;
+            const body = try tracker.store.foldBodyEvents(rec_arena.allocator(), e.value_ptr.body_events.items);
+            try body_rows.append(self.gpa, .{ .id = id, .body = body });
+        }
+        std.sort.pdq(Store.BodyRow, body_rows.items, {}, struct {
+            fn lt(_: void, a: Store.BodyRow, b: Store.BodyRow) bool {
+                return std.mem.lessThan(u8, &a.id.text, &b.id.text);
+            }
+        }.lt);
+        const bodies_written = try self.store.appendTombstoneBodies(sub, body_rows.items);
         // Re-fold so the listing below (and any later lookup in this process)
         // sees what was just written — the in-memory index was built at load.
         try self.store.loadTombstones();
         try self.print(
             "trk: tombstones: scanned {d} distinct id(s) in the full history of {s}; " ++
                 "{d} new tombstone(s) recorded, {d} existing record(s) upgraded, " ++
-                "{d} already complete or still live.\n",
-            .{ recs.count(), log_path, written.new, written.upgraded, recs.count() - written.total() },
+                "{d} already complete or still live; {d} body line(s) backfilled.\n",
+            .{ recs.count(), log_path, written.new, written.upgraded, recs.count() - written.total(), bodies_written },
         );
     }
 
@@ -6361,6 +6446,11 @@ pub const Cli = struct {
             .{},
         );
         return error.TombstoneIndexIncomplete;
+    }
+
+    fn rowsContain(rows: []const tracker.store.Tombstone, id: Ulid) bool {
+        for (rows) |r| if (r.id.eql(id)) return true;
+        return false;
     }
 
     fn tombstoneIdLessThan(_: void, lhs: tracker.store.Tombstone, rhs: tracker.store.Tombstone) bool {

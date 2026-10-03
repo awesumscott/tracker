@@ -55,6 +55,44 @@ pub fn appendedBody(alloc: std.mem.Allocator, current: []const u8, text: []const
     return std.mem.concat(alloc, u8, &.{ head, "\n\n", text });
 }
 
+/// One body-writing event recovered from history (`trk tombstones --rebuild`).
+///
+/// `ord` is the tie-break for equal `ts`: ascending = earlier in the log. The
+/// history walk derives it from (commit age, line position), because within one
+/// millisecond the file order is the only order there was.
+pub const BodyEvent = struct { ts: i64, append: bool, text: []const u8, ord: u64 = 0 };
+
+/// The body those events fold to, as the store's own fold would have left it:
+/// replayed in ts order, a `setBody` replaces and an `appendBody` goes on top
+/// via `appendedBody` — so the latest set is the base and later appends layer
+/// over it, and an append older than that set is (correctly) gone. Equal ts
+/// falls back to `ord`. Byte-identical duplicates (the same line seen on
+/// several branches) are folded once. `events` is sorted in place.
+pub fn foldBodyEvents(alloc: std.mem.Allocator, events: []BodyEvent) ![]const u8 {
+    std.sort.pdq(BodyEvent, events, {}, struct {
+        fn lt(_: void, a: BodyEvent, b: BodyEvent) bool {
+            if (a.ts != b.ts) return a.ts < b.ts;
+            return a.ord < b.ord;
+        }
+    }.lt);
+    var body: []const u8 = "";
+    for (events, 0..) |ev, i| {
+        var dup = false;
+        var j = i;
+        while (j > 0 and events[j - 1].ts == ev.ts) {
+            j -= 1;
+            const o = events[j];
+            if (o.append == ev.append and std.mem.eql(u8, o.text, ev.text)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        body = if (ev.append) try appendedBody(alloc, body, ev.text) else try alloc.dupe(u8, ev.text);
+    }
+    return body;
+}
+
 pub const tracker_subdir = ".tracker";
 pub const log_name = "log.jsonl";
 pub const snapshot_name = "snapshot.jsonl";
@@ -100,6 +138,11 @@ pub const gitattributes_text =
     \\# their tombstones instead of one erasing the other's. A duplicate line is
     \\# harmless: the reader keys by id, last line wins.
     \\tombstones.jsonl merge=union
+    \\#
+    \\# The tombstone BODIES: one line per compacted id carrying its final body,
+    \\# kept apart from the index so no ordinary command ever parses it. Same
+    \\# per-line, append-only, last-line-wins shape as the index, so union.
+    \\tombstone-bodies.jsonl merge=union
     \\
 ;
 
@@ -172,8 +215,18 @@ pub const quarantine_name = "quarantine.jsonl";
 /// a bare "it existed". Unlike `quarantine_name` this file IS read back by trk.
 ///
 /// Bounded by construction: one short line per task ever collected, never per
-/// event, and it carries no bodies.
+/// event, and it carries no bodies (those live in `tombstone_bodies_name`).
 pub const tombstones_name = "tombstones.jsonl";
+
+/// The tombstone BODIES (01M3YMBZP): one append-only `{"id":..,"body":..}` line
+/// per compacted id holding its final body, last line wins. A sibling of the
+/// index, never part of it: every command loads the index, and bodies would
+/// multiply its size (~22 MB beside a 1.7 MB index on Enix). `load` NEVER reads
+/// this file; only `lookupTombstoneBody` (`trk show` on a compacted id) and the
+/// `tombstones` maintenance verbs do, by substring scan. No line numbers or
+/// byte offsets are stored anywhere: union-merge interleaves lines and autocrlf
+/// shifts bytes, so a stored position would need a scan fallback anyway.
+pub const tombstone_bodies_name = "tombstone-bodies.jsonl";
 
 /// Subdirectory (under `.tracker/`) holding `compact`'s pre-rewrite backups,
 /// one run dir per compact (`backupDirName`), bounded by
@@ -536,6 +589,10 @@ pub const Store = struct {
     /// (comptime-false in a real build), so the branch that reads it is never
     /// even compiled into a production binary — this field existing costs a
     /// few inert bytes there, nothing else.
+    /// How many times this Store opened `tombstone_bodies_name`. `load` must
+    /// leave it at 0 (01M3YMBZP: the bodies file is off the load path); a test
+    /// asserts that, since a read cannot otherwise be told from not reading.
+    bodies_file_reads: usize = 0,
     test_sabotage_body: if (builtin.is_test) ?struct { id: Ulid, replacement: []const u8 } else void =
         if (builtin.is_test) null else {},
 
@@ -1220,6 +1277,105 @@ pub const Store = struct {
         try buf.appendSlice(self.gpa, "],\"src\":");
         try codec.writeJsonString(buf, self.gpa, t.src);
         try buf.print(self.gpa, ",\"ts\":{d}}}\n", .{t.ts});
+    }
+
+    /// Append one body line (`{"id":..,"body":..}`, deterministic key order).
+    pub fn emitTombstoneBody(self: *Store, buf: *std.ArrayList(u8), id: Ulid, body: []const u8) !void {
+        try buf.appendSlice(self.gpa, "{\"id\":\"");
+        try buf.appendSlice(self.gpa, &id.text);
+        try buf.appendSlice(self.gpa, "\",\"body\":");
+        try codec.writeJsonString(buf, self.gpa, body);
+        try buf.appendSlice(self.gpa, "}\n");
+    }
+
+    pub const BodyRow = struct { id: Ulid, body: []const u8 };
+
+    /// Append `rows` to `.tracker/tombstone-bodies.jsonl` (read-modify-
+    /// atomicWrite, like `appendTombstones`). Empty bodies are skipped: no line
+    /// and "no body" read the same, and the file stays smaller.
+    pub fn appendTombstoneBodies(self: *Store, sub: Io.Dir, rows: []const BodyRow) !usize {
+        var n: usize = 0;
+        for (rows) |r| {
+            if (r.body.len != 0) n += 1;
+        }
+        if (n == 0) return 0;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        const existing = sub.readFileAlloc(self.io, tombstone_bodies_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => try self.gpa.dupe(u8, ""),
+            else => return e,
+        };
+        defer self.gpa.free(existing);
+        try out.appendSlice(self.gpa, existing);
+        if (out.items.len != 0 and out.items[out.items.len - 1] != '\n')
+            try out.append(self.gpa, '\n');
+        for (rows) |r| {
+            if (r.body.len == 0) continue;
+            try self.emitTombstoneBody(&out, r.id, r.body);
+        }
+        try self.atomicWrite(sub, tombstone_bodies_name, out.items);
+        return n;
+    }
+
+    /// The stored final body for a compacted id, or null if none is recorded.
+    /// Caller-owned. A substring scan for the id text first; only a matching
+    /// line is JSON-decoded, and a line that fails to decode is skipped (a
+    /// garbled line must not hide a good one). Last matching line wins.
+    pub fn lookupTombstoneBody(self: *Store, gpa: std.mem.Allocator, id: Ulid) !?[]u8 {
+        self.bodies_file_reads += 1;
+        var sub = self.dir.openDir(self.io, tracker_subdir, .{}) catch return null;
+        defer sub.close(self.io);
+        const bytes = sub.readFileAlloc(self.io, tombstone_bodies_name, gpa, .unlimited) catch return null;
+        defer gpa.free(bytes);
+        var found: ?[]u8 = null;
+        errdefer if (found) |f| gpa.free(f);
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |raw| {
+            if (std.mem.indexOf(u8, raw, &id.text) == null) continue;
+            const line = std.mem.trim(u8, raw, " \t\r");
+            var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch continue;
+            defer parsed.deinit();
+            const root = switch (parsed.value) {
+                .object => |o| o,
+                else => continue,
+            };
+            const id_s = switch (root.get("id") orelse continue) {
+                .string => |x| x,
+                else => continue,
+            };
+            if (!std.ascii.eqlIgnoreCase(id_s, &id.text)) continue;
+            const body = switch (root.get("body") orelse continue) {
+                .string => |x| x,
+                else => continue,
+            };
+            const copy = try gpa.dupe(u8, body);
+            if (found) |f| gpa.free(f);
+            found = copy;
+        }
+        return found;
+    }
+
+    /// Ids that already have a body line, for the maintenance verbs
+    /// (`--rebuild` skips them, `--verify` reports tombstones missing one).
+    /// Reads each line's leading `{"id":"<26>"` as `emitTombstoneBody` writes it
+    /// — no JSON decode, so it is cheap on a large file. Caller `deinit`s.
+    pub fn tombstoneBodyIds(self: *Store, gpa: std.mem.Allocator) !std.AutoHashMapUnmanaged([ulid.len]u8, void) {
+        self.bodies_file_reads += 1;
+        var set: std.AutoHashMapUnmanaged([ulid.len]u8, void) = .empty;
+        errdefer set.deinit(gpa);
+        var sub = self.dir.openDir(self.io, tracker_subdir, .{}) catch return set;
+        defer sub.close(self.io);
+        const bytes = sub.readFileAlloc(self.io, tombstone_bodies_name, gpa, .unlimited) catch return set;
+        defer gpa.free(bytes);
+        const prefix = "{\"id\":\"";
+        var it = std.mem.splitScalar(u8, bytes, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len < prefix.len + ulid.len or !std.mem.startsWith(u8, line, prefix)) continue;
+            const id = ulid.parse(line[prefix.len..][0..ulid.len]) catch continue;
+            try set.put(gpa, id.text, {});
+        }
+        return set;
     }
 
     /// Append `rows` to `.tracker/tombstones.jsonl`. Returns how many lines were
@@ -2289,13 +2445,19 @@ pub const Store = struct {
             else => return e,
         };
         defer if (orig_tombstones) |b| self.gpa.free(b);
+        // Likewise the bodies file, appended to before the point of no return.
+        const orig_bodies = sub.readFileAlloc(self.io, tombstone_bodies_name, self.gpa, .unlimited) catch |e| switch (e) {
+            error.FileNotFound => null,
+            else => return e,
+        };
+        defer if (orig_bodies) |b| self.gpa.free(b);
 
         // Bounded pre-compact backup, taken from the same original bytes,
         // BEFORE the rewrite. Recovery today is git archaeology across
         // worktree merges — exactly how the 01KZTV44M loss stayed invisible
         // for weeks; this gives a same-machine fallback that needs no git
         // history and no reconstructed worktree at all.
-        try self.writeBackup(sub, orig_snapshot, orig_log, orig_tombstones);
+        try self.writeBackup(sub, orig_snapshot, orig_log, orig_tombstones, orig_bodies);
 
         // Step 0: spool the ghosts' log lines, durable BEFORE anything is
         // rewritten. Nothing this compaction discards is destroyed — a
@@ -2314,6 +2476,13 @@ pub const Store = struct {
             const now: i64 = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
             const rows = try self.collectableRows(self.gpa, now);
             defer self.gpa.free(rows);
+            // The FINAL bodies first (01M3YMBZP): the fold's body, appendBody
+            // deltas included, is in memory only now. Written ahead of the
+            // index so no tombstone ever exists whose body write was skipped.
+            const body_rows = try self.gpa.alloc(BodyRow, rows.len);
+            defer self.gpa.free(body_rows);
+            for (rows, body_rows) |r, *br| br.* = .{ .id = r.id, .body = self.tasks.get(key(r.id)).?.body };
+            _ = try self.appendTombstoneBodies(sub, body_rows);
             break :blk (try self.appendTombstones(sub, rows)).total();
         };
 
@@ -2367,6 +2536,7 @@ pub const Store = struct {
             if (orig_snapshot) |b| try self.atomicWrite(sub, snapshot_name, b) else sub.deleteFile(self.io, snapshot_name) catch {};
             if (orig_log) |b| try self.atomicWrite(sub, log_name, b) else sub.deleteFile(self.io, log_name) catch {};
             if (orig_tombstones) |b| try self.atomicWrite(sub, tombstones_name, b) else sub.deleteFile(self.io, tombstones_name) catch {};
+            if (orig_bodies) |b| try self.atomicWrite(sub, tombstone_bodies_name, b) else sub.deleteFile(self.io, tombstone_bodies_name) catch {};
             return error.CompactVerifyFailed;
         }
 
@@ -2394,13 +2564,13 @@ pub const Store = struct {
         return std.fmt.bufPrint(buf, "{d:0>20}", .{ts_u}) catch unreachable;
     }
 
-    /// Copy the pre-compact `snapshot.jsonl`/`log.jsonl`/`tombstones.jsonl`
-    /// bytes (whichever existed) into a fresh `.tracker/backup/<ts>/` run dir
+    /// Copy the pre-compact `snapshot.jsonl`/`log.jsonl`/`tombstones.jsonl`/
+    /// `tombstone-bodies.jsonl` bytes (whichever existed) into a fresh `.tracker/backup/<ts>/` run dir
     /// BEFORE compact does anything destructive, then evict down to
     /// `config.backup_retain`. A no-op on the very first compact (nothing to
     /// protect yet — no prior snapshot AND no prior log).
-    fn writeBackup(self: *Store, sub: Io.Dir, orig_snapshot: ?[]const u8, orig_log: ?[]const u8, orig_tombstones: ?[]const u8) !void {
-        if (orig_snapshot == null and orig_log == null and orig_tombstones == null) return;
+    fn writeBackup(self: *Store, sub: Io.Dir, orig_snapshot: ?[]const u8, orig_log: ?[]const u8, orig_tombstones: ?[]const u8, orig_bodies: ?[]const u8) !void {
+        if (orig_snapshot == null and orig_log == null and orig_tombstones == null and orig_bodies == null) return;
 
         // `.iterate = true`: `evictOldBackups` below scans this dir's entries,
         // which requires the handle to have been opened with iteration
@@ -2439,6 +2609,7 @@ pub const Store = struct {
         if (orig_snapshot) |b| try self.atomicWrite(run_dir, snapshot_name, b);
         if (orig_log) |b| try self.atomicWrite(run_dir, log_name, b);
         if (orig_tombstones) |b| try self.atomicWrite(run_dir, tombstones_name, b);
+        if (orig_bodies) |b| try self.atomicWrite(run_dir, tombstone_bodies_name, b);
 
         try self.evictOldBackups(backup_root);
     }

@@ -284,7 +284,7 @@ than editing prose anyway, and the point). This is a real, owned cost: the "open
 affordance is gone, replaced by a command.
 
 **The merge semantics ship with the store, inside `.tracker/.gitattributes`** (2026-08-20). The whole merge
-model rests on git attributes — `log.jsonl` and `tombstones.jsonl` union-merged (both append-only, per-line
+model rests on git attributes — `log.jsonl`, `tombstones.jsonl` and `tombstone-bodies.jsonl` union-merged (all append-only, per-line
 independent), `snapshot.jsonl` and `quarantine.jsonl` left on the default text driver — and nothing wrote them, so every repo re-derived them by hand or (measured across six
 of seven repos on one machine) simply didn't have them, leaving the log conflicting instead of unioning
 under live fan-out. `trk init` now writes them, and the placement is the ruling: **inside `.tracker/`, not at
@@ -309,7 +309,7 @@ patch someone has to remember to re-add elsewhere. `trk init` writes it alongsid
 (never overwritten; `--no-gitignore` opts out for a repo managing ignores centrally), covering
 `backup/` and a crash-orphaned `atomicWrite` temp file (`.<name>.tmp.<hex>`, left behind only if a
 process dies between the temp write and its rename). `log.jsonl`, `snapshot.jsonl`, `config.json`,
-`.gitattributes`, `quarantine.jsonl` and `tombstones.jsonl` are deliberately NOT listed — all six are meant
+`.gitattributes`, `quarantine.jsonl`, `tombstones.jsonl` and `tombstone-bodies.jsonl` are deliberately NOT listed — all seven are meant
 to be committed, so an ignore rule that swept up the store directory itself (or a glob wide enough to catch
 them) would be a data-loss footgun of a different kind. Re-running `init` in a repo that predates this
 file is the migration: idempotent-by-construction, it backfills the missing `.gitignore` without
@@ -675,16 +675,27 @@ The merge model is **owned** here, because it gates how parallel agents may touc
     task to `.tracker/tombstones.jsonl` — id, frozen short id, title, why it left (`archived`/`dropped`/
     `ghost`), the arcs it belonged to, when — **before** any destructive write, because that is the only
     moment the information still exists; `load` folds the file into `Store.tombstones`, and a lookup is a
-    hash probe. Deliberately no body: the index is read on every command, and the body is still in git
-    history and in `.tracker/backup/`.
+    hash probe. The index is deliberately bodiless: every command loads it.
+  - **Final bodies live in a sibling file, `.tracker/tombstone-bodies.jsonl`** (01M3YMBZP). `compact` writes
+    each collected task's final body (the full fold, `appendBody` deltas included) as one
+    `{"id":..,"body":..}` line, last line wins per id, **before** any destructive write, ahead of the index
+    write. It is kept out of the index because every command parses the index: measured on Enix, bodies would
+    add ~22 MB beside a 1.7 MB index on every load (roughly 4-5x the per-command cost). `Store.load` never
+    reads the bodies file; only `show`'s compacted path does, by substring scan for the one id, JSON-decoding
+    only matching lines (8 ms for a synthetic 22 MB file). No line number or byte offset is stored anywhere:
+    union-merge interleaves lines and autocrlf shifts bytes, so a stored position would need the scan as its
+    fallback, making the scan the real mechanism. If size ever matters, build an in-memory index at read
+    time, never a persisted one. `merge=union` like the index; empty bodies get no line. Compacted ids stay
+    read-only: `edit`/`state` resolve live tasks only and refuse them without minting a ghost.
   - **Three answers, three exit codes.** `trk show` exits `0` for a live task, **`2`** for a compacted one
     (the record is printed under a `COMPACTED` banner, in a shape that cannot be skim-read as a live task),
     and `1` for an id nothing has ever heard of. Collapsing `2` into `0` would tell the dangling-id lint
     that a graduated id is live; collapsing it into `1` puts it back where it started. `--json` carries a
     `"compacted": true` key the live view never emits, so a machine reader branches on a key rather than on
-    the absence of one. `--body` is the exception: it is the read half of a pipe into `trk edit
-    --replace-body -`, and a tombstone has no body, so stdout stays **empty** (which that flag refuses) and
-    the explanation goes to stderr — never plausible-looking body bytes.
+    the absence of one. The stored body prints under the banner and rides in `--json` as `"body"` (null if none). `--body` prints
+    exactly the stored body and still exits `2`; with none recorded, stdout stays **empty** (what
+    `trk edit --replace-body -` refuses) and the explanation goes to stderr — never plausible-looking body
+    bytes.
   - **This does not un-GC anything.** The task stays out of the graph, out of `next`, out of every view.
     The index is the difference between forgetting a task and forgetting *that it ever was*.
   - **`trk tombstones --rebuild` is the one-shot migration** for ids compacted before the index existed —
@@ -773,8 +784,14 @@ The merge model is **owned** here, because it gates how parallel agents may touc
       covers every OTHER incompleteness class: a compaction that predates the index, a bug in
       `appendTombstones`'s write path, a hand-deleted tombstone line, a future entomb path that forgets to
       call `appendTombstones` at all.
+  - **`--rebuild` also backfills bodies.** For every tombstoned id with no body line it folds the history's
+    `setBody`/`appendBody` events in `ts` order (ties by file order): the latest `setBody` is the base, later
+    appends go on top via the store's own `appendedBody`, an append older than that set is gone, as in the
+    live fold. Idempotent: an id with a body line is skipped. `--verify` does not check body coverage — a
+    task with an empty body legitimately has no line, so "tombstone without body line" is not a defect.
   - **A refused compact rolls the index back with everything else.** The tombstones are written before the
-    round-trip self-verify can fail, so `CompactVerifyFailed` restores `tombstones.jsonl` alongside
+    round-trip self-verify can fail, so `CompactVerifyFailed` restores `tombstones.jsonl`,
+    `tombstone-bodies.jsonl` (and the backup run dir carries both) alongside
     `snapshot.jsonl`/`log.jsonl`. The one error this mechanism must never make is the mirror of the one it
     fixes: a tombstone for a task that is still live would make `show` report live work as gone.
   - **`trk tree` reports an arc's GRADUATED members instead of omitting them** (task `01M29P5T7`). The
