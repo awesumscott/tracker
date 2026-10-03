@@ -1018,8 +1018,71 @@ test "render: the <summary> teaser is cut at a word boundary and HTML-escaped" {
     try testing.expect(std.mem.indexOf(u8, b.items, "  <details><summary>needs a Foo&lt;Bar> shim &amp; a fallback before the loader resolves the…</summary>\n") != null);
     // The raw, unescaped form never reaches the summary line.
     try testing.expect(std.mem.indexOf(u8, b.items, "<summary>needs a Foo<Bar>") == null);
-    // The body itself is still there in full, verbatim.
-    try testing.expect(std.mem.indexOf(u8, b.items, "  needs a Foo<Bar> shim & a fallback before the loader resolves the vendored module\n") != null);
+    // The body itself is still there in full, with its prose `<` escaped too
+    // (01M3F4JTG) — `&` is left alone in the body.
+    try testing.expect(std.mem.indexOf(u8, b.items, "  needs a Foo&lt;Bar> shim & a fallback before the loader resolves the vendored module\n") != null);
+}
+
+test "render: a '<' in a body or title cannot open raw HTML that swallows later tasks (01M3F4JTG)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = mintId();
+    const b_id = mintId();
+    try f.store.append(.{ .add = .{
+        .id = a,
+        .title = "clipd <a path> title",
+        .body = "path:\"<a path clipd can reach but the app itself cannot>\"\n" ++
+            "spans keep `<T>` and ``a `<b>` c`` literal\n" ++
+            "a span can cross `a line\nbreak <y>` and stay literal; \\<z> is already escaped\n" ++
+            "\n" ++
+            "an unmatched ` still escapes <x>\n" ++
+            "\n" ++
+            "```zig\n" ++
+            "fn f(comptime T: type) Foo(<T>) {}\n" ++
+            "# not a heading\n" ++
+            "```\n" ++
+            "after the fence <w>",
+    } });
+    try f.store.append(.{ .add = .{ .id = b_id, .title = "Second task" } });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try f.c.renderMarkdown(&out);
+    const o = out.items;
+
+    // The headline case: no raw `<a ` anywhere outside the anchors render emits.
+    try testing.expect(std.mem.indexOf(u8, o, "&lt;a path clipd can reach") != null);
+    try testing.expect(std.mem.indexOf(u8, o, "<a path") == null);
+    try testing.expect(std.mem.indexOf(u8, o, "clipd &lt;a path> title") != null);
+    // Code spans (including a double-backtick one, and one crossing a line
+    // break) pass through; an unmatched backtick does not shelter what follows.
+    try testing.expect(std.mem.indexOf(u8, o, "spans keep `<T>` and ``a `<b>` c`` literal\n") != null);
+    try testing.expect(std.mem.indexOf(u8, o, "an unmatched ` still escapes &lt;x>\n") != null);
+    try testing.expect(std.mem.indexOf(u8, o, "`a line\n  break <y>` and stay literal; \\<z> is already escaped\n") != null);
+    // A fenced block is literal: neither `&lt;` nor the heading backslash.
+    try testing.expect(std.mem.indexOf(u8, o, "  fn f(comptime T: type) Foo(<T>) {}\n  # not a heading\n  ```\n") != null);
+    try testing.expect(std.mem.indexOf(u8, o, "  after the fence &lt;w>\n") != null);
+    // The next task is still its own bullet.
+    try testing.expect(std.mem.indexOf(u8, o, "Second task\n") != null);
+}
+
+test "archive: a '<' in a changelog title or ruling is escaped the same way (01M3F4JTG)" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const t = mintId();
+    const d = mintId();
+    try f.store.append(.{ .add = .{ .id = t, .title = "support <a path> args" } });
+    try f.store.append(.{ .add = .{ .id = d, .title = "which <T>?", .body = "RULED: use `<T>`, not <U>" } });
+    try f.store.append(.{ .decisionDeclare = .{ .id = d, .declared = true } });
+    try f.store.append(.{ .setState = .{ .id = t, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = d, .state = .done } });
+
+    try f.run(&.{ "archive", "--dry-run" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "- support &lt;a path> args") != null);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "- **which &lt;T>?**\n  RULED: use `<T>`, not &lt;U>\n") != null);
 }
 
 test "render: the <summary> teaser never splits a UTF-8 code point" {

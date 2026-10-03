@@ -3222,13 +3222,15 @@ pub const Cli = struct {
         // tool should make. Either way nothing is lost by graduating, provided
         // the ruling is what graduates.
         if (self.store.isDecision(id)) {
-            try buf.print(gpa, "- **{s}**\n", .{t.title});
-            if (t.body.len != 0) {
-                var lines = std.mem.splitScalar(u8, t.body, '\n');
-                while (lines.next()) |raw| {
-                    const line = std.mem.trimEnd(u8, raw, " \t\r");
-                    if (line.len == 0) try buf.print(gpa, "\n", .{}) else try buf.print(gpa, "  {s}\n", .{line});
-                }
+            // Title and ruling go through the same escaping as `render`: the
+            // changelog is markdown too, and a `<` there swallows every entry
+            // after it just the same (01M3F4JTG).
+            try buf.print(gpa, "- **", .{});
+            try escapeProse(gpa, buf, t.title);
+            try buf.print(gpa, "**\n", .{});
+            const ruling = std.mem.trimEnd(u8, t.body, " \t\r\n");
+            if (ruling.len != 0) {
+                try self.writeMarkdownBody(buf, ruling, "  ");
             } else {
                 try buf.print(gpa, "  (no ruling recorded)\n", .{});
             }
@@ -3236,7 +3238,8 @@ pub const Cli = struct {
             try buf.print(gpa, "  ({s})\n", .{try self.shortId(id, &db)});
             return;
         }
-        try buf.print(gpa, "- {s}", .{t.title});
+        try buf.print(gpa, "- ", .{});
+        try escapeProse(gpa, buf, t.title);
         for (t.tags.items) |tg| try buf.print(gpa, " #{s}", .{tg});
         for (t.docrefs.items) |dr| {
             const display = self.store.docPath(dr.doc_id) orelse dr.doc_id;
@@ -3841,7 +3844,8 @@ pub const Cli = struct {
 
         for (arcs) |arc| {
             const arc_t = self.store.get(arc).?;
-            try buf.print(gpa, "## {s}", .{arc_t.title});
+            try buf.print(gpa, "## ", .{});
+            try escapeProse(gpa, buf, arc_t.title);
             var asb: [ulid.len]u8 = undefined;
             const arc_short = try self.shortId(arc, &asb);
             try buf.print(gpa, "  ({s})\n", .{arc_short});
@@ -3953,12 +3957,15 @@ pub const Cli = struct {
                 // bare `[N]` is reference-link syntax with no definition, so it
                 // rendered as an empty/broken anchor.
                 if (seq) |s| if (s != 0) try buf.print(gpa, " (seq {d})", .{s});
-                try buf.print(gpa, " {s}\n", .{t.title});
+                try buf.print(gpa, " ", .{});
+                try escapeProse(gpa, buf, t.title);
+                try buf.print(gpa, "\n", .{});
                 return;
             },
         }
         if (seq) |s| if (s != 0) try buf.print(gpa, " (seq {d})", .{s});
-        try buf.print(gpa, " {s}", .{t.title});
+        try buf.print(gpa, " ", .{});
+        try escapeProse(gpa, buf, t.title);
         for (t.tags.items) |tg| try buf.print(gpa, " #{s}", .{tg});
         for (t.docrefs.items) |dr| {
             // Resolve doc_id through the registry: use the path when registered,
@@ -4008,34 +4015,173 @@ pub const Cli = struct {
             try self.writeBodySummary(buf, body);
             try buf.print(gpa, "</summary>\n\n", .{});
         }
-        var it = std.mem.splitScalar(u8, body, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) {
-                try buf.print(gpa, "\n", .{});
-            } else {
-                try buf.print(gpa, "{s}", .{indent});
-                // Neutralize a line-leading construct that would hijack the
-                // DOCUMENT's own heading structure. Bodies are informally
-                // markdown by convention and that stays true for everything
-                // else — a leading `-` bullet list still renders as a list;
-                // only heading-shaped lines are escaped. Leading whitespace is
-                // skipped before testing: CommonMark allows up to 3 leading
-                // spaces on an ATX heading, and inside a list item several MORE
-                // still parse as a heading rather than an indented code block.
-                const lead = leadingWhitespaceLen(line);
-                const rest = line[lead..];
-                if (isHeadingHazard(rest)) {
-                    try buf.print(gpa, "{s}\\{s}\n", .{ line[0..lead], rest });
-                } else {
-                    try buf.print(gpa, "{s}\n", .{line});
-                }
-            }
-        }
+        try self.writeMarkdownBody(buf, body, indent);
         // Blank line before the close: `</details>` must start its own HTML
         // block, and it keeps the caller's indent so a bullet's disclosure stays
         // INSIDE the list item instead of terminating it.
         if (collapse) try buf.print(gpa, "\n{s}</details>\n", .{indent});
         try buf.print(gpa, "\n", .{});
+    }
+
+    /// Write a body as markdown lines under `indent`, neutralizing the two ways
+    /// body text can break the DOCUMENT around it rather than just itself:
+    ///
+    /// - A heading-shaped line would hijack the projection's own `#`/`##`
+    ///   hierarchy, so it gets a leading backslash. Bodies are informally
+    ///   markdown by convention and that stays true for everything else — a
+    ///   leading `-` bullet list still renders as a list.
+    /// - A `<` opens raw HTML (01M3F4JTG): an Enix body quoting
+    ///   `<a path clipd can reach ...>` became an `<a>` tag nothing closed, and
+    ///   every later task in TODO.md rendered as one link. Prose `<` is written
+    ///   `&lt;` (`escapeProse`), which also stops a body line from opening an
+    ///   HTML block that would swallow the disclosure `renderBody` emits.
+    ///
+    /// Fenced code blocks pass through untouched: their content is literal, so
+    /// either escape would show up as a stray `\` or `&lt;`. Escaping runs per
+    /// PARAGRAPH, not per line, because a code span may cross a line break and
+    /// its `<` is literal too. An indented code block is deliberately NOT
+    /// detected: telling one from a list item's continuation needs the whole
+    /// container structure, and the cost of guessing wrong is lopsided — a
+    /// stray `&lt;` in code is cosmetic, a missed `<a` swallows the document.
+    fn writeMarkdownBody(self: *Cli, buf: *std.ArrayList(u8), body: []const u8, indent: []const u8) Error!void {
+        const gpa = self.gpa;
+        var lines: std.ArrayList([]const u8) = .empty;
+        defer lines.deinit(gpa);
+        var it = std.mem.splitScalar(u8, body, '\n');
+        while (it.next()) |line| try lines.append(gpa, line);
+        var esc: std.ArrayList(u8) = .empty;
+        defer esc.deinit(gpa);
+
+        var fence: ?Fence = null;
+        var i: usize = 0;
+        while (i < lines.items.len) {
+            const line = lines.items[i];
+            if (fence) |f| {
+                try writeBodyLine(gpa, buf, indent, line);
+                if (f.closedBy(line)) fence = null;
+                i += 1;
+                continue;
+            }
+            if (isBlankLine(line)) {
+                try writeBodyLine(gpa, buf, indent, line);
+                i += 1;
+                continue;
+            }
+            if (Fence.opens(line)) |f| {
+                try writeBodyLine(gpa, buf, indent, line);
+                fence = f;
+                i += 1;
+                continue;
+            }
+            // A paragraph runs to the next blank line or fence opener (a fence
+            // may interrupt a paragraph); no code span can cross either.
+            var j = i + 1;
+            while (j < lines.items.len and !isBlankLine(lines.items[j]) and Fence.opens(lines.items[j]) == null) j += 1;
+            const last = lines.items[j - 1];
+            const start = @intFromPtr(line.ptr) - @intFromPtr(body.ptr);
+            const end = @intFromPtr(last.ptr) - @intFromPtr(body.ptr) + last.len;
+            esc.clearRetainingCapacity();
+            try escapeProse(gpa, &esc, body[start..end]);
+            var pit = std.mem.splitScalar(u8, esc.items, '\n');
+            while (pit.next()) |pl| {
+                try buf.print(gpa, "{s}", .{indent});
+                // Leading whitespace is skipped before testing: CommonMark
+                // allows up to 3 leading spaces on an ATX heading, and inside a
+                // list item several MORE still parse as a heading rather than
+                // an indented code block.
+                const lead = leadingWhitespaceLen(pl);
+                const rest = pl[lead..];
+                if (isHeadingHazard(rest)) {
+                    try buf.print(gpa, "{s}\\{s}\n", .{ pl[0..lead], rest });
+                } else {
+                    try buf.print(gpa, "{s}\n", .{pl});
+                }
+            }
+            i = j;
+        }
+    }
+
+    fn writeBodyLine(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), indent: []const u8, line: []const u8) Error!void {
+        if (line.len == 0) return buf.print(gpa, "\n", .{});
+        try buf.print(gpa, "{s}{s}\n", .{ indent, line });
+    }
+
+    fn isBlankLine(line: []const u8) bool {
+        return std.mem.trim(u8, line, " \t\r").len == 0;
+    }
+
+    /// A fenced code block's opener: three or more backticks or tildes.
+    const Fence = struct {
+        ch: u8,
+        len: usize,
+
+        fn opens(line: []const u8) ?Fence {
+            const rest = line[leadingWhitespaceLen(line)..];
+            if (rest.len < 3 or (rest[0] != '`' and rest[0] != '~')) return null;
+            const n = runLen(rest, 0, rest[0]);
+            if (n < 3) return null;
+            // A backtick fence's info string may not contain a backtick —
+            // ```` ```x``` ```` on one line is a code SPAN, not a fence.
+            if (rest[0] == '`' and std.mem.indexOfScalar(u8, rest[n..], '`') != null) return null;
+            return .{ .ch = rest[0], .len = n };
+        }
+
+        /// Closed by a run of the same character at least as long, alone on
+        /// its line.
+        fn closedBy(f: Fence, line: []const u8) bool {
+            const rest = line[leadingWhitespaceLen(line)..];
+            const n = runLen(rest, 0, f.ch);
+            return n >= f.len and isBlankLine(rest[n..]);
+        }
+    };
+
+    fn runLen(s: []const u8, from: usize, c: u8) usize {
+        var k = from;
+        while (k < s.len and s[k] == c) k += 1;
+        return k - from;
+    }
+
+    /// Append `text` (inline markdown) to `out` with every `<` outside a code
+    /// span written `&lt;`, so no body or title can open raw HTML in the
+    /// projection (01M3F4JTG). A code span — a backtick run closed by a run of
+    /// the SAME length — is copied verbatim, since its `<` is already literal
+    /// and `&lt;` there would display as written. An unmatched run is literal
+    /// backticks, so escaping continues past it. A backslash escape is copied
+    /// as a pair: `\<` already renders a literal `<`, and `` \` `` is not a
+    /// span opener. `&` is left alone; the worst it can do is display an
+    /// entity a body spelled out, which breaks nothing around it.
+    fn escapeProse(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) Error!void {
+        var i: usize = 0;
+        while (i < text.len) {
+            const c = text[i];
+            if (c == '\\' and i + 1 < text.len) {
+                try out.appendSlice(gpa, text[i .. i + 2]);
+                i += 2;
+            } else if (c == '`') {
+                const n = runLen(text, i, '`');
+                const stop = if (findBacktickRun(text, i + n, n)) |close| close + n else i + n;
+                try out.appendSlice(gpa, text[i..stop]);
+                i = stop;
+            } else {
+                if (c == '<') try out.appendSlice(gpa, "&lt;") else try out.append(gpa, c);
+                i += 1;
+            }
+        }
+    }
+
+    /// Start of the next backtick run of exactly `n` at or after `from`.
+    fn findBacktickRun(text: []const u8, from: usize, n: usize) ?usize {
+        var k = from;
+        while (k < text.len) {
+            if (text[k] != '`') {
+                k += 1;
+                continue;
+            }
+            const m = runLen(text, k, '`');
+            if (m == n) return k;
+            k += m;
+        }
+        return null;
     }
 
     /// Byte cap on the `<summary>` teaser. Long enough to carry a real sentence
