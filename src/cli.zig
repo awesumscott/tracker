@@ -535,8 +535,9 @@ pub const Cli = struct {
         \\  Idempotent + non-destructive: never overwrites an existing TODO.md,
         \\  .gitattributes, or .gitignore; --force rewrites config.json only.
         \\  The .gitattributes union-merges log.jsonl (parallel-worktree appends
-        \\  combine) and pins snapshot.jsonl + quarantine.jsonl to the text driver
-        \\  (a raced compact must surface as a conflict). It goes INSIDE .tracker/
+        \\  combine) and the tombstone index + bodies files, and pins snapshot.jsonl +
+        \\  quarantine.jsonl to the text driver (a raced compact must surface as a
+        \\  conflict). It goes INSIDE .tracker/
         \\  on purpose: git resolves attributes per directory and the nearest file
         \\  wins, so a later root-level `*.jsonl` glob cannot capture the baselines.
         \\  --no-gitattributes skips it (a repo managing attributes centrally).

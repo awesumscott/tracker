@@ -321,7 +321,7 @@ would be worse — but that means a pin *added to the template after a store alr
 `tombstones.jsonl merge=union` was, in the same commit that added the tombstones index) can never reach that
 store by any `init` re-run. `compact` and `tombstones --rebuild` warn (stderr) when a pin is missing instead,
 because between them they are every verb that writes one of the files these pins govern — `compact` *creates*
-`snapshot.jsonl`/`quarantine.jsonl` and writes `tombstones.jsonl`, `--rebuild` is the other, and can be the
+`snapshot.jsonl`/`quarantine.jsonl` and writes `tombstones.jsonl`/`tombstone-bodies.jsonl`, `--rebuild` is the other, and can be the
 *first* write ever, in a store that has never run `compact` (01M2N0QW2). It cannot verify what is actually in
 effect: this check itself never shells out to git — `discover.zig` reads `.git` as a plain file for exactly
 this reason, and `stale`'s and `--rebuild`'s own history scans spawn it only for a question git alone can

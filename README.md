@@ -90,8 +90,8 @@ Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its
 example; bare `trk` prints the overview.
 
 `trk show` has three exit codes, because it can give three different answers: **0** the task is live,
-**2** the id existed and `trk compact` graduated it out of the store (its record is printed, headed
-`COMPACTED`), **1** no such id, ever. Before the tombstone index the middle case was reported as the
+**2** the id existed and `trk compact` graduated it out of the store (its record and final body are
+printed, headed `COMPACTED`), **1** no such id, ever. Before the tombstone index the middle case was reported as the
 last one — which is how a perfectly good historical citation gets "fixed". See `trk tombstones --help`.
 
 ## MCP server

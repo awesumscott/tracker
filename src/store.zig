@@ -153,8 +153,8 @@ pub const gitattributes_text =
 /// is relative to this file's own directory. Only `backup/` (see
 /// `backup_subdir`) and a crash-orphaned atomic-write temp file are listed —
 /// `log.jsonl`, `snapshot.jsonl`, `config.json`, `.gitattributes`,
-/// `quarantine.jsonl` and `tombstones.jsonl` are all meant to be committed, so
-/// none of them belongs here.
+/// `quarantine.jsonl`, `tombstones.jsonl` and `tombstone-bodies.jsonl` are all
+/// meant to be committed, so none of them belongs here.
 pub const gitignore_name = ".gitignore";
 pub const gitignore_text =
     \\# Written by `trk init`. Kept INSIDE .tracker/ deliberately: git resolves
