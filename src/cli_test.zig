@@ -6122,7 +6122,7 @@ test "rule --by: every malformed combination is refused BEFORE any write; the de
     try testing.expectEqualStrings("scott", f.store.get(d2).?.ruled_by.?);
 }
 
-test "provenance: walks cites to a scott ruling or a doc; reports unknown, broken, empty and looping chains; --known hides only legacy" {
+test "provenance: walks cites to a scott ruling or a doc; reports unknown, broken, empty and looping chains; --known hides unknown-by leaves at any depth, never a broken link" {
     const alloc = testing.allocator;
     var f = try Fixture.init(alloc);
     defer f.deinit();
@@ -6151,6 +6151,13 @@ test "provenance: walks cites to a scott ruling or a doc; reports unknown, broke
     try f.run(&.{ "rule", &legacy.text, "R" });
     const on_legacy = try mkDecision(&f, "ON-LEGACY");
     try f.run(&.{ "rule", &on_legacy.text, "R", "--by", "rec-bot", "--cites", &scott.text, "--cites", &legacy.text });
+    // A legacy leaf BESIDE a genuinely broken link: the break must win over
+    // the unknown, at any position in the cites.
+    const mixed_ghost = mintId();
+    const cm = [_][]const u8{ &legacy.text, &mixed_ghost.text };
+    const mixed = try mkDecision(&f, "MIXED-BREAK");
+    try f.store.append(.{ .setRuling = .{ .id = mixed, .by = "rec-bot", .cites = &cm } });
+    try f.store.append(.{ .setState = .{ .id = mixed, .state = .done } });
     // Hand-built events the CLI refuses to write: a rec-bot ruling citing
     // nothing, an unrecognized author, a two-ruling cite loop, a dangling cite.
     const nocite = try mkDecision(&f, "NO-CITES");
@@ -6176,18 +6183,25 @@ test "provenance: walks cites to a scott ruling or a doc; reports unknown, broke
     const e = f.runExpectErr(&.{"provenance"});
     try testing.expectEqual(@as(anyerror, error.UntracedRulings), e);
     const o = f.out.items;
-    for ([_][]const u8{ "LEGACY", "ON-LEGACY", "NO-CITES", "STRANGER", "LOOP-1", "LOOP-2", "DANGLING" }) |t|
+    for ([_][]const u8{ "LEGACY", "ON-LEGACY", "MIXED-BREAK", "NO-CITES", "STRANGER", "LOOP-1", "LOOP-2", "DANGLING" }) |t|
         try testing.expect(std.mem.indexOf(u8, o, t) != null);
     for ([_][]const u8{ "SCOTT-LEAF", "VIA-SCOTT", "VIA-DOC", "DEEP" }) |t|
         try testing.expect(std.mem.indexOf(u8, o, t) == null);
 
-    // --known drops ONLY the ruling that is itself legacy; the one resting on
-    // it is a broken chain and stays.
+    // --known drops every ruling whose only failure is an unrecorded `by`, at
+    // any depth: the legacy ruling AND the one resting on it. Every genuinely
+    // broken link stays, including one beside a legacy leaf.
     const e2 = f.runExpectErr(&.{ "provenance", "--known" });
     try testing.expectEqual(@as(anyerror, error.UntracedRulings), e2);
     const o2 = f.out.items;
-    try testing.expect(std.mem.indexOf(u8, o2, "ON-LEGACY") != null);
+    try testing.expect(std.mem.indexOf(u8, o2, "ON-LEGACY") == null);
     try testing.expect(std.mem.indexOf(u8, o2, "  LEGACY") == null);
+    for ([_][]const u8{ "MIXED-BREAK", "NO-CITES", "STRANGER", "LOOP-1", "LOOP-2", "DANGLING" }) |t|
+        try testing.expect(std.mem.indexOf(u8, o2, t) != null);
+    // The mixed one reports the break, not the unknown.
+    const mi = std.mem.indexOf(u8, o2, "MIXED-BREAK").?;
+    const mend = std.mem.indexOfPos(u8, o2, mi, "\n    ").?;
+    try testing.expect(std.mem.indexOf(u8, o2[mend .. mend + 90], "not in the store") != null);
 
     // --json: machine-readable reasons.
     const e3 = f.runExpectErr(&.{ "provenance", "--json" });
@@ -6208,13 +6222,65 @@ test "provenance: walks cites to a scott ruling or a doc; reports unknown, broke
     }
     try testing.expect(seen_cycle and seen_unknown and seen_nocites and seen_missing);
 
-    // Single-ruling form: exit follows that ruling's own verdict.
+    // Single-ruling form: exit follows that ruling's own verdict, --known or not.
     const e4 = f.runExpectErr(&.{ "provenance", &on_legacy.text });
     try testing.expectEqual(@as(anyerror, error.UntracedRulings), e4);
+    const e4b = f.runExpectErr(&.{ "provenance", &on_legacy.text, "--known" });
+    try testing.expectEqual(@as(anyerror, error.UntracedRulings), e4b);
     try f.run(&.{ "provenance", &via_scott.text, "--json" });
     const p5 = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
     defer p5.deinit();
     try testing.expect(p5.value.array.items[0].object.get("traced").?.bool);
+}
+
+test "rule --stamp: backfills by on a legacy ruling, writes provenance only, refuses everything else; --known then traces it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const legacy = try mkDecision(&f, "LEGACY");
+    try f.run(&.{ "rule", &legacy.text, "the ruling", "--by", "scott" });
+    const old = try mkDecision(&f, "OLD");
+    try f.run(&.{ "rule", &old.text, "the old ruling" });
+    const dep = try mkDecision(&f, "DEP");
+    try f.run(&.{ "rule", &dep.text, "R", "--by", "rec-bot", "--cites", &old.text });
+
+    // Before: OLD is unknown; DEP rests on it. Unfiltered both report.
+    try testing.expectEqual(@as(anyerror, error.UntracedRulings), f.runExpectErr(&.{"provenance"}));
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "DEP") != null);
+
+    const before = try showParsed(&f, old);
+    defer before.deinit();
+    const body_before = try alloc.dupe(u8, before.value.object.get("body").?.string);
+    defer alloc.free(body_before);
+
+    try f.run(&.{ "rule", "--stamp", &old.text, "--by", "scott" });
+    const after = try showParsed(&f, old);
+    defer after.deinit();
+    try testing.expectEqualStrings("scott", after.value.object.get("ruled_by").?.string);
+    try testing.expectEqualStrings(body_before, after.value.object.get("body").?.string);
+    try testing.expectEqualStrings("done", after.value.object.get("state").?.string);
+
+    // Positive: the whole chain now traces.
+    try f.run(&.{"provenance"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing") != null);
+
+    // Negative: a recorded by is never rewritten (even to the same value).
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{ "rule", "--stamp", &old.text, "--by", "scott" }));
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{ "rule", "--stamp", &legacy.text, "--by", "rec-bot", "--cites", "d.md#x" }));
+    // Not ruled, not a decision, no --by, text given, bad by.
+    const open_d = try mkDecision(&f, "OPEN");
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{ "rule", "--stamp", &open_d.text, "--by", "scott" }));
+    const plain = mintId();
+    try f.store.append(.{ .add = .{ .id = plain, .title = "PLAIN" } });
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{ "rule", "--stamp", &plain.text, "--by", "scott" }));
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{ "rule", "--stamp", &open_d.text }));
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{ "rule", "--stamp", &open_d.text, "text", "--by", "scott" }));
+    try testing.expectEqual(@as(anyerror, error.UsageError), f.runExpectErr(&.{ "rule", "--stamp", &open_d.text, "--by", "bob" }));
+    // The open decision was left open and unstamped by every refusal.
+    const od = try showParsed(&f, open_d);
+    defer od.deinit();
+    try testing.expectEqualStrings("open", od.value.object.get("state").?.string);
 }
 
 test "provenance: an open decision is not a ruling -- unlisted in the sweep, reported when asked about directly" {

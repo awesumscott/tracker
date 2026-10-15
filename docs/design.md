@@ -1156,8 +1156,24 @@ walk rather than a read of body text.
   `unrecognized_by`, `no_cites`, `cite_missing`, `cite_unruled`, `cycle`) — something a filtered row has
   nowhere to carry. `Store.traceRuling` follows cites until every leaf is a `scott` ruling or a doc
   citation (taken as given: trk cannot judge a doc), with a path stack for cycles. No `<id>` sweeps every
-  ruled decision; `--known` drops the rulings that are themselves unknown-`by`, leaving only broken chains
-  (a lint's form). It exits nonzero iff it reported, as `stale-rulings` does.
+  ruled decision; `--known` is a lint's form (below). It exits nonzero iff it reported, as `stale-rulings`
+  does.
+- **An unrecorded leaf is UNKNOWN, not broken (01M50K4HF).** Nearly every ruling that exists predates `--by`,
+  so a rec-bot closure citing one is the normal case, and a lint that reported it would be permanently
+  non-empty and read past, hiding the real breaks. `traceWalk` therefore remembers the first `unknown_by` in
+  a ruling's cites and keeps walking: any genuinely broken link (`cite_missing`, `cite_unruled`,
+  `no_cites`, `cycle`, `unrecognized_by`) elsewhere in the chain wins over it, and `unknown_by` is returned
+  only when nothing else is wrong. `--known` drops a row whose only failure is `unknown_by`, at ANY depth;
+  the single-`<id>` form still shows it.
+- **`trk rule --stamp <id> --by scott|rec-bot [--cites ...]` backfills `by`.** Hiding unknown leaves is
+  only the lint's tolerance; it never lets provenance reach Scott through a legacy ruling, because the
+  leaf stays unrecorded. `rule` refuses an already-ruled decision and no other verb writes `setRuling`, so
+  without a backfill the gap is permanent. `--stamp` writes the `setRuling` event ONLY (no text, body and
+  state untouched), takes the same `--by`/`--cites` validation as a live ruling, and refuses a decision that
+  is not ruled, not a decision, or already records a `by` (a recorded author is never rewritten, so a stamp
+  cannot launder a rec-bot ruling into a scott one). It is the orchestrator's assertion of who ruled, to be
+  used only for rulings known to be Scott's. The MCP `rule` tool carries it as the boolean `stamp`, and
+  `text` is then omitted.
 - **A cite to a compacted task reads `cite_missing`.** The walk does not consult the tombstone index; a
   chain through a collected ruling is reported rather than guessed.
 
