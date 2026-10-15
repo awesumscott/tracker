@@ -84,7 +84,7 @@ discovery).
 
 ## Commands
 
-`add · dep · undep · in · unin · arc · decision · rule · migrate-arcs · migrate-shorts · migrate-decisions · state · release · edit · show · next · list · render · tree · log · stale · stale-rulings · lost-appends · doc · compact · archive · tombstones · init · mcp-serve`
+`add · dep · undep · in · unin · arc · decision · rule · migrate-arcs · migrate-shorts · migrate-decisions · state · release · edit · show · next · list · render · tree · log · stale · stale-rulings · lost-appends · provenance · doc · compact · archive · tombstones · init · mcp-serve`
 
 Every verb self-documents: `trk <verb> --help` (or `trk help <verb>`) prints its synopsis, flags, and an
 example; bare `trk` prints the overview.
@@ -104,7 +104,7 @@ instead of a shell. Register it in `.mcp.json`:
 ```
 
 Every tool takes a required `tree`: `"main"`, or the path of one of the repository's linked git
-worktrees — a lane's write lands in exactly the store it names. `show`/`list`/`next`/`tree`/`log` return
+worktrees — a lane's write lands in exactly the store it names. `show`/`list`/`next`/`tree`/`log`/`provenance` return
 JSON. `init`, the `migrate-*` verbs, `stale-rulings` and `lost-appends` stay CLI-only. See `trk mcp-serve --help`.
 
 ## Config

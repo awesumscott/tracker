@@ -222,7 +222,7 @@ test "tools/list: one tool per exposed verb, all requiring tree, readOnlyHint fr
         try testing.expectEqualStrings("tree", schema.get("required").?.array.items[0].string);
         try testing.expect(!schema.get("additionalProperties").?.bool);
         const ro = t.object.get("annotations").?.object.get("readOnlyHint").?.bool;
-        const want_ro = for ([_][]const u8{ "next", "list", "tree", "show", "log", "stale", "tombstones", "doc_list", "doc_resolve" }) |rn| {
+        const want_ro = for ([_][]const u8{ "next", "list", "tree", "show", "log", "stale", "provenance", "tombstones", "doc_list", "doc_resolve" }) |rn| {
             if (std.mem.eql(u8, rn, name)) break true;
         } else false;
         try testing.expectEqual(want_ro, ro);
@@ -552,4 +552,70 @@ test "tools/call: decision raises a node, next withholds the work it blocks, lis
     for (parsed.value.array.items) |row| {
         try testing.expect(!contains(row.object.get("title").?.string, "does TODO.md want"));
     }
+}
+
+test "tools/call: rule takes by/cites, show exposes them, provenance reports; a malformed combination is an error result" {
+    var r = try Repo.init(.{});
+    defer r.deinit();
+
+    var q1 = try r.call("decision",
+        \\"tree":"main","question":"base fork"
+    );
+    defer q1.deinit();
+    const base = std.mem.trimEnd(u8, q1.text(), "\n");
+    var q2 = try r.call("decision",
+        \\"tree":"main","question":"citing fork"
+    );
+    defer q2.deinit();
+    const cited = std.mem.trimEnd(u8, q2.text(), "\n");
+
+    // NEGATIVE: rec-bot with no cites is refused and the fork stays open.
+    const bad_args = try std.fmt.allocPrint(gpa,
+        \\"tree":"main","id":"{s}","text":"R","by":"rec-bot"
+    , .{cited});
+    defer gpa.free(bad_args);
+    var bad = try r.call("rule", bad_args);
+    defer bad.deinit();
+    try testing.expect(bad.isError());
+    // NEGATIVE: an author outside the enum is refused.
+    const bad2_args = try std.fmt.allocPrint(gpa,
+        \\"tree":"main","id":"{s}","text":"R","by":"bob"
+    , .{cited});
+    defer gpa.free(bad2_args);
+    var bad2 = try r.call("rule", bad2_args);
+    defer bad2.deinit();
+    try testing.expect(bad2.isError());
+
+    // POSITIVE: scott, then a rec-bot closure citing it plus a doc.
+    const ok1_args = try std.fmt.allocPrint(gpa,
+        \\"tree":"main","id":"{s}","text":"R","by":"scott"
+    , .{base});
+    defer gpa.free(ok1_args);
+    var ok1 = try r.call("rule", ok1_args);
+    defer ok1.deinit();
+    try testing.expect(!ok1.isError());
+    const ok2_args = try std.fmt.allocPrint(gpa,
+        \\"tree":"main","id":"{s}","text":"R","by":"rec-bot","cites":["{s}","design.md#x"]
+    , .{ cited, base });
+    defer gpa.free(ok2_args);
+    var ok2 = try r.call("rule", ok2_args);
+    defer ok2.deinit();
+    try testing.expect(!ok2.isError());
+
+    const show_args = try std.fmt.allocPrint(gpa,
+        \\"tree":"main","id":"{s}"
+    , .{cited});
+    defer gpa.free(show_args);
+    var sh = try r.call("show", show_args);
+    defer sh.deinit();
+    try testing.expect(contains(sh.text(), "\"ruled_by\":\"rec-bot\""));
+    try testing.expect(contains(sh.text(), "design.md#x"));
+
+    // Everything traces: provenance is clean over MCP.
+    var pv = try r.call("provenance",
+        \\"tree":"main"
+    );
+    defer pv.deinit();
+    try testing.expect(!pv.isError());
+    try testing.expectEqualStrings("[]", std.mem.trim(u8, pv.text(), " \n"));
 }

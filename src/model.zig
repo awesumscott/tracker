@@ -169,6 +169,15 @@ pub const Task = struct {
     /// see design.md "short-id stability"). Once set, this is the only value
     /// `Cli.shortId` ever returns for this task, across adds/archives/compacts.
     short: ?[]const u8 = null,
+    /// WHO ruled, from the newest `setRuling` (`scott` | `rec-bot`), or `null`
+    /// for a task never ruled through `trk rule --by` — every ruling written
+    /// before the field existed. `null` reads as UNKNOWN provenance, never as
+    /// an error (`trk provenance` reports it; nothing refuses it).
+    ruled_by: ?[]const u8 = null,
+    /// What a `rec-bot` ruling cites: ruled decision ids and/or `doc#section`
+    /// strings, verbatim as recorded (ids are stored full-length). Empty for a
+    /// `scott` ruling and for an unknown one.
+    cites: []const []const u8 = &.{},
 };
 
 /// `from needs to` — `from` depends on prerequisite `to`. Forms the DAG.
@@ -347,6 +356,12 @@ pub const Op = enum {
     /// Safe for an older binary to skip: it then shows a body missing the
     /// appended text, which changes no readiness, satisfaction or state.
     appendBody,
+    /// Record WHO ruled a decision (`by`) and, for a citation closure, what it
+    /// cites. Written by `trk rule --by` immediately before the `setState done`
+    /// that closes the decision. Last-write-wins on fold, a per-task scalar
+    /// like `setPriority`. Safe for an older binary to skip: it loses the
+    /// provenance field and nothing else.
+    setRuling,
 };
 
 /// One log event — a tagged union over the op kinds. Fields mirror the JSON
@@ -375,6 +390,7 @@ pub fn eventTaskIds(ev: Event) [2]?Ulid {
         .setTitle => |x| .{ x.id, null },
         .setBody => |x| .{ x.id, null },
         .appendBody => |x| .{ x.id, null },
+        .setRuling => |x| .{ x.id, null },
         .setShort => |x| .{ x.id, null },
         .tag => |x| .{ x.id, null },
         .untag => |x| .{ x.id, null },
@@ -475,4 +491,6 @@ pub const Event = union(Op) {
     unraises: struct { task: Ulid, decision: Ulid, ts: i64 = 0 },
     /// Append `text` to a task's body. See `Op.appendBody`.
     appendBody: struct { id: Ulid, text: []const u8, ts: i64 = 0 },
+    /// Who ruled `id`, and what a citation closure cites. See `Op.setRuling`.
+    setRuling: struct { id: Ulid, by: []const u8, cites: []const []const u8 = &.{}, ts: i64 = 0 },
 };

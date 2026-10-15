@@ -146,6 +146,7 @@ pub fn main(init: std.process.Init) !u8 {
             error.TombstoneIndexIncomplete,
             error.StaleRulings,
             error.LostAppends,
+            error.UntracedRulings,
             => {},
             else => try printErr(io, gpa, "trk: error: {s}\n", .{@errorName(e)}),
         }

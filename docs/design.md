@@ -1130,6 +1130,37 @@ So a decision graduates like anything else. What changes is what graduates:
 fork from a standing constraint, and a flag for it would be one more thing to forget. Promotion to this
 document is the mechanism, and it is deliberate by design.
 
+
+### Who ruled is a field, not prose (01M50DC6X, 2026-10-15)
+
+A ruling records WHAT was decided; WHO ruled is structured, so "can this decision be traced to Scott" is a
+walk rather than a read of body text.
+
+- **`trk rule <id> <text> --by scott|rec-bot [--cites <id|doc#section>]...`** writes a `setRuling
+  {id, by, cites}` event, then the body append and the `setState done`. `scott` is the orchestrator entering
+  his answer (`go with rec` is stored as the adopted ruling text); `rec-bot` is a closure by citation and
+  REQUIRES at least one cite. `--cites` is refused with `scott` and without `--by`. A cite is a RULED
+  decision (stored full-length) or a doc citation (contains `#` or `.`; ids contain neither); a cite to an
+  open, dropped or non-decision task is refused at write time. All validation precedes the first write.
+- **Why a separate event and not fields on `setState`:** `setState done` is the generic lifecycle write, and
+  its `holder` field is already a lease-only special case; provenance on it would make a second. `setRuling`
+  is a last-write-wins per-task scalar like `setPriority`, rides `scalarTarget` (so the compact watermark
+  covers it) and is re-emitted by the snapshot. An older binary skips the unknown op and loses only the
+  field.
+- **Unknown is a value, not an error.** A ruling with no `setRuling` (every ruling written before this)
+  folds to `ruled_by == null`; `show`/`--json` print it as "not recorded"/`null` and nothing refuses it.
+  `ruled_by` and `cites` appear on ruled decisions only, in `show` and in the `list`/`next` rows (they share
+  `appendEdgesJson`).
+- **The query is a verb, `trk provenance`, not a `list` filter.** The question is a walk over `cites`, not a
+  per-task predicate, and every failure needs a REASON and the point the chain broke (`unknown_by`,
+  `unrecognized_by`, `no_cites`, `cite_missing`, `cite_unruled`, `cycle`) — something a filtered row has
+  nowhere to carry. `Store.traceRuling` follows cites until every leaf is a `scott` ruling or a doc
+  citation (taken as given: trk cannot judge a doc), with a path stack for cycles. No `<id>` sweeps every
+  ruled decision; `--known` drops the rulings that are themselves unknown-`by`, leaving only broken chains
+  (a lint's form). It exits nonzero iff it reported, as `stale-rulings` does.
+- **A cite to a compacted task reads `cite_missing`.** The walk does not consult the tombstone index; a
+  chain through a collected ruling is reported rather than guessed.
+
 ### Rejected
 
 - **`rule` clearing the declaration instead of closing the node.** The first draft's shape, and it does not

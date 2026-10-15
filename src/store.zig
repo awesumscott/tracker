@@ -666,6 +666,7 @@ pub const Store = struct {
             .setPriority => |x| x.id,
             .setShort => |x| x.id,
             .release => |x| x.id,
+            .setRuling => |x| x.id,
             else => null,
         };
     }
@@ -712,6 +713,7 @@ pub const Store = struct {
             .setPriority => |x| x.id,
             .setShort => |x| x.id,
             .release => |x| x.id,
+            .setRuling => |x| x.id,
             .tag => |x| x.id,
             .untag => |x| x.id,
             .docref => |x| x.id,
@@ -782,6 +784,15 @@ pub const Store = struct {
             .setPriority => |x| {
                 const t = try self.ensureNode(x.id);
                 t.priority = x.priority;
+            },
+            .setRuling => |x| {
+                // Last-write-wins scalar, like setPriority. The strings are
+                // copied into the arena: the event's own buffers die with it.
+                const t = try self.ensureNode(x.id);
+                t.ruled_by = try self.a().dupe(u8, x.by);
+                const cs = try self.a().alloc([]const u8, x.cites.len);
+                for (x.cites, 0..) |c, i| cs[i] = try self.a().dupe(u8, c);
+                t.cites = cs;
             },
             .tag => |x| {
                 const t = try self.ensureNode(x.id);
@@ -1907,6 +1918,11 @@ pub const Store = struct {
             .setShort => |x| gpa.free(x.short),
             .setState => |x| if (x.holder) |h| gpa.free(h),
             .release => |x| gpa.free(x.holder),
+            .setRuling => |x| {
+                gpa.free(x.by);
+                for (x.cites) |c| gpa.free(c);
+                gpa.free(x.cites);
+            },
             else => {},
         }
     }
@@ -2969,6 +2985,8 @@ pub const Store = struct {
                     .doc_id = dr.doc_id,
                     .section_id = dr.section_id,
                 } });
+            if (t.ruled_by) |by|
+                try self.emit(buf, .{ .setRuling = .{ .id = id, .by = by, .cites = t.cites } });
             if (self.declared_arcs.contains(key(id)))
                 try self.emit(buf, .{ .arcDeclare = .{ .id = id, .declared = true } });
             if (self.standing_arcs.contains(key(id)))
@@ -3228,6 +3246,11 @@ pub const Store = struct {
                     task_id = x.id;
                     break :blk try std.fmt.allocPrint(alloc, "short frozen: {s}", .{x.short});
                 },
+                .setRuling => |x| blk: {
+                    ts = x.ts;
+                    task_id = x.id;
+                    break :blk try std.fmt.allocPrint(alloc, "ruling: by {s}, {d} cite(s)", .{ x.by, x.cites.len });
+                },
                 .release => |x| blk: {
                     ts = x.ts;
                     task_id = x.id;
@@ -3446,6 +3469,80 @@ pub const Store = struct {
         const slice = try out.toOwnedSlice(alloc);
         std.sort.pdq(Ulid, slice, {}, Ulid.lessThan);
         return slice;
+    }
+
+    /// Why a ruling has no path back to Scott. See `traceRuling`.
+    pub const TraceFail = enum {
+        /// The ruling carries no `by` — every ruling made before the field
+        /// existed. Reported, never an error: old logs stay valid.
+        unknown_by,
+        /// `by` is neither `scott` nor `rec-bot`.
+        unrecognized_by,
+        /// A `rec-bot` ruling that cites nothing: a claim with no chain.
+        no_cites,
+        /// A cite is a task id the store does not hold (never existed, or
+        /// compacted away) — the chain cannot be walked through it.
+        cite_missing,
+        /// A cite names a task that is not a RULED decision (open, dropped, or
+        /// not a decision at all).
+        cite_unruled,
+        /// The cites loop back onto a ruling already on the path.
+        cycle,
+    };
+
+    pub const Trace = union(enum) {
+        /// Every leaf is a by-scott ruling or a doc citation.
+        traced,
+        /// The first failing point of the walk: `at` is the ruling whose own
+        /// field or cite broke the chain (may be the queried ruling itself),
+        /// `cite` the offending cite string when the failure is about one.
+        failed: struct { reason: TraceFail, at: Ulid, cite: ?[]const u8 = null },
+    };
+
+    /// A cite that is not a task id: contains `#` (doc#section) or `.` (a doc
+    /// path). Task ids are bare ULIDs, so neither character can appear in one.
+    pub fn isDocCite(cite: []const u8) bool {
+        return std.mem.indexOfAny(u8, cite, "#.") != null;
+    }
+
+    /// Does the ruling on `id` trace back to Scott? Follows `cites` from the
+    /// ruling until every leaf is a `by: scott` ruling or a doc citation (taken
+    /// as given — trk cannot judge a doc). `rec-bot` rulings must cite; a
+    /// ruling with no `by` is `unknown_by`, not an error. Caller guarantees
+    /// nothing: a non-decision or unruled `id` simply reports `cite_unruled`.
+    pub fn traceRuling(self: *Store, id: Ulid) !Trace {
+        var path: std.ArrayList(Ulid) = .empty;
+        defer path.deinit(self.gpa);
+        return self.traceWalk(id, &path);
+    }
+
+    fn traceWalk(self: *Store, id: Ulid, path: *std.ArrayList(Ulid)) !Trace {
+        const t = self.get(id) orelse return .{ .failed = .{ .reason = .cite_missing, .at = id } };
+        if (!self.isDecision(id) or (t.state != .done and t.state != .archived))
+            return .{ .failed = .{ .reason = .cite_unruled, .at = id } };
+        for (path.items) |p| if (p.eql(id)) return .{ .failed = .{ .reason = .cycle, .at = id } };
+        const by = t.ruled_by orelse return .{ .failed = .{ .reason = .unknown_by, .at = id } };
+        if (std.mem.eql(u8, by, "scott")) return .traced;
+        if (!std.mem.eql(u8, by, "rec-bot")) return .{ .failed = .{ .reason = .unrecognized_by, .at = id } };
+        if (t.cites.len == 0) return .{ .failed = .{ .reason = .no_cites, .at = id } };
+        try path.append(self.gpa, id);
+        defer _ = path.pop();
+        for (t.cites) |c| {
+            if (isDocCite(c)) continue;
+            const cid = ulid.parse(c) catch
+                return .{ .failed = .{ .reason = .cite_missing, .at = id, .cite = c } };
+            const sub = try self.traceWalk(cid, path);
+            switch (sub) {
+                .traced => {},
+                .failed => |f| {
+                    // A failure AT the cited task is about the cite from here;
+                    // keep the deeper ruling as `at` so the report names where
+                    // the chain actually broke.
+                    return .{ .failed = .{ .reason = f.reason, .at = f.at, .cite = f.cite orelse c } };
+                },
+            }
+        }
+        return .traced;
     }
 
     /// Is `id` a declared DECISION — a fork awaiting a ruling?

@@ -2563,7 +2563,7 @@ test "every verb supports --help/-h and add --help mints no task" {
         "init",              "add",  "dep",  "undep",  "in",            "unin",    "arc",        "migrate-arcs", "migrate-shorts",
         "state",             "next", "list", "render", "tree",          "compact", "archive",    "doc",          "show",
         "edit",              "rule", "log",  "stale",  "stale-rulings", "release", "tombstones", "mcp-serve",    "decision",
-        "migrate-decisions", "lost-appends",
+        "migrate-decisions", "lost-appends", "provenance",
     };
     try testing.expectEqual(verbs.len, cli.Cli.verbs.len);
 
@@ -5989,4 +5989,242 @@ test "tombstones --rebuild backfills BODIES from history: latest setBody is the 
     const again = (try readTrackerFile(alloc, f.tmp.dir, ".tracker/tombstone-bodies.jsonl")).?;
     defer alloc.free(again);
     try testing.expectEqualStrings(bytes, again);
+}
+
+// ------------------------------------------------- rule --by / provenance
+
+fn mkDecision(f: *Fixture, title: []const u8) !Ulid {
+    const d = mintId();
+    try f.store.append(.{ .add = .{ .id = d, .title = title } });
+    try f.store.append(.{ .decisionDeclare = .{ .id = d, .declared = true } });
+    return d;
+}
+
+/// `show --json` of `id`, parsed. Caller deinits.
+fn showParsed(f: *Fixture, id: Ulid) !std.json.Parsed(std.json.Value) {
+    try f.run(&.{ "show", &id.text, "--json" });
+    return std.json.parseFromSlice(std.json.Value, f.alloc, f.out.items, .{});
+}
+
+test "rule --by: scott is stored and exposed; no --by reads as null (unknown), never an error; an ordinary task carries neither" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const a = try mkDecision(&f, "fork a");
+    const b = try mkDecision(&f, "fork b");
+    try f.run(&.{ "rule", &a.text, "RULED: yes", "--by", "scott" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "(by scott)") != null);
+    try f.run(&.{ "rule", &b.text, "RULED: yes, legacy path" });
+
+    {
+        const p = try showParsed(&f, a);
+        defer p.deinit();
+        try testing.expectEqualStrings("scott", p.value.object.get("ruled_by").?.string);
+        try testing.expectEqual(@as(usize, 0), p.value.object.get("cites").?.array.items.len);
+    }
+    {
+        const p = try showParsed(&f, b);
+        defer p.deinit();
+        try testing.expect(p.value.object.get("ruled_by").? == .null);
+    }
+    // Text face.
+    try f.run(&.{ "show", &a.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "ruled by: scott") != null);
+    try f.run(&.{ "show", &b.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "ruled by: (not recorded)") != null);
+
+    // An open decision and an ordinary task do not grow the field.
+    const open_d = try mkDecision(&f, "still open");
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "work" } });
+    for ([_]Ulid{ open_d, work }) |id| {
+        const p = try showParsed(&f, id);
+        defer p.deinit();
+        try testing.expect(p.value.object.get("ruled_by") == null);
+    }
+    // list rows carry it too (shared emitter).
+    try f.run(&.{ "list", "--decision", "--all", "--json" });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "\"ruled_by\":\"scott\"") != null);
+}
+
+test "rule --by rec-bot: cites resolve to full ids, doc cites stay verbatim; ruling survives compact" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const base = try mkDecision(&f, "base ruling");
+    try f.run(&.{ "rule", &base.text, "RULED: base", "--by", "scott" });
+    const d = try mkDecision(&f, "rides on base");
+    // A 10-char prefix is enough for resolve; the stored cite is the full id.
+    try f.run(&.{ "rule", &d.text, "RULED: per base", "--by", "rec-bot", "--cites", base.text[0..10], "--cites", "issue-tracker.md#decisions" });
+
+    {
+        const p = try showParsed(&f, d);
+        defer p.deinit();
+        try testing.expectEqualStrings("rec-bot", p.value.object.get("ruled_by").?.string);
+        const cites = p.value.object.get("cites").?.array.items;
+        try testing.expectEqual(@as(usize, 2), cites.len);
+        try testing.expectEqualStrings(&base.text, cites[0].string);
+        try testing.expectEqualStrings("issue-tracker.md#decisions", cites[1].string);
+    }
+
+    try f.run(&.{"compact"});
+    try f.reopen();
+    const t = f.store.get(d).?;
+    try testing.expectEqualStrings("rec-bot", t.ruled_by.?);
+    try testing.expectEqual(@as(usize, 2), t.cites.len);
+    try testing.expectEqualStrings(&base.text, t.cites[0]);
+    // ...and a ruling with no `by` is still none after the snapshot rewrite.
+    const e = try mkDecision(&f, "legacy");
+    try f.run(&.{ "rule", &e.text, "RULED: legacy" });
+    try f.run(&.{"compact"});
+    try f.reopen();
+    try testing.expect(f.store.get(e).?.ruled_by == null);
+}
+
+test "rule --by: every malformed combination is refused BEFORE any write; the decision stays open" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    const d = try mkDecision(&f, "fork");
+    const open_other = try mkDecision(&f, "unruled cite target");
+    const work = mintId();
+    try f.store.append(.{ .add = .{ .id = work, .title = "not a decision" } });
+    const ruled = try mkDecision(&f, "ruled");
+    try f.run(&.{ "rule", &ruled.text, "RULED", "--by", "scott" });
+
+    const bad = [_][]const []const u8{
+        &.{ "rule", &d.text, "x", "--by", "rec-bot" }, // rec-bot with nothing cited
+        &.{ "rule", &d.text, "x", "--by", "scott", "--cites", "a.md#b" }, // scott is the leaf
+        &.{ "rule", &d.text, "x", "--cites", "a.md#b" }, // cites without by
+        &.{ "rule", &d.text, "x", "--by", "bob" }, // not a known author
+        &.{ "rule", &d.text, "x", "--by", "rec-bot", "--cites", &open_other.text }, // unruled decision
+        &.{ "rule", &d.text, "x", "--by", "rec-bot", "--cites", &work.text }, // not a decision
+        &.{ "rule", &d.text, "x", "--by", "rec-bot", "--cites", "01ZZZZZZZZZZ" }, // unresolvable id
+        &.{ "rule", &d.text, "x", "--by" }, // flag with no value
+    };
+    for (bad) |argv| {
+        const err = f.runExpectErr(argv);
+        try testing.expect(err != error.TestUnexpectedSuccess);
+        const t = f.store.get(d).?;
+        try testing.expectEqual(tracker.State.open, t.state);
+        try testing.expect(t.ruled_by == null);
+        try testing.expectEqualStrings("", t.body);
+    }
+    // POSITIVE twin: the same decision rules fine once the combination is valid.
+    try f.run(&.{ "rule", &d.text, "x", "--by", "rec-bot", "--cites", &ruled.text });
+    try testing.expectEqual(tracker.State.done, f.store.get(d).?.state);
+    // Flags may precede the positionals.
+    const d2 = try mkDecision(&f, "fork 2");
+    try f.run(&.{ "rule", "--by", "scott", &d2.text, "y" });
+    try testing.expectEqualStrings("scott", f.store.get(d2).?.ruled_by.?);
+}
+
+test "provenance: walks cites to a scott ruling or a doc; reports unknown, broken, empty and looping chains; --known hides only legacy" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+
+    // Nothing ruled yet: nothing to report, exit 0.
+    try f.run(&.{"provenance"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing") != null);
+
+    const scott = try mkDecision(&f, "SCOTT-LEAF");
+    try f.run(&.{ "rule", &scott.text, "R", "--by", "scott" });
+    const via_scott = try mkDecision(&f, "VIA-SCOTT");
+    try f.run(&.{ "rule", &via_scott.text, "R", "--by", "rec-bot", "--cites", &scott.text });
+    const via_doc = try mkDecision(&f, "VIA-DOC");
+    try f.run(&.{ "rule", &via_doc.text, "R", "--by", "rec-bot", "--cites", "design.md#x" });
+    const deep = try mkDecision(&f, "DEEP");
+    try f.run(&.{ "rule", &deep.text, "R", "--by", "rec-bot", "--cites", &via_scott.text, "--cites", "d.md#y" });
+
+    // Every one of those traces: still nothing, exit 0.
+    try f.run(&.{"provenance"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "nothing") != null);
+    try f.run(&.{ "provenance", &deep.text });
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "traced:") != null);
+
+    // Legacy (no by), and a rec-bot ruling resting on the legacy one.
+    const legacy = try mkDecision(&f, "LEGACY");
+    try f.run(&.{ "rule", &legacy.text, "R" });
+    const on_legacy = try mkDecision(&f, "ON-LEGACY");
+    try f.run(&.{ "rule", &on_legacy.text, "R", "--by", "rec-bot", "--cites", &scott.text, "--cites", &legacy.text });
+    // Hand-built events the CLI refuses to write: a rec-bot ruling citing
+    // nothing, an unrecognized author, a two-ruling cite loop, a dangling cite.
+    const nocite = try mkDecision(&f, "NO-CITES");
+    try f.store.append(.{ .setRuling = .{ .id = nocite, .by = "rec-bot" } });
+    try f.store.append(.{ .setState = .{ .id = nocite, .state = .done } });
+    const stranger = try mkDecision(&f, "STRANGER");
+    try f.store.append(.{ .setRuling = .{ .id = stranger, .by = "bob" } });
+    try f.store.append(.{ .setState = .{ .id = stranger, .state = .done } });
+    const l1 = try mkDecision(&f, "LOOP-1");
+    const l2 = try mkDecision(&f, "LOOP-2");
+    const c1 = [_][]const u8{&l2.text};
+    const c2 = [_][]const u8{&l1.text};
+    try f.store.append(.{ .setRuling = .{ .id = l1, .by = "rec-bot", .cites = &c1 } });
+    try f.store.append(.{ .setRuling = .{ .id = l2, .by = "rec-bot", .cites = &c2 } });
+    try f.store.append(.{ .setState = .{ .id = l1, .state = .done } });
+    try f.store.append(.{ .setState = .{ .id = l2, .state = .done } });
+    const ghost = mintId();
+    const cg = [_][]const u8{&ghost.text};
+    const dangling = try mkDecision(&f, "DANGLING");
+    try f.store.append(.{ .setRuling = .{ .id = dangling, .by = "rec-bot", .cites = &cg } });
+    try f.store.append(.{ .setState = .{ .id = dangling, .state = .done } });
+
+    const e = f.runExpectErr(&.{"provenance"});
+    try testing.expectEqual(@as(anyerror, error.UntracedRulings), e);
+    const o = f.out.items;
+    for ([_][]const u8{ "LEGACY", "ON-LEGACY", "NO-CITES", "STRANGER", "LOOP-1", "LOOP-2", "DANGLING" }) |t|
+        try testing.expect(std.mem.indexOf(u8, o, t) != null);
+    for ([_][]const u8{ "SCOTT-LEAF", "VIA-SCOTT", "VIA-DOC", "DEEP" }) |t|
+        try testing.expect(std.mem.indexOf(u8, o, t) == null);
+
+    // --known drops ONLY the ruling that is itself legacy; the one resting on
+    // it is a broken chain and stays.
+    const e2 = f.runExpectErr(&.{ "provenance", "--known" });
+    try testing.expectEqual(@as(anyerror, error.UntracedRulings), e2);
+    const o2 = f.out.items;
+    try testing.expect(std.mem.indexOf(u8, o2, "ON-LEGACY") != null);
+    try testing.expect(std.mem.indexOf(u8, o2, "  LEGACY") == null);
+
+    // --json: machine-readable reasons.
+    const e3 = f.runExpectErr(&.{ "provenance", "--json" });
+    try testing.expectEqual(@as(anyerror, error.UntracedRulings), e3);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+    defer parsed.deinit();
+    var seen_cycle = false;
+    var seen_unknown = false;
+    var seen_nocites = false;
+    var seen_missing = false;
+    for (parsed.value.array.items) |row| {
+        try testing.expect(!row.object.get("traced").?.bool);
+        const why = row.object.get("reason").?.string;
+        if (std.mem.eql(u8, why, "cycle")) seen_cycle = true;
+        if (std.mem.eql(u8, why, "unknown_by")) seen_unknown = true;
+        if (std.mem.eql(u8, why, "no_cites")) seen_nocites = true;
+        if (std.mem.eql(u8, why, "cite_missing")) seen_missing = true;
+    }
+    try testing.expect(seen_cycle and seen_unknown and seen_nocites and seen_missing);
+
+    // Single-ruling form: exit follows that ruling's own verdict.
+    const e4 = f.runExpectErr(&.{ "provenance", &on_legacy.text });
+    try testing.expectEqual(@as(anyerror, error.UntracedRulings), e4);
+    try f.run(&.{ "provenance", &via_scott.text, "--json" });
+    const p5 = try std.json.parseFromSlice(std.json.Value, alloc, f.out.items, .{});
+    defer p5.deinit();
+    try testing.expect(p5.value.array.items[0].object.get("traced").?.bool);
+}
+
+test "provenance: an open decision is not a ruling -- unlisted in the sweep, reported when asked about directly" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc);
+    defer f.deinit();
+    const open_d = try mkDecision(&f, "OPEN-FORK");
+    try f.run(&.{"provenance"});
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "OPEN-FORK") == null);
+    const e = f.runExpectErr(&.{ "provenance", &open_d.text });
+    try testing.expectEqual(@as(anyerror, error.UntracedRulings), e);
+    try testing.expect(std.mem.indexOf(u8, f.out.items, "not a ruled decision") != null);
 }
