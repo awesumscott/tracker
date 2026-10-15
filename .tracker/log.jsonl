@@ -3,3 +3,4 @@
 {"op":"setPriority","id":"01M50DC6X8HM48J7DW1EGD2X9Z","priority":2,"ts":1792089136050}
 {"op":"setState","id":"01M50DC6X8HM48J7DW1EGD2X9Z","state":"leased","holder":"lane-rule-by","ts":1792092082568}
 {"op":"setState","id":"01M50DC6X8HM48J7DW1EGD2X9Z","state":"submitted","ts":1792092552651}
+{"op":"setState","id":"01M50DC6X8HM48J7DW1EGD2X9Z","state":"done","ts":1792092633204}
