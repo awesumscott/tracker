@@ -3527,6 +3527,9 @@ pub const Store = struct {
         if (t.cites.len == 0) return .{ .failed = .{ .reason = .no_cites, .at = id } };
         try path.append(self.gpa, id);
         defer _ = path.pop();
+        // An unrecorded leaf is UNKNOWN, not broken: remember the first, keep
+        // walking, and let any genuinely broken link elsewhere win.
+        var unknown: ?Trace = null;
         for (t.cites) |c| {
             if (isDocCite(c)) continue;
             const cid = ulid.parse(c) catch
@@ -3538,11 +3541,13 @@ pub const Store = struct {
                     // A failure AT the cited task is about the cite from here;
                     // keep the deeper ruling as `at` so the report names where
                     // the chain actually broke.
-                    return .{ .failed = .{ .reason = f.reason, .at = f.at, .cite = f.cite orelse c } };
+                    const fail: Trace = .{ .failed = .{ .reason = f.reason, .at = f.at, .cite = f.cite orelse c } };
+                    if (f.reason != .unknown_by) return fail;
+                    if (unknown == null) unknown = fail;
                 },
             }
         }
-        return .traced;
+        return unknown orelse .traced;
     }
 
     /// Is `id` a declared DECISION — a fork awaiting a ruling?

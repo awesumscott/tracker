@@ -959,8 +959,9 @@ pub const Cli = struct {
         \\        trk edit 01KX6H --append-body "2026-08-23: reproduced on main."
         \\        trk edit 01KX6H --rm-doc none
         },
-        .{ .name = "rule", .run = &cmdRule, .mutates = true, .tools = &rule_tools, .flags = &.{ "--by", "--cites" }, .text =
+        .{ .name = "rule", .run = &cmdRule, .mutates = true, .tools = &rule_tools, .flags = &.{ "--by", "--cites", "--stamp" }, .text =
         \\trk rule <id> <ruling text|-> [--by scott|rec-bot] [--cites <id|doc#section>]...
+        \\trk rule --stamp <id> --by scott|rec-bot [--cites <id|doc#section>]...
         \\  Record the answer to a DECISION and close it, atomically: appends the
         \\  ruling to the decision's body and sets it `done`. `-` reads the ruling
         \\  from stdin.
@@ -983,6 +984,12 @@ pub const Cli = struct {
         \\  scott or without --by. Without --by the ruling reads as unknown provenance
         \\  (every ruling made before the field existed) — never an error. `show` and
         \\  `--json` expose `ruled_by` and `cites`; `trk provenance` walks the chain.
+        \\  --stamp backfills `by` on a decision ALREADY ruled without one (every ruling
+        \\  made before the field existed): writes the provenance field only, takes no
+        \\  ruling text, leaves body and state untouched, and refuses a decision that
+        \\  already records a `by` (a recorded author is never rewritten) or is not
+        \\  ruled. Same --by/--cites validation as a live ruling. It is the orchestrator
+        \\  asserting who ruled; use it only for rulings known to be his.
         \\  e.g.  trk rule 01M2V2TSA "list --arc only; TODO.md stays forward-looking" --by scott
         \\        trk rule 01M2V2TSA "per the settled shape" --by rec-bot --cites 01M2VFV83 --cites issue-tracker.md#decisions
         },
@@ -995,9 +1002,11 @@ pub const Cli = struct {
         \\  `by`, a rec-bot ruling citing nothing, a cite to a task that is missing or
         \\  not a ruled decision, or a cite loop. The report names the ruling where the
         \\  chain broke and the cite that led there.
-        \\  With <id>: that one ruling, traced or not. --known hides the unknown-`by`
-        \\  rulings, leaving only rulings whose recorded chain is actually broken (the
-        \\  form for a lint). --json: an array of {id, short, title, by, traced, reason,
+        \\  With <id>: that one ruling, traced or not. --known hides every ruling whose
+        \\  only failure is an unrecorded `by`, at ANY depth of the chain (a legacy
+        \\  leaf is unknown, not broken), leaving only rulings with a genuinely broken
+        \\  link (the form for a lint). A broken link anywhere still reports, even
+        \\  beside a legacy leaf. `trk rule --stamp` backfills a legacy `by`. --json: an array of {id, short, title, by, traced, reason,
         \\  at, at_short, cite}; reason/at/cite are null when traced.
         \\  Exits nonzero iff it reported at least one ruling.
         \\  e.g.  trk provenance --known
@@ -1277,14 +1286,15 @@ pub const Cli = struct {
 
     const rule_tools = [_]Tool{.{ .name = "rule", .params = &.{
         p_id,
-        .{ .name = "text", .kind = .string, .required = true, .desc = "The ruling. Appended to the decision's body; closes it, releasing whatever it blocked." },
+        .{ .name = "text", .kind = .string, .desc = "The ruling (required unless stamp). Appended to the decision's body; closes it, releasing whatever it blocked." },
         .{ .name = "by", .kind = .string, .flag = "--by", .desc = "Who ruled: `scott` (the orchestrator entering his answer) or `rec-bot` (needs cites). Omitted = unknown provenance." },
+        .{ .name = "stamp", .kind = .boolean, .flag = "--stamp", .desc = "Backfill `by` (required) on an already-ruled decision that has none: writes provenance only, no text, body and state untouched; refuses one that already has a `by`." },
         .{ .name = "cites", .kind = .string_list, .flag = "--cites", .desc = "With by=rec-bot: ruled decision ids and/or doc#section citations the closure rests on." },
     } }};
 
     const provenance_tools = [_]Tool{.{ .name = "provenance", .argv = &.{"--json"}, .params = &.{
         .{ .name = "id", .kind = .string, .desc = "Trace only this ruling." },
-        .{ .name = "known", .kind = .boolean, .flag = "--known", .desc = "Hide rulings with no recorded `by` (legacy); keep only broken chains." },
+        .{ .name = "known", .kind = .boolean, .flag = "--known", .desc = "Hide rulings whose only failure is an unrecorded `by` anywhere in the chain (legacy leaf); keep only genuinely broken chains." },
     } }};
 
     const log_tools = [_]Tool{.{ .name = "log", .argv = &.{"--json"}, .params = &.{
@@ -5510,11 +5520,14 @@ pub const Cli = struct {
         var npos: usize = 0;
         var extra: usize = 0;
         var by: ?[]const u8 = null;
+        var stamp = false;
         var cite_args: std.ArrayList([]const u8) = .empty;
         defer cite_args.deinit(self.gpa);
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--by")) {
+            if (std.mem.eql(u8, args[i], "--stamp")) {
+                stamp = true;
+            } else if (std.mem.eql(u8, args[i], "--by")) {
                 by = try self.flagVal(args, &i, "--by");
             } else if (std.mem.eql(u8, args[i], "--cites")) {
                 try cite_args.append(self.gpa, try self.flagVal(args, &i, "--cites"));
@@ -5525,7 +5538,17 @@ pub const Cli = struct {
                 extra += 1;
             }
         }
-        if (npos < 2) {
+        if (stamp) {
+            if (npos != 1 or extra != 0) {
+                try self.write("trk: usage: trk rule --stamp <id> --by scott|rec-bot [--cites <id|doc#section>]...\n" ++
+                    "  --stamp takes no ruling text: it records `by` on an already-ruled decision.\n");
+                return error.UsageError;
+            }
+            if (by == null) {
+                try self.write("trk: --stamp needs --by scott|rec-bot\n");
+                return error.UsageError;
+            }
+        } else if (npos < 2) {
             try self.write("trk: usage: trk rule <id> <ruling text|-> [--by scott|rec-bot] [--cites <id|doc#section>]...\n" ++
                 "  Appends <ruling text> to the decision's body and closes it, atomically.\n");
             return error.MissingArgument;
@@ -5578,11 +5601,34 @@ pub const Cli = struct {
             try cites.append(self.gpa, try self.gpa.dupe(u8, &cid.text));
         }
 
-        const b = try self.bodyArg("rule", pos[1]);
-        defer if (b.owned) self.gpa.free(b.text);
-
         var sb: [ulid.len]u8 = undefined;
         const sid = try self.shortId(id, &sb);
+
+        if (stamp) {
+            // Backfill: a ruling made before `--by` existed can never acquire
+            // it any other way. Writes `setRuling` ONLY; body and state stay
+            // exactly as they were.
+            if (!self.store.isDecision(id)) {
+                try self.print("trk: {s} is not a decision - nothing to stamp\n", .{sid});
+                return error.UsageError;
+            }
+            const st = self.store.get(id).?;
+            if (st.state != .done and st.state != .archived) {
+                try self.print("trk: {s} is {s}, not ruled - `--stamp` records who ruled an ALREADY-ruled decision; " ++
+                    "rule it with `--by` instead\n", .{ sid, st.state.toString() });
+                return error.UsageError;
+            }
+            if (st.ruled_by) |old| {
+                try self.print("trk: {s} already records by={s} - a recorded `by` is never rewritten\n", .{ sid, old });
+                return error.UsageError;
+            }
+            try self.store.append(.{ .setRuling = .{ .id = id, .by = by.?, .cites = cites.items } });
+            try self.print("{s}: stamped by {s}\n", .{ sid, by.? });
+            return;
+        }
+
+        const b = try self.bodyArg("rule", pos[1]);
+        defer if (b.owned) self.gpa.free(b.text);
 
         if (!self.store.isDecision(id)) {
             try self.print(
@@ -6082,7 +6128,7 @@ pub const Cli = struct {
             if (id_arg == null) {
                 switch (tr) {
                     .traced => continue,
-                    .failed => |f| if (known and f.reason == .unknown_by and f.at.eql(tid)) continue,
+                    .failed => |f| if (known and f.reason == .unknown_by) continue,
                 }
             }
             try rows.append(self.gpa, .{ .id = tid, .trace = tr });
