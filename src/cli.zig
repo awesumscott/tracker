@@ -116,6 +116,10 @@ pub const CliError = error{
     /// write discarded (01M32AHNQ). Listed in `out` before this is returned;
     /// main.zig exits 1, same shape as `StaleRulings`.
     LostAppends,
+    /// `trk provenance` reported at least one ruling with no path back to
+    /// Scott. Listed in `out` before this is returned; main.zig exits 1, same
+    /// shape as `StaleRulings`.
+    UntracedRulings,
 };
 
 /// The store's write path surfaces a broad fs error set (append/atomicWrite).
@@ -955,8 +959,8 @@ pub const Cli = struct {
         \\        trk edit 01KX6H --append-body "2026-08-23: reproduced on main."
         \\        trk edit 01KX6H --rm-doc none
         },
-        .{ .name = "rule", .run = &cmdRule, .mutates = true, .tools = &rule_tools, .text =
-        \\trk rule <id> <ruling text|->
+        .{ .name = "rule", .run = &cmdRule, .mutates = true, .tools = &rule_tools, .flags = &.{ "--by", "--cites" }, .text =
+        \\trk rule <id> <ruling text|-> [--by scott|rec-bot] [--cites <id|doc#section>]...
         \\  Record the answer to a DECISION and close it, atomically: appends the
         \\  ruling to the decision's body and sets it `done`. `-` reads the ruling
         \\  from stdin.
@@ -971,7 +975,32 @@ pub const Cli = struct {
         \\  REFUSES on a task that is not a declared decision — `rule` is the resolver
         \\  for forks, not a way to close work on the strength of a note; use
         \\  `trk edit <id> --append-body` for that. Refuses on an already-ruled one too.
-        \\  e.g.  trk rule 01M2V2TSA "list --arc only; TODO.md stays forward-looking"
+        \\  --by records WHO ruled as a field on the ruling, not prose: `--by scott` is
+        \\  the orchestrator entering his answer; `--by rec-bot --cites <id|doc#section>`
+        \\  is a closure by citation, where each cite is a RULED decision (any unique
+        \\  prefix; stored full-length) or a doc citation (contains `#` or `.`, taken
+        \\  as given). `--cites` repeats, and is required with rec-bot and refused with
+        \\  scott or without --by. Without --by the ruling reads as unknown provenance
+        \\  (every ruling made before the field existed) — never an error. `show` and
+        \\  `--json` expose `ruled_by` and `cites`; `trk provenance` walks the chain.
+        \\  e.g.  trk rule 01M2V2TSA "list --arc only; TODO.md stays forward-looking" --by scott
+        \\        trk rule 01M2V2TSA "per the settled shape" --by rec-bot --cites 01M2VFV83 --cites issue-tracker.md#decisions
+        },
+        .{ .name = "provenance", .run = &cmdProvenance, .tools = &provenance_tools, .flags = &.{ "--known", "--json" }, .text =
+        \\trk provenance [<id>] [--known] [--json]
+        \\  Which rulings have NO path back to Scott? Walks `cites` from each ruled
+        \\  decision until every leaf is a `--by scott` ruling or a doc citation (taken
+        \\  as given; trk cannot judge a doc). A ruling is reported when it has no `by`
+        \\  (unknown — every ruling made before `rule --by` existed), an unrecognized
+        \\  `by`, a rec-bot ruling citing nothing, a cite to a task that is missing or
+        \\  not a ruled decision, or a cite loop. The report names the ruling where the
+        \\  chain broke and the cite that led there.
+        \\  With <id>: that one ruling, traced or not. --known hides the unknown-`by`
+        \\  rulings, leaving only rulings whose recorded chain is actually broken (the
+        \\  form for a lint). --json: an array of {id, short, title, by, traced, reason,
+        \\  at, at_short, cite}; reason/at/cite are null when traced.
+        \\  Exits nonzero iff it reported at least one ruling.
+        \\  e.g.  trk provenance --known
         },
         .{ .name = "log", .run = &cmdLog, .tools = &log_tools, .flags = &.{ "--limit", "--json" }, .text =
         \\trk log [<id>] [--limit <n>] [--json]
@@ -1249,6 +1278,13 @@ pub const Cli = struct {
     const rule_tools = [_]Tool{.{ .name = "rule", .params = &.{
         p_id,
         .{ .name = "text", .kind = .string, .required = true, .desc = "The ruling. Appended to the decision's body; closes it, releasing whatever it blocked." },
+        .{ .name = "by", .kind = .string, .flag = "--by", .desc = "Who ruled: `scott` (the orchestrator entering his answer) or `rec-bot` (needs cites). Omitted = unknown provenance." },
+        .{ .name = "cites", .kind = .string_list, .flag = "--cites", .desc = "With by=rec-bot: ruled decision ids and/or doc#section citations the closure rests on." },
+    } }};
+
+    const provenance_tools = [_]Tool{.{ .name = "provenance", .argv = &.{"--json"}, .params = &.{
+        .{ .name = "id", .kind = .string, .desc = "Trace only this ruling." },
+        .{ .name = "known", .kind = .boolean, .flag = "--known", .desc = "Hide rulings with no recorded `by` (legacy); keep only broken chains." },
     } }};
 
     const log_tools = [_]Tool{.{ .name = "log", .argv = &.{"--json"}, .params = &.{
@@ -4983,6 +5019,13 @@ pub const Cli = struct {
             if (!t.state.satisfiesPrereq()) {
                 var idb: [ulid.len]u8 = undefined;
                 try self.print("  resolve with: trk rule {s} \"<the ruling>\"\n", .{try self.shortId(id, &idb)});
+            } else if (t.state != .dropped) {
+                if (t.ruled_by) |by| {
+                    try self.print("  ruled by: {s}\n", .{by});
+                    for (t.cites) |c| try self.print("    cites: {s}\n", .{c});
+                } else {
+                    try self.write("  ruled by: (not recorded)\n");
+                }
             }
         } else {
             const raised = try self.store.raisedBy(self.gpa, id);
@@ -5048,6 +5091,23 @@ pub const Cli = struct {
     /// --json` and the `list`/`next` rows so the two schemas cannot drift.
     fn appendEdgesJson(self: *Cli, id: Ulid) Error!void {
         const t = self.store.get(id).?;
+        // Who ruled, on a RULED decision only (an ordinary task's object is
+        // unchanged). `ruled_by` is null for a ruling made before the field
+        // existed — unknown provenance, not an error.
+        if (self.store.isDecision(id) and t.state.satisfiesPrereq() and t.state != .dropped) {
+            if (t.ruled_by) |by| {
+                try self.write(",\"ruled_by\":");
+                try self.writeJsonString(by);
+            } else {
+                try self.write(",\"ruled_by\":null");
+            }
+            try self.write(",\"cites\":[");
+            for (t.cites, 0..) |c, n| {
+                if (n != 0) try self.write(",");
+                try self.writeJsonString(c);
+            }
+            try self.write("]");
+        }
         // Provenance, both directions, always present so a consumer indexes
         // without a guard: `raises` on a task, `raised_by` on a decision.
         try self.write(",\"raises\":[");
@@ -5446,17 +5506,79 @@ pub const Cli = struct {
     /// the resolver for decisions, and using it on ordinary work would close
     /// that work on the strength of a note.
     fn cmdRule(self: *Cli, args: []const []const u8) Error!void {
-        if (args.len < 2) {
-            try self.write("trk: usage: trk rule <id> <ruling text|->\n" ++
+        var pos: [2][]const u8 = undefined;
+        var npos: usize = 0;
+        var extra: usize = 0;
+        var by: ?[]const u8 = null;
+        var cite_args: std.ArrayList([]const u8) = .empty;
+        defer cite_args.deinit(self.gpa);
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--by")) {
+                by = try self.flagVal(args, &i, "--by");
+            } else if (std.mem.eql(u8, args[i], "--cites")) {
+                try cite_args.append(self.gpa, try self.flagVal(args, &i, "--cites"));
+            } else if (npos < 2) {
+                pos[npos] = args[i];
+                npos += 1;
+            } else {
+                extra += 1;
+            }
+        }
+        if (npos < 2) {
+            try self.write("trk: usage: trk rule <id> <ruling text|-> [--by scott|rec-bot] [--cites <id|doc#section>]...\n" ++
                 "  Appends <ruling text> to the decision's body and closes it, atomically.\n");
             return error.MissingArgument;
         }
-        const id = try self.resolve(args[0]);
-        if (args.len > 2) {
-            try self.print("trk: rule takes exactly one ruling-text argument, got {d} extra\n", .{args.len - 2});
+        const id = try self.resolve(pos[0]);
+        if (extra > 0) {
+            try self.print("trk: rule takes exactly one ruling-text argument, got {d} extra\n", .{extra});
             return error.UsageError;
         }
-        const b = try self.bodyArg("rule", args[1]);
+
+        // Provenance flags are validated BEFORE any write, so a refusal leaves
+        // the decision untouched and open.
+        if (by) |b| {
+            if (!std.mem.eql(u8, b, "scott") and !std.mem.eql(u8, b, "rec-bot")) {
+                try self.print("trk: --by must be `scott` or `rec-bot`, got '{s}'\n", .{b});
+                return error.UsageError;
+            }
+            const is_bot = std.mem.eql(u8, b, "rec-bot");
+            if (is_bot and cite_args.items.len == 0) {
+                try self.write("trk: --by rec-bot needs at least one --cites <id|doc#section> — " ++
+                    "a closure by citation with nothing cited has no path back to Scott\n");
+                return error.UsageError;
+            }
+            if (!is_bot and cite_args.items.len != 0) {
+                try self.write("trk: --cites belongs to --by rec-bot; a `scott` ruling is the leaf and cites nothing\n");
+                return error.UsageError;
+            }
+        } else if (cite_args.items.len != 0) {
+            try self.write("trk: --cites needs --by rec-bot\n");
+            return error.UsageError;
+        }
+        var cites: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (cites.items) |c| self.gpa.free(c);
+            cites.deinit(self.gpa);
+        }
+        for (cite_args.items) |c| {
+            if (tracker.store.Store.isDocCite(c)) {
+                try cites.append(self.gpa, try self.gpa.dupe(u8, c));
+                continue;
+            }
+            const cid = try self.resolve(c);
+            const ct = self.store.get(cid).?;
+            if (!self.store.isDecision(cid) or (ct.state != .done and ct.state != .archived)) {
+                var cb: [ulid.len]u8 = undefined;
+                try self.print("trk: --cites {s} is not a RULED decision — a rec-bot closure can only rest on " ++
+                    "a ruling (or a doc#section citation)\n", .{try self.shortId(cid, &cb)});
+                return error.UsageError;
+            }
+            try cites.append(self.gpa, try self.gpa.dupe(u8, &cid.text));
+        }
+
+        const b = try self.bodyArg("rule", pos[1]);
         defer if (b.owned) self.gpa.free(b.text);
 
         var sb: [ulid.len]u8 = undefined;
@@ -5483,8 +5605,13 @@ pub const Cli = struct {
         }
 
         try self.applyBodyEdit(id, sid, b.text, true);
+        if (by) |who| try self.store.append(.{ .setRuling = .{ .id = id, .by = who, .cites = cites.items } });
         try self.store.append(.{ .setState = .{ .id = id, .state = .done } });
-        try self.print("{s}: ruled and closed\n", .{sid});
+        if (by) |who| {
+            try self.print("{s}: ruled and closed (by {s})\n", .{ sid, who });
+        } else {
+            try self.print("{s}: ruled and closed\n", .{sid});
+        }
 
         // Name what the ruling just released. The whole point of blocking on a
         // decision is that answering it unblocks the work, and an agent that
@@ -5906,6 +6033,121 @@ pub const Cli = struct {
         }
 
         if (hits.items.len != 0) return error.StaleRulings;
+    }
+
+    /// `trk provenance [<id>] [--known] [--json]` — see its help text; the walk
+    /// is `Store.traceRuling`. A VERB rather than a `list` filter because the
+    /// answer is not a per-task predicate: it is a walk over `cites`, and each
+    /// failure needs a REASON and the point the chain broke, which a filtered
+    /// row has nowhere to carry. Read-only, and `stale-rulings`' sibling: a
+    /// reconciliation report that exits nonzero when it reports.
+    fn cmdProvenance(self: *Cli, args: []const []const u8) Error!void {
+        var json = false;
+        var known = false;
+        var id_arg: ?[]const u8 = null;
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--json")) {
+                json = true;
+            } else if (std.mem.eql(u8, a, "--known")) {
+                known = true;
+            } else if (a.len != 0 and a[0] == '-') {
+                return self.unknownFlag(a);
+            } else if (id_arg == null) {
+                id_arg = a;
+            } else {
+                try self.write("trk: usage: trk provenance [<id>] [--known] [--json]\n");
+                return error.UsageError;
+            }
+        }
+
+        var ids: std.ArrayList(Ulid) = .empty;
+        defer ids.deinit(self.gpa);
+        if (id_arg) |a| {
+            try ids.append(self.gpa, try self.resolve(a));
+        } else {
+            const all = try self.store.allIds(self.gpa);
+            defer self.gpa.free(all);
+            for (all) |tid| {
+                const t = self.store.get(tid).?;
+                if (self.store.isDecision(tid) and (t.state == .done or t.state == .archived))
+                    try ids.append(self.gpa, tid);
+            }
+        }
+
+        const Row = struct { id: Ulid, trace: tracker.store.Store.Trace };
+        var rows: std.ArrayList(Row) = .empty;
+        defer rows.deinit(self.gpa);
+        for (ids.items) |tid| {
+            const tr = try self.store.traceRuling(tid);
+            if (id_arg == null) {
+                switch (tr) {
+                    .traced => continue,
+                    .failed => |f| if (known and f.reason == .unknown_by and f.at.eql(tid)) continue,
+                }
+            }
+            try rows.append(self.gpa, .{ .id = tid, .trace = tr });
+        }
+
+        var reported: usize = 0;
+        for (rows.items) |r| {
+            if (r.trace == .failed) reported += 1;
+        }
+
+        if (json) {
+            try self.write("[");
+            for (rows.items, 0..) |r, n| {
+                if (n != 0) try self.write(",");
+                const t = self.store.get(r.id).?;
+                var sb: [ulid.len]u8 = undefined;
+                try self.print("{{\"id\":\"{s}\",\"short\":\"{s}\",\"title\":", .{ &r.id.text, try self.shortId(r.id, &sb) });
+                try self.writeJsonString(t.title);
+                try self.write(",\"by\":");
+                if (t.ruled_by) |by| try self.writeJsonString(by) else try self.write("null");
+                switch (r.trace) {
+                    .traced => try self.write(",\"traced\":true,\"reason\":null,\"at\":null,\"at_short\":null,\"cite\":null}"),
+                    .failed => |f| {
+                        var ab: [ulid.len]u8 = undefined;
+                        try self.print(",\"traced\":false,\"reason\":\"{s}\",\"at\":\"{s}\",\"at_short\":\"{s}\",\"cite\":", .{
+                            @tagName(f.reason), &f.at.text, try self.shortId(f.at, &ab),
+                        });
+                        if (f.cite) |c| try self.writeJsonString(c) else try self.write("null");
+                        try self.write("}");
+                    },
+                }
+            }
+            try self.write("]\n");
+        } else if (rows.items.len == 0) {
+            try self.write("trk: provenance: nothing — every ruling traces back to a `scott` ruling or a doc citation\n");
+        } else {
+            for (rows.items) |r| {
+                const t = self.store.get(r.id).?;
+                var sb: [ulid.len]u8 = undefined;
+                const sid = try self.shortId(r.id, &sb);
+                switch (r.trace) {
+                    .traced => try self.print("{s}  {s}\n    traced: every leaf is a scott ruling or a doc citation\n", .{ sid, t.title }),
+                    .failed => |f| {
+                        var ab: [ulid.len]u8 = undefined;
+                        try self.print("{s}  {s}\n    {s}", .{ sid, t.title, provenanceReason(f.reason) });
+                        if (!f.at.eql(r.id)) try self.print(" (at {s})", .{try self.shortId(f.at, &ab)});
+                        if (f.cite) |c| try self.print(" [cite {s}]", .{c});
+                        try self.write("\n");
+                    },
+                }
+            }
+            if (reported != 0) try self.print("trk: provenance: {d} ruling(s) with no path back to Scott\n", .{reported});
+        }
+        if (reported != 0) return error.UntracedRulings;
+    }
+
+    fn provenanceReason(r: tracker.store.Store.TraceFail) []const u8 {
+        return switch (r) {
+            .unknown_by => "no `by` recorded (ruled before `rule --by`, or without it)",
+            .unrecognized_by => "`by` is neither scott nor rec-bot",
+            .no_cites => "rec-bot ruling that cites nothing",
+            .cite_missing => "cites a task that is not in the store",
+            .cite_unruled => "the task (or a cited task) is not a ruled decision",
+            .cycle => "the cites loop back onto a ruling already on the path",
+        };
     }
 
     /// `trk lost-appends [--json]` — see its help text; the scan is

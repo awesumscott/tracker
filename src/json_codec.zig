@@ -27,6 +27,7 @@
 //!   {"op":"setTitle","id":"<ulid>","title":"...","ts":0}
 //!   {"op":"setBody","id":"<ulid>","body":"...","ts":0}
 //!   {"op":"appendBody","id":"<ulid>","text":"...","ts":0}
+//!   {"op":"setRuling","id":"<ulid>","by":"scott"|"rec-bot","cites":["<ulid>|doc#section"],"ts":0}
 //!   {"op":"untag","id":"<ulid>","tag":"...","ts":0}
 //!   {"op":"undep","from":"<ulid>","to":"<ulid>","ts":0}
 //!   {"op":"unin","task":"<ulid>","arc":"<ulid>","ts":0}
@@ -265,6 +266,21 @@ pub fn encode(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, ev: Event) !void 
             try writeJsonString(buf, gpa, b.text);
             try writeKey(buf, gpa, "ts", &first);
             try writeInt(buf, gpa, b.ts);
+        },
+        .setRuling => |r| {
+            try writeKey(buf, gpa, "id", &first);
+            try writeJsonString(buf, gpa, r.id.slice());
+            try writeKey(buf, gpa, "by", &first);
+            try writeJsonString(buf, gpa, r.by);
+            try writeKey(buf, gpa, "cites", &first);
+            try buf.append(gpa, '[');
+            for (r.cites, 0..) |c, i| {
+                if (i != 0) try buf.append(gpa, ',');
+                try writeJsonString(buf, gpa, c);
+            }
+            try buf.append(gpa, ']');
+            try writeKey(buf, gpa, "ts", &first);
+            try writeInt(buf, gpa, r.ts);
         },
         .untag => |t| {
             try writeKey(buf, gpa, "id", &first);
@@ -565,6 +581,31 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
             .text = try gpa.dupe(u8, try getStr(obj, "text")),
             .ts = getIntDefault(obj, "ts", 0),
         } },
+        .setRuling => {
+            const id = try getUlid(obj, "id");
+            const by = try gpa.dupe(u8, try getStr(obj, "by"));
+            errdefer gpa.free(by);
+            var cites: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (cites.items) |c| gpa.free(c);
+                cites.deinit(gpa);
+            }
+            if (obj.get("cites")) |cv| switch (cv) {
+                .array => |arr| {
+                    for (arr.items) |item| switch (item) {
+                        .string => |s| try cites.append(gpa, try gpa.dupe(u8, s)),
+                        else => {},
+                    };
+                },
+                else => {},
+            };
+            return .{ .setRuling = .{
+                .id = id,
+                .by = by,
+                .cites = try cites.toOwnedSlice(gpa),
+                .ts = getIntDefault(obj, "ts", 0),
+            } };
+        },
         .untag => return .{ .untag = .{
             .id = try getUlid(obj, "id"),
             .tag = try gpa.dupe(u8, try getStr(obj, "tag")),
@@ -626,6 +667,42 @@ pub fn decode(gpa: std.mem.Allocator, line: []const u8) DecodeError!Event {
 // ----- tests -----
 
 const testing = std.testing;
+
+test "encode/decode round-trip setRuling, with and without cites" {
+    const gpa = testing.allocator;
+    const id = try ulid.parse(&ulid.mintAt(testing.io, 100).text);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const cites = [_][]const u8{ "01ABC", "docs/x.md#sec \"q\"" };
+    try encode(&buf, gpa, .{ .setRuling = .{ .id = id, .by = "rec-bot", .cites = &cites, .ts = 7 } });
+    {
+        const ev = try decode(gpa, buf.items);
+        defer {
+            gpa.free(ev.setRuling.by);
+            for (ev.setRuling.cites) |c| gpa.free(c);
+            gpa.free(ev.setRuling.cites);
+        }
+        try testing.expect(ev.setRuling.id.eql(id));
+        try testing.expectEqualStrings("rec-bot", ev.setRuling.by);
+        try testing.expectEqual(@as(usize, 2), ev.setRuling.cites.len);
+        try testing.expectEqualStrings(cites[1], ev.setRuling.cites[1]);
+        try testing.expectEqual(@as(i64, 7), ev.setRuling.ts);
+    }
+    // No cites key at all (a by-scott line, or a hand-written one) decodes empty.
+    const bare = try std.fmt.allocPrint(gpa, "{{\"op\":\"setRuling\",\"id\":\"{s}\",\"by\":\"scott\"}}", .{id.slice()});
+    defer gpa.free(bare);
+    const ev2 = try decode(gpa, bare);
+    defer {
+        gpa.free(ev2.setRuling.by);
+        gpa.free(ev2.setRuling.cites);
+    }
+    try testing.expectEqualStrings("scott", ev2.setRuling.by);
+    try testing.expectEqual(@as(usize, 0), ev2.setRuling.cites.len);
+    // `by` is required: a ruling line with no author is malformed, not "unknown".
+    const nob = try std.fmt.allocPrint(gpa, "{{\"op\":\"setRuling\",\"id\":\"{s}\"}}", .{id.slice()});
+    defer gpa.free(nob);
+    try testing.expectError(error.MissingField, decode(gpa, nob));
+}
 
 test "encode/decode round-trip add" {
     const gpa = testing.allocator;

@@ -3526,3 +3526,96 @@ test "foldBodyEvents: latest set is the base, later appends layer on, ties follo
     try testing.expectEqualStrings("C", try tracker.store.foldBodyEvents(a, &tie));
     try testing.expectEqualStrings("", try tracker.store.foldBodyEvents(a, &.{}));
 }
+
+test "setRuling: last write wins and survives a reload; absent stays null" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(alloc, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+    const a = mintId();
+    const b = mintId();
+    try s.append(.{ .add = .{ .id = a, .title = "a" } });
+    try s.append(.{ .add = .{ .id = b, .title = "b" } });
+    const c1 = [_][]const u8{"x.md#y"};
+    try s.append(.{ .setRuling = .{ .id = a, .by = "rec-bot", .cites = &c1 } });
+    try s.append(.{ .setRuling = .{ .id = a, .by = "scott" } });
+    try testing.expectEqualStrings("scott", s.get(a).?.ruled_by.?);
+    try testing.expectEqual(@as(usize, 0), s.get(a).?.cites.len);
+    try testing.expect(s.get(b).?.ruled_by == null);
+
+    var s2 = Store.open(alloc, io, tmp.dir);
+    defer s2.deinit();
+    try s2.load();
+    try testing.expectEqualStrings("scott", s2.get(a).?.ruled_by.?);
+    try testing.expect(s2.get(b).?.ruled_by == null);
+}
+
+test "traceRuling: scott leaf, doc leaf, nested chain trace; unknown, missing, unruled and looping chains fail with the right reason and point" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = Store.open(alloc, io, tmp.dir);
+    defer s.deinit();
+    try s.load();
+
+    const Mk = struct {
+        fn dec(st: *Store, by: ?[]const u8, cites: []const []const u8, done: bool) !tracker.Ulid {
+            const d = mintId();
+            try st.append(.{ .add = .{ .id = d, .title = "d" } });
+            try st.append(.{ .decisionDeclare = .{ .id = d, .declared = true } });
+            if (by) |who| try st.append(.{ .setRuling = .{ .id = d, .by = who, .cites = cites } });
+            if (done) try st.append(.{ .setState = .{ .id = d, .state = .done } });
+            return d;
+        }
+    };
+    const leaf = try Mk.dec(&s, "scott", &.{}, true);
+    try testing.expectEqual(Store.Trace.traced, try s.traceRuling(leaf));
+
+    const doc = try Mk.dec(&s, "rec-bot", &.{"design.md#s"}, true);
+    try testing.expectEqual(Store.Trace.traced, try s.traceRuling(doc));
+
+    const nested = try Mk.dec(&s, "rec-bot", &.{ &leaf.text, &doc.text }, true);
+    try testing.expectEqual(Store.Trace.traced, try s.traceRuling(nested));
+
+    // Legacy: no by. Failure is AT the queried ruling, with no cite.
+    const legacy = try Mk.dec(&s, null, &.{}, true);
+    const tl = try s.traceRuling(legacy);
+    try testing.expectEqual(Store.TraceFail.unknown_by, tl.failed.reason);
+    try testing.expect(tl.failed.at.eql(legacy));
+    try testing.expect(tl.failed.cite == null);
+
+    // Chain rests on the legacy one: reason and point come from the deep node,
+    // the cite is the edge taken from the queried ruling.
+    const top = try Mk.dec(&s, "rec-bot", &.{ &leaf.text, &legacy.text }, true);
+    const tt = try s.traceRuling(top);
+    try testing.expectEqual(Store.TraceFail.unknown_by, tt.failed.reason);
+    try testing.expect(tt.failed.at.eql(legacy));
+    try testing.expectEqualStrings(&legacy.text, tt.failed.cite.?);
+
+    // An unruled (open) decision as a cite.
+    const open_d = try Mk.dec(&s, null, &.{}, false);
+    const on_open = try Mk.dec(&s, "rec-bot", &.{&open_d.text}, true);
+    try testing.expectEqual(Store.TraceFail.cite_unruled, (try s.traceRuling(on_open)).failed.reason);
+
+    // by=rec-bot, nothing cited; unrecognized author.
+    const none = try Mk.dec(&s, "rec-bot", &.{}, true);
+    try testing.expectEqual(Store.TraceFail.no_cites, (try s.traceRuling(none)).failed.reason);
+    const who = try Mk.dec(&s, "bob", &.{}, true);
+    try testing.expectEqual(Store.TraceFail.unrecognized_by, (try s.traceRuling(who)).failed.reason);
+
+    // A cite that is not an id the store holds.
+    const ghost = mintId();
+    const dangling = try Mk.dec(&s, "rec-bot", &.{&ghost.text}, true);
+    try testing.expectEqual(Store.TraceFail.cite_missing, (try s.traceRuling(dangling)).failed.reason);
+
+    // Self-loop, and the doc-cite classifier.
+    const selfd = try Mk.dec(&s, null, &.{}, true);
+    const sc = [_][]const u8{&selfd.text};
+    try s.append(.{ .setRuling = .{ .id = selfd, .by = "rec-bot", .cites = &sc } });
+    try testing.expectEqual(Store.TraceFail.cycle, (try s.traceRuling(selfd)).failed.reason);
+    try testing.expect(Store.isDocCite("a.md"));
+    try testing.expect(Store.isDocCite("a#b"));
+    try testing.expect(!Store.isDocCite(&leaf.text));
+}
